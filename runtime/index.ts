@@ -2,14 +2,20 @@ import type {
 	AgentToolResult,
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-import type { Api, Model, Usage } from "@earendil-works/pi-ai";
+import type { Api, Model } from "@earendil-works/pi-ai";
 import type {
 	AgentSession,
 	AgentSessionEvent,
 	CreateAgentSessionOptions,
 	ExtensionError,
+	SessionManager,
 } from "@earendil-works/pi-coding-agent";
-import { type RunSummary, summarizeRun } from "./summary.ts";
+import {
+	appendDelegatedUsage,
+	type RunSummary,
+	summarizeOwnUsage,
+	summarizeRun,
+} from "./summary.ts";
 
 export { appendDelegatedUsage, SUBAGENT_USAGE_KIND } from "./summary.ts";
 
@@ -39,6 +45,8 @@ export type ChildSessionFactory = (
 export interface SubagentsOptions {
 	createSession: ChildSessionFactory;
 	disposeSession: (session: AgentSession) => Promise<void>;
+	/** Captured root ledger; billing never follows session replacement. */
+	rootSessionManager?: SessionManager;
 }
 
 export const ROOT = "root";
@@ -114,8 +122,6 @@ interface ActiveRun {
 	preflight: Promise<void>;
 	/** Settles once the run, including descendant delivery, finishes. */
 	settled: Promise<void>;
-	/** Children's usage by ID, billed even when cancellation suppresses delivery. */
-	delegatedUsage: Map<string, Usage>;
 }
 
 interface SubagentNode extends Writable<Subagent> {
@@ -125,6 +131,15 @@ interface SubagentNode extends Writable<Subagent> {
 	/** Present exactly while status is "running". */
 	run?: ActiveRun;
 	unsubscribe: () => void;
+}
+
+interface UsageLedger {
+	manager: SessionManager;
+	sessionId: string;
+}
+
+function usageLedger(manager: SessionManager): UsageLedger {
+	return { manager, sessionId: manager.getSessionId() };
 }
 
 interface SubagentsState {
@@ -207,7 +222,9 @@ function toolSnapshot(
 export function createSubagents({
 	createSession,
 	disposeSession,
+	rootSessionManager,
 }: SubagentsOptions): Subagents {
+	const rootLedger = rootSessionManager && usageLedger(rootSessionManager);
 	const state: SubagentsState = {
 		nodes: new Map(),
 		completions: new Map(),
@@ -260,18 +277,9 @@ export function createSubagents({
 			},
 		};
 		state.nodes.set(id, node);
-		const parentUsage = parent?.run?.delegatedUsage;
 		const result = run(node, instructions, signal);
 		// Observe even detached results; the original promise remains usable by callers.
 		void result.catch(() => {});
-		if (parentUsage) {
-			trackCompletion(
-				parentId,
-				result.then((completed) => {
-					parentUsage.set(id, completed.usage);
-				}),
-			);
-		}
 		return { id, result };
 	}
 
@@ -380,9 +388,23 @@ export function createSubagents({
 			settled: new Promise<void>((resolve) => {
 				settle = resolve;
 			}),
-			delegatedUsage: new Map(),
 		};
 		node.run = active;
+		const ledgers: UsageLedger[] = rootLedger ? [rootLedger] : [];
+		// Resumed descendants belong to any active ancestors too, even when their
+		// immediate parent has already completed. Idle ancestors receive billing only.
+		for (
+			let parent = state.nodes.get(node.parentId);
+			parent;
+			parent = state.nodes.get(parent.parentId)
+		) {
+			if (parent.session)
+				ledgers.push(usageLedger(parent.session.sessionManager));
+			if (parent.run) trackCompletion(parent.id, active.settled);
+		}
+		trackCompletion(ROOT, active.settled);
+		// Capture reused history before any initialization listeners can bill this run.
+		let start = node.session?.sessionManager.getEntries().length;
 		// Reserve the original input ahead of sends made by initialization listeners.
 		const prompt = submit(node, active, instructions, sent);
 		const cancel = () => abort(node.id);
@@ -392,7 +414,6 @@ export function createSubagents({
 			settle();
 		};
 		try {
-			let start = 0;
 			let creatingSession = false;
 			signal?.addEventListener("abort", cancel, { once: true });
 			changed();
@@ -416,7 +437,7 @@ export function createSubagents({
 				}
 				if (signal?.aborted || node.cancelled || state.disposed) cancel();
 				if (node.session)
-					start = node.session.sessionManager.getEntries().length;
+					start ??= node.session.sessionManager.getEntries().length;
 			} catch (error) {
 				recordError(node, error);
 				if (creatingSession && node.session) {
@@ -450,18 +471,29 @@ export function createSubagents({
 					break;
 			}
 
-			const summary = summarizeRun(
-				node.session?.sessionManager.getEntries().slice(start) ?? [],
-				node.cancelled,
-				node.error,
-				active.delegatedUsage,
-			);
-			node.status = summary.status;
-			node.error = summary.error;
-			// Terminal listeners may immediately start another run; do not attach its
-			// input to this summary or let this run's finally erase its bookkeeping.
-			finish();
-			changed();
+			const entries =
+				node.session?.sessionManager.getEntries().slice(start ?? 0) ?? [];
+			const summary = summarizeRun(entries, node.cancelled, node.error);
+			const usage = summarizeOwnUsage(entries);
+			// Bill before terminal listeners can restart a conversation. Each run's
+			// local delta reaches every captured ancestor exactly once, without a turn
+			// or result notification, and regardless of cancellation or delivery failure.
+			try {
+				for (const { manager, sessionId } of ledgers)
+					if (manager.getSessionId() === sessionId)
+						appendDelegatedUsage(manager, node.context.model, {
+							id: node.id,
+							usage,
+						});
+			} finally {
+				// Even a ledger write failure must leave a reusable terminal node.
+				node.status = summary.status;
+				node.error = summary.error;
+				// Terminal listeners may immediately start another run; do not attach its
+				// input to this summary or let this run's finally erase its bookkeeping.
+				finish();
+				changed();
+			}
 			return {
 				id: node.id,
 				...summary,

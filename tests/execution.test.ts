@@ -1,9 +1,10 @@
 import { expect, mock, test } from "bun:test";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import type {
-	AgentSession,
-	AgentSessionEvent,
+import {
+	type AgentSession,
+	type AgentSessionEvent,
+	SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { createSubagents, ROOT, type SpawnContext } from "../runtime/index.ts";
 import { deferred, model, response, until } from "./fixtures.ts";
@@ -61,6 +62,43 @@ test("runtime owns execution but delegates session creation and disposal", async
 	expect(disposeSession).toHaveBeenCalledTimes(1);
 	expect(disposeSession).toHaveBeenCalledWith(session);
 	expect(unsubscribe).toHaveBeenCalledTimes(1);
+});
+
+test("ledger write failures do not leave completed runs stuck running or prevent reuse", async () => {
+	const entries: { type: "message"; message: AssistantMessage }[] = [];
+	const rootSessionManager = SessionManager.inMemory();
+	const appendUsage = rootSessionManager.appendUsage.bind(rootSessionManager);
+	rootSessionManager.appendUsage = () => {
+		throw new Error("ledger unavailable");
+	};
+	const session = {
+		subscribe: () => () => {},
+		prompt: async () => {
+			entries.push({ type: "message", message: response("done") });
+		},
+		waitForIdle: async () => {},
+		sessionManager: { getEntries: () => entries },
+	} as unknown as AgentSession;
+	const runtime = createSubagents({
+		rootSessionManager,
+		createSession: async (_context, _owner, onCreated) => {
+			onCreated(session);
+			return session;
+		},
+		disposeSession: async () => {},
+	});
+	try {
+		await expect(
+			runtime.start(ROOT, "initial", context).result,
+		).rejects.toThrow("ledger unavailable");
+		expect(runtime.get("1")?.status).toBe("done");
+		rootSessionManager.appendUsage = appendUsage;
+		await runtime.send("1", "resume");
+		expect(runtime.get("1")?.status).toBe("done");
+		expect(rootSessionManager.getEntries()).toHaveLength(1);
+	} finally {
+		await runtime.dispose();
+	}
 });
 
 test("session-creation failures remain plain run data", async () => {

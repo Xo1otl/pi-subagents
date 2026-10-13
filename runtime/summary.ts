@@ -20,9 +20,7 @@ export interface RunSummary {
 	usage: Usage;
 }
 
-/** Bill a child to the session that delegated it. The note identifies the child,
- * so summarizeRun counts it once even though the runtime also tracks it.
- */
+/** Bill one run's own usage to an ancestor, independently of result delivery. */
 export function appendDelegatedUsage(
 	manager: SessionManager,
 	model: Model<Api>,
@@ -37,31 +35,8 @@ export function appendDelegatedUsage(
 	);
 }
 
-function isDelegatedUsage(
-	entry: SessionEntry,
-	delegated: ReadonlyMap<string, Usage>,
-): boolean {
-	return (
-		entry.type === "usage" &&
-		entry.kind === SUBAGENT_USAGE_KIND &&
-		Boolean(entry.note && delegated.has(entry.note))
-	);
-}
-
-/** Derive one run's result from the raw entries it appended.
- * Raw entries survive compaction and context edits, so neither final output
- * nor billing disappears when a full pi session repairs its model context.
- */
-export function summarizeRun(
-	entries: readonly SessionEntry[],
-	cancelled: boolean,
-	error: string | undefined,
-	delegatedUsage: ReadonlyMap<string, Usage>,
-): RunSummary {
-	const messages = entries.flatMap((entry) =>
-		entry.type === "message" ? [entry.message] : [],
-	);
-	let final: AssistantMessage | undefined;
+/** Raw entries are the single source of billing, including descendant charges. */
+function summarizeUsage(entries: readonly SessionEntry[]): Usage {
 	const usage: Usage = {
 		input: 0,
 		output: 0,
@@ -70,26 +45,16 @@ export function summarizeRun(
 		totalTokens: 0,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
-	for (const message of messages) {
-		if (message.role === "assistant") final = message;
-	}
-	const usages = [
-		...messages.flatMap((message) =>
-			(message.role === "assistant" || message.role === "toolResult") &&
-			message.usage
+	const usages = entries.flatMap((entry) => {
+		if (entry.type === "message") {
+			const message = entry.message;
+			return (message.role === "assistant" || message.role === "toolResult") &&
+				message.usage
 				? [message.usage]
-				: [],
-		),
-		...entries.flatMap((entry) =>
-			"usage" in entry &&
-			entry.usage &&
-			!isDelegatedUsage(entry, delegatedUsage)
-				? [entry.usage]
-				: [],
-		),
-		// Preserve descendant billing even when cancellation suppresses delivery.
-		...delegatedUsage.values(),
-	];
+				: [];
+		}
+		return "usage" in entry && entry.usage ? [entry.usage] : [];
+	});
 	for (const used of usages) {
 		usage.input += used.input;
 		usage.output += used.output;
@@ -110,7 +75,32 @@ export function summarizeRun(
 			usage.cost[key] += used.cost[key];
 		}
 	}
+	return usage;
+}
 
+/** Propagate only new, local charges; descendants bill every ancestor themselves. */
+export function summarizeOwnUsage(entries: readonly SessionEntry[]): Usage {
+	return summarizeUsage(
+		entries.filter(
+			(entry) => entry.type !== "usage" || entry.kind !== SUBAGENT_USAGE_KIND,
+		),
+	);
+}
+
+/** Derive one run's result from the raw entries it appended.
+ * Raw entries survive compaction and context edits, so neither final output
+ * nor billing disappears when a full pi session repairs its model context.
+ */
+export function summarizeRun(
+	entries: readonly SessionEntry[],
+	cancelled: boolean,
+	error: string | undefined,
+): RunSummary {
+	let final: AssistantMessage | undefined;
+	for (const entry of entries)
+		if (entry.type === "message" && entry.message.role === "assistant")
+			final = entry.message;
+	const usage = summarizeUsage(entries);
 	let status: RunSummary["status"];
 	if (cancelled || final?.stopReason === "aborted") {
 		status = "aborted";

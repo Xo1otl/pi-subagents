@@ -8,12 +8,7 @@ import {
 	type SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import {
-	appendDelegatedUsage,
-	createSubagents,
-	ROOT,
-	type Subagents,
-} from "../runtime/index.ts";
+import { createSubagents, ROOT, type Subagents } from "../runtime/index.ts";
 import {
 	discardSubagentCompletion,
 	subagentCompletionMessage,
@@ -32,8 +27,11 @@ import {
 } from "./sessions.ts";
 
 /** Compose execution with Pi's session lifecycle, without loading presentation. */
-export function createSubagentRuntime(): Subagents {
+export function createSubagentRuntime(
+	rootSessionManager?: SessionManager,
+): Subagents {
 	return createSubagents({
+		rootSessionManager,
 		createSession: (context, owner, onCreated, onError) =>
 			createChildSession(
 				context,
@@ -229,7 +227,11 @@ export function createSubagentIntegration(
 			if (previous?.parentId === ROOT) await previous.runtime.dispose();
 			await cleanup;
 		}
-		const runtime = owner?.runtime ?? createSubagentRuntime();
+		// ExtensionContext exposes a read-only view of Pi's public SessionManager.
+		// Capture the actual ledger once; run billing must survive binding teardown.
+		const runtime =
+			owner?.runtime ??
+			createSubagentRuntime(ctx.sessionManager as SessionManager);
 		binding = {
 			runtime,
 			parentId: owner?.id ?? ROOT,
@@ -295,14 +297,9 @@ export function createSubagentIntegration(
 						!tree.get(source.parentId)?.cancelled));
 			const completion = started.result
 				.then(async (result) => {
-					// Billing belongs to the captured session, even if notification is suppressed.
-					// Never redirect it through a stale pi/ctx into the replacement session.
+					// Run billing is already persisted, independently of this notification.
 					if (source.manager.getSessionId() !== source.sessionId) return;
-					// ExtensionContext types its manager read-only, but Pi exposes the public
-					// SessionManager instance. appendUsage is the supported SDK billing API;
-					// custom-message details/data alone do not contribute to session totals.
 					const manager = source.manager as SessionManager;
-					appendDelegatedUsage(manager, context.model, result);
 					const data = {
 						id: result.id,
 						status: result.status,
