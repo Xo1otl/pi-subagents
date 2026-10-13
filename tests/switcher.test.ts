@@ -22,7 +22,9 @@ import {
 } from "../ui/switcher.ts";
 import {
 	blockingTool,
+	hierarchyStream,
 	lastText,
+	model,
 	response,
 	spawnContext,
 	stream,
@@ -549,6 +551,132 @@ test.each([20, 80])(
 		expect(output()).not.toContain("● Tree");
 	},
 );
+
+test("shows unknown context during startup, then updates from live and resumed child usage", async () => {
+	const { tree, switcher, tui } = await setup({ empty: true });
+	const usage = {
+		...response("").usage,
+		input: 20_000,
+		output: 5000,
+		cacheRead: 15_000,
+		cacheWrite: 10_000,
+		totalTokens: 50_000,
+	};
+	const context = await spawnContext(
+		stream((context) =>
+			lastText(context) === "monitor"
+				? { ...toolCall("blocking", {}), usage }
+				: response(lastText(context), {
+						usage: { ...usage, input: 31_000, totalTokens: 61_000 },
+					}),
+		),
+	);
+	const release = await blockingTool(context);
+	const result = tree.start(ROOT, "monitor", context).result;
+	const screen = () => switcher.render(100).map(stripTerminalSequences);
+	expect(screen()[1]).toContain("Subagents · 1 · ctx ?");
+	await until(() => tree.get("1")?.liveTools.size === 1);
+	expect(tree.get("1")?.status).toBe("running");
+	expect(screen()[1]).toContain("ctx 50k/100k (50.0%)");
+	const runningRow = screen()[agentRow(switcher, "1")] ?? "";
+	expect(runningRow).toContain("1 [running]");
+	expect(runningRow).toContain("50.0%");
+	// Pending steering is not finalized model context yet.
+	await tree.send("1", "next message");
+	expect(screen()[1]).toContain("ctx 50k/100k (50.0%)");
+	tui.requestRender.mockClear();
+	release.resolve();
+	await result;
+	expect(tui.requestRender).toHaveBeenCalled();
+	expect(screen()[1]).toContain("ctx 61k/100k (61.0%)");
+	await tree.send("1", "resume");
+	// Two requests are billed, but context is the latest request, not their sum.
+	expect(
+		tree.get("1")?.session?.getSessionStats().tokens.total,
+	).toBeGreaterThan(100_000);
+	expect(screen()[1]).toContain("ctx 61k/100k (61.0%)");
+	for (const parent of ["1", "1.1"])
+		await tree.start(parent, "a very long task ".repeat(20), context).result;
+	const nestedRow = switcher
+		.render(80)
+		.map(stripTerminalSequences)
+		.find((line) => line.includes("1.1.1 [done]"));
+	// Even a nested row with long instructions keeps its context column visible.
+	expect(nestedRow?.split("│")[1]?.trim()).toEndWith("61.0%");
+});
+
+test("each nested child uses its own context, not delegated ancestor charges", async () => {
+	const { tree, switcher } = await setup({ empty: true });
+	const context = await spawnContext(
+		stream((context, options) => {
+			const text = lastText(context);
+			if (text === "nest:0" || text === "resume") {
+				const tokens = text === "resume" ? 75_000 : 50_000;
+				return response("hello", {
+					usage: {
+						...response("").usage,
+						input: tokens - 2,
+						totalTokens: tokens,
+					},
+				});
+			}
+			return hierarchyStream(model, context, options).result();
+		}),
+	);
+	await tree.start(ROOT, "nest:1", context).result;
+	const parent = tree.get("1")?.session;
+	if (!parent) throw new Error("Missing parent");
+	const parentUsage = parent.getContextUsage();
+	expect(parentUsage?.tokens).toBeLessThan(1000);
+	expect(parent.getSessionStats().tokens.total).toBeGreaterThan(50_000);
+	const heading = () => stripTerminalSequences(switcher.render(100)[1] ?? "");
+	expect(heading()).toContain("(0.0%)");
+	switcher.handleInput("\t");
+	expect(heading()).toContain("Subagents · 1.1 · ctx 50k/100k (50.0%)");
+	await tree.send("1.1", "resume");
+	expect(heading()).toContain("ctx 75k/100k (75.0%)");
+	switcher.handleInput("\t");
+	expect(heading()).toContain("Subagents · 1 · ctx");
+	expect(heading()).toContain("(0.0%)");
+	expect(parent.getContextUsage()).toEqual(parentUsage);
+});
+
+test("compaction and model changes refresh context without losing the draft or layout", async () => {
+	const { tree, switcher, tui } = await setup();
+	const session = tree.get("1")?.session;
+	if (!session) throw new Error("Missing session");
+	switcher.focused = true;
+	switcher.handleInput("draft survives context changes");
+	switcher.render(100);
+	session.sessionManager.appendCompaction("short summary", null, 50_000);
+	const heading = () => stripTerminalSequences(switcher.render(100)[1] ?? "");
+	expect(heading()).toContain("ctx ?/100k");
+	expect(heading()).not.toContain("0.0%");
+	await session.setModel({ ...model, contextWindow: 200_000 });
+	expect(heading()).toContain("ctx ?/200k");
+	await tree.send("1", "after compaction");
+	expect(heading()).toContain("ctx 3/200k (0.0%)");
+	expect(stripTerminalSequences(switcher.render(100).join("\n"))).toContain(
+		"draft survives context changes",
+	);
+	for (const width of [20, 80, 120]) {
+		const lines = switcher.render(width);
+		expect(lines).toHaveLength(tui.terminal.rows);
+		for (const line of lines) expect(visibleWidth(line)).toBe(width);
+		expect(lines.join("\n")).toContain(CURSOR_MARKER);
+	}
+	const assistant = session.sessionManager
+		.getBranch()
+		.findLast(
+			(entry) => entry.type === "message" && entry.message.role === "assistant",
+		);
+	if (!assistant) throw new Error("Missing post-compaction response");
+	session.sessionManager.appendContextEdit(assistant.id, null);
+	expect(heading()).toContain("ctx ?/200k");
+	await session.setModel({ ...model, contextWindow: 0 });
+	expect(heading()).toContain("ctx ?");
+	expect(heading()).not.toContain("/0");
+});
 
 test("double Left focuses the tree from an empty composer; Enter returns without sending", async () => {
 	const { tree, switcher } = await setup();

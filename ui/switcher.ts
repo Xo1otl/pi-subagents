@@ -10,6 +10,10 @@ import {
 } from "@earendil-works/pi-tui";
 import type { Subagents } from "../runtime/index.ts";
 import { ChatEditor, type ChatTUI, fitComposer } from "./composer.ts";
+import {
+	createContextUsageReader,
+	renderContextUsage,
+} from "./context-usage.ts";
 import { atTextStart, createDoubleLeftDetector } from "./navigation.ts";
 import { singleLine } from "./text.ts";
 import {
@@ -110,6 +114,7 @@ export function createSubagentSwitcher({
 	initialFocus = "conversation",
 }: SubagentSwitcherOptions): SubagentSwitcher {
 	const conversations = new Map<string, Conversation>();
+	const readContextUsage = createContextUsageReader();
 	const doubleLeft = createDoubleLeftDetector();
 	let selected = initialId ?? runtime.tree()[0]?.id;
 	let focus = initialFocus;
@@ -437,11 +442,26 @@ export function createSubagentSwitcher({
 					nodes.length - listHeight,
 				),
 			);
-			if (height >= 5) tree.push(focusMarker("tree") + theme.fg("dim", "Tree"));
+			if (height >= 5)
+				tree.push(focusMarker("tree") + theme.fg("dim", "Tree · ctx"));
 			for (const entry of nodes.slice(start, start + listHeight)) {
 				agentRows.set(inset + 1 + tree.length, entry.id);
+				const color = entry.id === selected ? "accent" : "muted";
 				const label = `${entry.id === selected ? ">" : " "} ${"  ".repeat(entry.depth - 1)}${entry.id} [${entry.status}] ${singleLine(entry.instructions)}`;
-				tree.push(theme.fg(entry.id === selected ? "accent" : "muted", label));
+				const usage = renderContextUsage(
+					readContextUsage(entry.session),
+					theme,
+					true,
+				);
+				// Reserve the percentage column so long IDs/tasks cannot push it out.
+				const labelWidth = Math.max(
+					0,
+					(treeWidth || width) - visibleWidth(usage) - 1,
+				);
+				tree.push(
+					truncateToWidth(theme.fg(color, label), labelWidth, "", true) +
+						` ${usage}`,
+				);
 			}
 			const conversationY = height < 5 ? 0 : 1 + (treeWidth ? 0 : tree.length);
 			const editor = fitComposer(
@@ -481,7 +501,12 @@ export function createSubagentSwitcher({
 						];
 			const lines: string[] = [];
 			if (height >= 5)
-				lines.push(theme.fg("accent", `Subagents · ${node?.id ?? "none"}`));
+				lines.push(
+					theme.fg("accent", `Subagents · ${node?.id ?? "none"}`) +
+						(node
+							? ` · ${renderContextUsage(readContextUsage(node.session), theme)}`
+							: ""),
+				);
 			if (treeWidth && height >= 5) {
 				for (let row = 0; row < conversationLines.length; row++)
 					lines.push(

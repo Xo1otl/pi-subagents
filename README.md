@@ -38,6 +38,8 @@ Run `/subagents`, press **Ctrl+Shift+A**, or press **Left Arrow twice quickly** 
 
 The switcher fills the terminal, with the subagent tree on the left and a Markdown conversation and Pi-style multiline editor on the right. Very narrow terminals use a stacked layout. Tool calls and results are grouped into compact, individually collapsible blocks. Command logs stream while tools are running, including nested tools. The root transcript shows background receipts and compact completion previews; expand tools for more output or open the switcher for the conversation.
 
+The tree shows each child's current context percentage; the header shows the selected child's estimated tokens, context limit, and percentage. Usage follows Pi's context estimate, including cache tokens, context edits, compaction, and the current model—not cumulative billing or descendant charges. Above 70% it turns yellow, above 90% red (using the active theme). `?` means usage is not yet available, such as during startup or just after compaction, before the next response.
+
 Incoming output follows the bottom only while viewing live output. Scrolling up anchors the visible content instead of pushing it away as new text arrives. Each agent retains its scroll bookmark, tool expansion state, editor cursor, undo/history, and unsent draft while the switcher is open.
 
 - **Left Arrow twice quickly** at the beginning of the message text: focus the tree. Elsewhere, Left only moves the text cursor.
