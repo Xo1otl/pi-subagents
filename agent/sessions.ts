@@ -2,10 +2,13 @@ import {
 	type AgentSession,
 	createAgentSession,
 	createCodemodeExtension,
+	createEventBus,
 	createMcpExtension,
 	createToolSearchExtension,
 	DefaultResourceLoader,
+	type EventBus,
 	type ExtensionContext,
+	type ExtensionError,
 	type ExtensionFactory,
 	getAgentDir,
 	SessionManager,
@@ -13,21 +16,30 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { SessionOwner, SpawnContext } from "../runtime/index.ts";
 
-// Pi's extension loader can evaluate another copy of this module.
-const key = Symbol.for("pi-subagents.owners");
-const shared = globalThis as typeof globalThis & {
-	[key]?: WeakMap<ExtensionContext["sessionManager"], SessionOwner>;
-};
-shared[key] ??= new WeakMap();
-const owners = shared[key];
+/** Each delegated session has its own event bus, which answers this request.
+ * Unlike module state, the bus reaches every copy of this extension, including
+ * a configured installation that Pi's loader evaluates separately.
+ */
+const OWNER_REQUEST = "pi-subagents:owner";
 
-export function sessionOwner(ctx: ExtensionContext): SessionOwner | undefined {
-	return owners.get(ctx.sessionManager);
+interface OwnerRequest {
+	owner?: SessionOwner;
 }
 
-export function spawnContext(ctx: ExtensionContext): SpawnContext {
+/** The subagent a loading extension serves; undefined in a root session. */
+export function sessionOwner(events: EventBus): SessionOwner | undefined {
+	const request: OwnerRequest = {};
+	// Bus handlers run synchronously within emit.
+	events.emit(OWNER_REQUEST, request);
+	return request.owner;
+}
+
+/** Children inherit their parent's configuration, then its current selections. */
+export function spawnContext(
+	ctx: ExtensionContext,
+	owner?: SessionOwner,
+): SpawnContext {
 	if (!ctx.model) throw new Error("Select a model before spawning a subagent.");
-	const owner = sessionOwner(ctx);
 	return {
 		...owner?.runtime.get(owner.id)?.context,
 		cwd: ctx.cwd,
@@ -83,6 +95,7 @@ export async function createChildSession(
 	context: SpawnContext,
 	owner: SessionOwner,
 	onCreated: (session: AgentSession) => void,
+	onError: (error: ExtensionError) => void,
 	extension: ExtensionFactory,
 ): Promise<AgentSession> {
 	const agentDir = context.agentDir ?? getAgentDir();
@@ -97,10 +110,15 @@ export async function createChildSession(
 				return { action: "stop" };
 		});
 	};
+	const eventBus = createEventBus();
+	eventBus.on(OWNER_REQUEST, (request) => {
+		(request as OwnerRequest).owner = owner;
+	});
 	const resourceLoader = new DefaultResourceLoader({
 		cwd: context.cwd,
 		agentDir,
 		settingsManager,
+		eventBus,
 		extensionFactories: [
 			ownedWarming,
 			backgroundMonitors(owner),
@@ -133,7 +151,6 @@ export async function createChildSession(
 	});
 	await resourceLoader.reload();
 	const sessionManager = SessionManager.inMemory(context.cwd);
-	owners.set(sessionManager, owner);
 	const { session } = await createAgentSession({
 		cwd: context.cwd,
 		agentDir,
@@ -151,6 +168,7 @@ export async function createChildSession(
 	await session.bindExtensions({
 		mode: "rpc",
 		shutdownHandler: () => owner.runtime.abort(owner.id),
+		onError,
 	});
 	return session;
 }
@@ -164,7 +182,6 @@ export async function disposeChildSession(
 			reason: "quit",
 		});
 	} finally {
-		owners.delete(session.sessionManager);
 		session.dispose();
 	}
 }

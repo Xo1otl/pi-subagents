@@ -1,11 +1,9 @@
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { Theme } from "@earendil-works/pi-coding-agent";
 import {
-	Markdown,
-	type MarkdownTheme,
-	Text,
-	truncateToWidth,
-} from "@earendil-works/pi-tui";
+	getMarkdownTheme,
+	sessionEntryToContextMessages,
+	type Theme,
+} from "@earendil-works/pi-coding-agent";
+import { Markdown, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import type { Subagent, SubagentToolExecution } from "../runtime/index.ts";
 import { plain, singleLine } from "./text.ts";
 
@@ -57,32 +55,7 @@ function transcriptBlocks(node: Subagent): Block[] {
 	const messages =
 		node.session?.sessionManager
 			.getBranch()
-			.flatMap((entry): AgentMessage[] => {
-				if (entry.type === "message") return [entry.message];
-				if (entry.type === "custom_message")
-					return [
-						{
-							role: "custom",
-							...entry,
-							timestamp: Date.parse(entry.timestamp),
-						},
-					];
-				if (entry.type === "compaction" || entry.type === "branch_summary")
-					return [
-						{
-							role:
-								entry.type === "compaction"
-									? "compactionSummary"
-									: "branchSummary",
-							summary: entry.summary,
-							tokensBefore:
-								entry.type === "compaction" ? entry.tokensBefore : 0,
-							fromId: entry.type === "branch_summary" ? entry.fromId : null,
-							timestamp: Date.parse(entry.timestamp),
-						},
-					];
-				return [];
-			}) ?? [];
+			.flatMap((entry) => sessionEntryToContextMessages(entry)) ?? [];
 	const streaming = node.session?.state.streamingMessage;
 	if (
 		streaming &&
@@ -204,25 +177,6 @@ function transcriptBlocks(node: Subagent): Block[] {
 	return blocks;
 }
 
-function markdownTheme(theme: ChatTheme): MarkdownTheme {
-	return {
-		heading: (text) => theme.fg("mdHeading", text),
-		link: (text) => theme.fg("mdLink", text),
-		linkUrl: (text) => theme.fg("mdLinkUrl", text),
-		code: (text) => theme.fg("mdCode", text),
-		codeBlock: (text) => theme.fg("mdCodeBlock", text),
-		codeBlockBorder: (text) => theme.fg("mdCodeBlockBorder", text),
-		quote: (text) => theme.fg("mdQuote", text),
-		quoteBorder: (text) => theme.fg("mdQuoteBorder", text),
-		hr: (text) => theme.fg("mdHr", text),
-		listBullet: (text) => theme.fg("mdListBullet", text),
-		bold: (text) => `\x1b[1m${text}\x1b[22m`,
-		italic: (text) => `\x1b[3m${text}\x1b[23m`,
-		strikethrough: (text) => `\x1b[9m${text}\x1b[29m`,
-		underline: (text) => `\x1b[4m${text}\x1b[24m`,
-	};
-}
-
 function argumentPreview(args: unknown): string {
 	if (!args || typeof args !== "object") return "";
 	for (const key of ["command", "path", "instructions", "pattern"] as const)
@@ -254,7 +208,7 @@ function renderBlock(
 		const body =
 			block.label === "user"
 				? new Text(text, 0, 0)
-				: new Markdown(text, 0, 0, markdownTheme(theme));
+				: new Markdown(text, 0, 0, getMarkdownTheme());
 		return [truncateToWidth(header, width), ...body.render(width)];
 	}
 	const color =

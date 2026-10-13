@@ -1,4 +1,7 @@
-import type { Theme } from "@earendil-works/pi-coding-agent";
+import {
+	getSelectListTheme,
+	type Theme,
+} from "@earendil-works/pi-coding-agent";
 import {
 	CURSOR_MARKER,
 	Editor,
@@ -57,13 +60,7 @@ export class ChatEditor extends Editor {
 		// Editor uses only terminal.rows and requestRender from the enclosing TUI.
 		super(tui as TUI, {
 			borderColor: (text) => theme.fg("dim", text),
-			selectList: {
-				selectedPrefix: (text) => theme.fg("accent", text),
-				selectedText: (text) => theme.fg("accent", text),
-				description: (text) => theme.fg("muted", text),
-				scrollInfo: (text) => theme.fg("dim", text),
-				noMatch: (text) => theme.fg("warning", text),
-			},
+			selectList: getSelectListTheme(),
 		});
 	}
 

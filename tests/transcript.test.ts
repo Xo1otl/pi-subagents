@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { AgentSession } from "@earendil-works/pi-coding-agent";
+import { type AgentSession, initTheme } from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import type { Subagent, SubagentToolExecution } from "../runtime/index.ts";
 import {
@@ -9,6 +9,8 @@ import {
 } from "../ui/transcript.ts";
 import { model, response, toolCall } from "./fixtures.ts";
 
+// Markdown follows Pi's active theme, like the main transcript.
+initTheme("dark");
 const theme = { fg: (_color: string, text: string) => text };
 function node(
 	messages: AgentMessage[] = [],

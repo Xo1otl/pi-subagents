@@ -1,8 +1,9 @@
-import type {
-	Api,
-	AssistantMessage,
-	Model,
-	Usage,
+import {
+	type Api,
+	type AssistantMessage,
+	contentText,
+	type Model,
+	type Usage,
 } from "@earendil-works/pi-ai";
 import type {
 	SessionEntry,
@@ -123,11 +124,6 @@ export function summarizeRun(
 		status = "done";
 	}
 	const output =
-		error ||
-		final?.content
-			.filter((part) => part.type === "text")
-			.map((part) => part.text)
-			.join("\n") ||
-		"(no output)";
+		error || (final && contentText(final.content)) || "(no output)";
 	return { status, error, output, usage };
 }

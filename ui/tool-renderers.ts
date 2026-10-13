@@ -1,4 +1,5 @@
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
+import { contentText } from "@earendil-works/pi-ai";
 import type {
 	Theme,
 	ToolRenderResultOptions,
@@ -32,12 +33,7 @@ export function renderSubagentResult(
 	theme: Pick<Theme, "fg">,
 ): Text {
 	if (isPartial) return new Text(theme.fg("muted", "Delegating…"), 0, 0);
-	const text = plain(
-		result.content
-			.filter((part) => part.type === "text")
-			.map((part) => part.text)
-			.join("\n"),
-	);
+	const text = plain(contentText(result.content));
 	if (isSubagentReceipt(result.details)) {
 		const { id } = result.details;
 		return new Text(

@@ -34,8 +34,14 @@ import {
 /** Compose execution with Pi's session lifecycle, without loading presentation. */
 export function createSubagentRuntime(): Subagents {
 	return createSubagents({
-		createSession: (context, owner, onCreated) =>
-			createChildSession(context, owner, onCreated, subagentsExtension),
+		createSession: (context, owner, onCreated, onError) =>
+			createChildSession(
+				context,
+				owner,
+				onCreated,
+				onError,
+				subagentsExtension,
+			),
 		disposeSession: disposeChildSession,
 	});
 }
@@ -53,7 +59,6 @@ interface SessionBinding {
 	parentId: string;
 	manager: ExtensionContext["sessionManager"];
 	sessionId: string;
-	active: boolean;
 	/** Only cancellation aborts a headless session; it fences that session's older children. */
 	abortEpoch: number;
 	stopWatchingAbort: () => void;
@@ -71,7 +76,8 @@ export function createSubagentIntegration(
 	pi: ExtensionAPI,
 	view?: SubagentView,
 ) {
-	let runtime: Subagents | undefined;
+	// Each delegated session loads its own extensions, so the owner is fixed.
+	const owner = sessionOwner(pi.events);
 	let binding: SessionBinding | undefined;
 
 	function discardPending(source: SessionBinding): Promise<void> {
@@ -88,17 +94,13 @@ export function createSubagentIntegration(
 
 	function invalidate(): Promise<void> {
 		const source = binding;
-		if (source) {
-			source.active = false;
-			source.stopWatchingAbort();
-		}
+		source?.stopWatchingAbort();
 		binding = undefined;
-		runtime = undefined;
 		return source ? discardPending(source) : Promise.resolve();
 	}
 
 	function isCurrent(source: SessionBinding, ctx: ExtensionContext): boolean {
-		if (!source.active || binding !== source) return false;
+		if (binding !== source) return false;
 		try {
 			// This guarded getter also detects dispose/replacement without a shutdown event.
 			return (
@@ -131,8 +133,8 @@ export function createSubagentIntegration(
 		return binding.accounting.splice(0);
 	}
 
-	// Custom drafts persist metadata, not model context. Pi 1.1.0 cannot attach
-	// usage to these drafts; the actual billing entry is appended separately.
+	// Custom drafts persist metadata, not model context. Boundary drafts cannot
+	// carry usage; the actual billing entry is appended separately.
 	function appendAccounting(
 		event: BoundaryState,
 		ctx: ExtensionContext,
@@ -214,12 +216,11 @@ export function createSubagentIntegration(
 	pi.on("session_tree", releaseAfterIdleWork);
 
 	const current = (): Subagents => {
-		if (!runtime) throw new Error("Subagents are not initialized.");
-		return runtime;
+		if (!binding) throw new Error("Subagents are not initialized.");
+		return binding.runtime;
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
-		const owner = sessionOwner(ctx);
 		const previous = binding;
 		try {
 			view?.dispose();
@@ -228,13 +229,12 @@ export function createSubagentIntegration(
 			if (previous?.parentId === ROOT) await previous.runtime.dispose();
 			await cleanup;
 		}
-		runtime = owner?.runtime ?? createSubagentRuntime();
+		const runtime = owner?.runtime ?? createSubagentRuntime();
 		binding = {
 			runtime,
 			parentId: owner?.id ?? ROOT,
 			manager: ctx.sessionManager,
 			sessionId: ctx.sessionManager.getSessionId(),
-			active: true,
 			abortEpoch: 0,
 			stopWatchingAbort: () => {},
 			accounting: [],
@@ -246,8 +246,7 @@ export function createSubagentIntegration(
 		if (!owner) view?.bind(runtime, ctx);
 	});
 	pi.on("session_shutdown", async (event, ctx) => {
-		const owner = sessionOwner(ctx);
-		const previous = runtime;
+		const previous = binding?.runtime;
 		flushAccounting(ctx);
 		// Fence deliveries before awaiting cancellation or asynchronous initialization.
 		try {
@@ -284,7 +283,7 @@ export function createSubagentIntegration(
 			if (!source || !isCurrent(source, ctx))
 				throw new Error("Subagent parent session is no longer active.");
 			const epoch = source.abortEpoch;
-			const context = spawnContext(ctx);
+			const context = spawnContext(ctx, owner);
 			// After receipt, this job belongs to the runtime, not the parent's turn signal.
 			const started = tree.start(source.parentId, instructions, context);
 			const canDeliver = () =>

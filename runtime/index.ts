@@ -5,7 +5,9 @@ import type {
 import type { Api, Model, Usage } from "@earendil-works/pi-ai";
 import type {
 	AgentSession,
+	AgentSessionEvent,
 	CreateAgentSessionOptions,
+	ExtensionError,
 } from "@earendil-works/pi-coding-agent";
 import { type RunSummary, summarizeRun } from "./summary.ts";
 
@@ -24,11 +26,14 @@ export interface SessionOwner {
 	id: string;
 }
 
-/** onCreated transfers cleanup ownership, even if initialization later rejects. */
+/** onCreated transfers cleanup ownership, even if initialization later rejects.
+ * onError receives the session's extension errors, e.g. through bindExtensions.
+ */
 export type ChildSessionFactory = (
 	context: SpawnContext,
 	owner: SessionOwner,
 	onCreated: (session: AgentSession) => void,
+	onError: (error: ExtensionError) => void,
 ) => Promise<AgentSession>;
 
 export interface SubagentsOptions {
@@ -104,26 +109,28 @@ export interface Subagents {
 
 type Writable<T> = { -readonly [K in keyof T]: T[K] };
 
+interface ActiveRun {
+	/** Serialize input preflight, not entire prompts or delegated runs. */
+	preflight: Promise<void>;
+	/** Settles once the run, including descendant delivery, finishes. */
+	settled: Promise<void>;
+	/** Children's usage by ID, billed even when cancellation suppresses delivery. */
+	delegatedUsage: Map<string, Usage>;
+}
+
 interface SubagentNode extends Writable<Subagent> {
 	liveTools: Map<string, SubagentToolExecution>;
 	/** Input awaiting the session's preflight; identity distinguishes equal texts. */
 	pendingInput: Set<{ readonly text: string }>;
-	/** Settles once the current run, including descendant delivery, finishes. */
-	operation?: Promise<void>;
+	/** Present exactly while status is "running". */
+	run?: ActiveRun;
 	unsubscribe: () => void;
-}
-
-interface ActiveRun {
-	/** Serialize input preflight, not entire prompts or delegated runs. */
-	preflight: Promise<void>;
 }
 
 interface SubagentsState {
 	nodes: Map<string, SubagentNode>;
-	runs: Map<string, ActiveRun>;
 	completions: Map<string, Set<Promise<void>>>;
 	completionErrors: unknown[];
-	delegatedUsage: Map<string, Map<string, Usage>>;
 	listeners: Set<() => void>;
 	childCounts: Map<string, number>;
 	closing?: Promise<void>;
@@ -169,6 +176,33 @@ function belongsTo(
 	return false;
 }
 
+function recordError(node: SubagentNode, error: unknown): void {
+	node.error ??= error instanceof Error ? error.message : String(error);
+}
+
+/** Merge one execution event into the call's raw snapshot. */
+function toolSnapshot(
+	event: Extract<
+		AgentSessionEvent,
+		{ type: `tool_execution_${"start" | "update" | "end"}` }
+	>,
+	previous: SubagentToolExecution | undefined,
+): SubagentToolExecution {
+	const ended = event.type === "tool_execution_end";
+	return {
+		toolCallId: event.toolCallId,
+		toolName: event.toolName,
+		args: ended ? previous?.args : event.args,
+		parentToolCallId: event.parentToolCallId ?? previous?.parentToolCallId,
+		result: ended
+			? event.result
+			: event.type === "tool_execution_update"
+				? event.partialResult
+				: undefined,
+		status: ended ? (event.isError ? "error" : "done") : "running",
+	};
+}
+
 /** Owns one session's mutable state; all operations are safe to pass as callbacks. */
 export function createSubagents({
 	createSession,
@@ -176,10 +210,8 @@ export function createSubagents({
 }: SubagentsOptions): Subagents {
 	const state: SubagentsState = {
 		nodes: new Map(),
-		runs: new Map(),
 		completions: new Map(),
 		completionErrors: [],
-		delegatedUsage: new Map(),
 		listeners: new Set(),
 		childCounts: new Map(),
 		disposed: false,
@@ -228,7 +260,7 @@ export function createSubagents({
 			},
 		};
 		state.nodes.set(id, node);
-		const parentUsage = state.delegatedUsage.get(parentId);
+		const parentUsage = parent?.run?.delegatedUsage;
 		const result = run(node, instructions, signal);
 		// Observe even detached results; the original promise remains usable by callers.
 		void result.catch(() => {});
@@ -255,8 +287,7 @@ export function createSubagents({
 		// Observe detached work, but retain failures even if they settle before drainage.
 		void completion.then(remove, (error: unknown) => {
 			const node = state.nodes.get(parentId);
-			if (node?.operation)
-				node.error ??= error instanceof Error ? error.message : String(error);
+			if (node?.run) recordError(node, error);
 			else state.completionErrors.push(error);
 			remove();
 		});
@@ -320,10 +351,9 @@ export function createSubagents({
 		const node = state.nodes.get(id);
 		if (!node) throw new Error(`Unknown subagent: ${id}`);
 		if (!instructions.trim()) return;
-		const active = state.runs.get(id);
-		if (active) {
+		if (node.run) {
 			if (node.cancelled) throw new Error(`Subagent ${id} is stopping.`);
-			const prompt = submit(node, active, instructions, true);
+			const prompt = submit(node, node.run, instructions, true);
 			changed();
 			await prompt;
 			changed();
@@ -340,30 +370,25 @@ export function createSubagents({
 		node.status = "running";
 		node.error = undefined;
 		node.liveTools.clear();
-		const delegatedUsage = new Map<string, Usage>();
-		state.delegatedUsage.set(node.id, delegatedUsage);
+		let initialized = () => {};
 		let settle = () => {};
 		// Track the whole delegated run before any lifecycle callback can request shutdown.
-		node.operation = new Promise<void>((resolve) => {
-			settle = resolve;
-		});
-		const operation = node.operation;
-		let initialized = () => {};
 		const active: ActiveRun = {
 			preflight: new Promise<void>((resolve) => {
 				initialized = resolve;
 			}),
+			settled: new Promise<void>((resolve) => {
+				settle = resolve;
+			}),
+			delegatedUsage: new Map(),
 		};
-		state.runs.set(node.id, active);
+		node.run = active;
 		// Reserve the original input ahead of sends made by initialization listeners.
 		const prompt = submit(node, active, instructions, sent);
 		const cancel = () => abort(node.id);
 		const finish = () => {
 			signal?.removeEventListener("abort", cancel);
-			if (state.runs.get(node.id) === active) state.runs.delete(node.id);
-			if (node.operation === operation) node.operation = undefined;
-			if (state.delegatedUsage.get(node.id) === delegatedUsage)
-				state.delegatedUsage.delete(node.id);
+			if (node.run === active) node.run = undefined;
 			settle();
 		};
 		try {
@@ -380,55 +405,10 @@ export function createSubagents({
 					await createSession(
 						node.context,
 						{ runtime: operations, id: node.id },
-						(session) => {
-							node.unsubscribe();
-							node.session = session;
-							const unsubscribeErrors = session.extensionRunner?.onError(
-								(error) => {
-									if (node.operation) node.error ??= error.error;
-									else state.completionErrors.push(new Error(error.error));
-									changed();
-								},
-							);
-							const unsubscribe = session.subscribe((event) => {
-								// Cancellation can precede async prompt validation and loop startup.
-								if (node.cancelled && event.type === "agent_start")
-									stopSession(session);
-								if (
-									event.type === "tool_execution_start" ||
-									event.type === "tool_execution_update" ||
-									event.type === "tool_execution_end"
-								) {
-									const previous = node.liveTools.get(event.toolCallId);
-									node.liveTools.set(event.toolCallId, {
-										toolCallId: event.toolCallId,
-										toolName: event.toolName,
-										args:
-											event.type === "tool_execution_end"
-												? previous?.args
-												: event.args,
-										parentToolCallId:
-											event.parentToolCallId ?? previous?.parentToolCallId,
-										result:
-											event.type === "tool_execution_end"
-												? event.result
-												: event.type === "tool_execution_update"
-													? event.partialResult
-													: undefined,
-										status:
-											event.type === "tool_execution_end"
-												? event.isError
-													? "error"
-													: "done"
-												: "running",
-									});
-								}
-								changed();
-							});
-							node.unsubscribe = () => {
-								unsubscribe();
-								unsubscribeErrors?.();
-							};
+						(session) => attach(node, session),
+						(error) => {
+							if (node.run) node.error ??= error.error;
+							else state.completionErrors.push(new Error(error.error));
 							changed();
 						},
 					);
@@ -438,23 +418,12 @@ export function createSubagents({
 				if (node.session)
 					start = node.session.sessionManager.getEntries().length;
 			} catch (error) {
-				node.error ??= error instanceof Error ? error.message : String(error);
+				recordError(node, error);
 				if (creatingSession && node.session) {
 					// A published session whose binding failed is not reusable.
 					const session = node.session;
 					node.session = undefined;
-					try {
-						await disposeSession(session);
-					} catch (error) {
-						state.completionErrors.push(error);
-					} finally {
-						try {
-							node.unsubscribe();
-						} catch (error) {
-							state.completionErrors.push(error);
-						}
-						node.unsubscribe = () => {};
-					}
+					await detach(node, session);
 				}
 			} finally {
 				initialized();
@@ -463,13 +432,13 @@ export function createSubagents({
 			try {
 				await prompt;
 			} catch (error) {
-				node.error ??= error instanceof Error ? error.message : String(error);
+				recordError(node, error);
 			}
 			for (;;) {
 				try {
 					await drain(node);
 				} catch (error) {
-					node.error ??= error instanceof Error ? error.message : String(error);
+					recordError(node, error);
 					break;
 				}
 				// Recheck after the await: new completion/input preflight can arrive in
@@ -485,7 +454,7 @@ export function createSubagents({
 				node.session?.sessionManager.getEntries().slice(start) ?? [],
 				node.cancelled,
 				node.error,
-				delegatedUsage,
+				active.delegatedUsage,
 			);
 			node.status = summary.status;
 			node.error = summary.error;
@@ -500,6 +469,46 @@ export function createSubagents({
 		} finally {
 			initialized();
 			finish();
+		}
+	}
+
+	/** Mirror a published session's events into its node. */
+	function attach(node: SubagentNode, session: AgentSession): void {
+		node.unsubscribe();
+		node.session = session;
+		node.unsubscribe = session.subscribe((event) => {
+			// Cancellation can precede async prompt validation and loop startup.
+			if (node.cancelled && event.type === "agent_start") stopSession(session);
+			if (
+				event.type === "tool_execution_start" ||
+				event.type === "tool_execution_update" ||
+				event.type === "tool_execution_end"
+			)
+				node.liveTools.set(
+					event.toolCallId,
+					toolSnapshot(event, node.liveTools.get(event.toolCallId)),
+				);
+			changed();
+		});
+		changed();
+	}
+
+	/** Cleanup failures are reported at shutdown, never thrown at the caller. */
+	async function detach(
+		node: SubagentNode,
+		session: AgentSession | undefined,
+	): Promise<void> {
+		try {
+			if (session) await disposeSession(session);
+		} catch (error) {
+			state.completionErrors.push(error);
+		} finally {
+			try {
+				node.unsubscribe();
+			} catch (error) {
+				state.completionErrors.push(error);
+			}
+			node.unsubscribe = () => {};
 		}
 	}
 
@@ -539,7 +548,7 @@ export function createSubagents({
 		state.disposed = true;
 		// Publish the closing promise before notifying listeners that may request shutdown again.
 		state.closing = Promise.allSettled(
-			[...state.nodes.values()].map((node) => node.operation),
+			[...state.nodes.values()].map((node) => node.run?.settled),
 		).then(async () => {
 			// Result handlers may register billing/delivery after shutdown began.
 			while (state.completions.size) {
@@ -548,28 +557,14 @@ export function createSubagents({
 				);
 			}
 			await Promise.all(
-				[...state.nodes.values()].map(async (node) => {
-					try {
-						if (node.session) await disposeSession(node.session);
-					} catch (error) {
-						state.completionErrors.push(error);
-					} finally {
-						try {
-							node.unsubscribe();
-						} catch (error) {
-							state.completionErrors.push(error);
-						}
-					}
-				}),
+				[...state.nodes.values()].map((node) => detach(node, node.session)),
 			);
 			const errors = [...state.completionErrors];
 			state.listeners.clear();
 			state.nodes.clear();
-			state.runs.clear();
 			state.childCounts.clear();
 			state.completions.clear();
 			state.completionErrors.length = 0;
-			state.delegatedUsage.clear();
 			if (errors.length)
 				throw new AggregateError(errors, "Subagent cleanup failed.");
 		});

@@ -42,6 +42,7 @@ test("runtime owns execution but delegates session creation and disposal", async
 			context,
 			{ runtime, id: "1" },
 			expect.any(Function),
+			expect.any(Function),
 		);
 		expect(prompt).toHaveBeenCalledWith("task instructions", {
 			streamingBehavior: "steer",
