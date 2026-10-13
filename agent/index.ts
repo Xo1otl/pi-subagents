@@ -222,7 +222,7 @@ export function createSubagentIntegration(
 	const tool = defineTool({
 		name: "subagent",
 		label: "Subagent",
-		description: "Results arrive on completion.",
+		description: "Final reply is sent to the parent.",
 		parameters: Type.Object({
 			instructions: Type.String({ minLength: 1 }),
 		}),
