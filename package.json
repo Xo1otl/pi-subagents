@@ -9,9 +9,9 @@
 	],
 	"files": [
 		"index.ts",
-		"runtime.ts",
-		"sessions.ts",
-		"switcher.ts",
+		"agent/",
+		"runtime/",
+		"ui/",
 		"README.md"
 	],
 	"pi": {

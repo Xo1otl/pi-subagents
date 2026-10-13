@@ -10,5 +10,11 @@
 		"skipLibCheck": true,
 		"types": ["bun"]
 	},
-	"include": ["*.ts", "tests/**/*.ts"]
+	"include": [
+		"index.ts",
+		"agent/**/*.ts",
+		"runtime/**/*.ts",
+		"ui/**/*.ts",
+		"tests/**/*.ts"
+	]
 }

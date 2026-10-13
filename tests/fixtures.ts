@@ -11,8 +11,16 @@ import {
 	type SimpleStreamOptions,
 	type TranscriptContext,
 } from "@earendil-works/pi-ai";
-import { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import type { SpawnContext } from "../runtime.ts";
+import {
+	createAgentSession,
+	DefaultResourceLoader,
+	type ExtensionContext,
+	type ExtensionFactory,
+	ModelRuntime,
+	SessionManager,
+	SettingsManager,
+} from "@earendil-works/pi-coding-agent";
+import type { SpawnContext } from "../runtime/index.ts";
 
 export const model: Model<"openai-responses"> = {
 	id: "test-model",
@@ -138,7 +146,15 @@ export const hierarchyStream = stream((context) => {
 	if (last?.role === "toolResult") {
 		return last.isError
 			? response("", { stopReason: "error", errorMessage: text })
-			: response(text);
+			: response("Delegated work is running.");
+	}
+	const completion = /^Subagent [\d.]+ (done|error|aborted)\.\n([\s\S]*)$/.exec(
+		text,
+	);
+	if (completion) {
+		return completion[1] === "done"
+			? response(completion[2] ?? "")
+			: response("", { stopReason: "error", errorMessage: completion[2] });
 	}
 	const match = /^nest:(\d+)$/.exec(text);
 	if (match && Number(match[1]) > 0) {
@@ -150,8 +166,11 @@ export const hierarchyStream = stream((context) => {
 });
 
 const directories: string[] = [];
+const sharedKeys: symbol[] = [];
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 afterEach(async () => {
+	for (const key of sharedKeys.splice(0))
+		Reflect.deleteProperty(globalThis, key);
 	if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 	else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
 	await Promise.all(
@@ -212,6 +231,73 @@ export async function spawnContext(
 	};
 }
 
+export function deferred<T = void>() {
+	let resolve!: (value: T | PromiseLike<T>) => void;
+	let reject!: (reason?: unknown) => void;
+	const promise = new Promise<T>((yes, no) => {
+		resolve = yes;
+		reject = no;
+	});
+	return { promise, resolve, reject };
+}
+
+/** A root SDK session, with the same deterministic provider available to children. */
+export async function parentSession(
+	streamFn: Provider["streamSimple"],
+	extensionFactories: ExtensionFactory[],
+	onChildStart?: (ctx: ExtensionContext) => Promise<void>,
+	onChildLoad?: ExtensionFactory,
+) {
+	const context = await spawnContext(streamFn);
+	if (!context.agentDir) throw new Error("Missing test agent directory");
+	const key = Symbol.for(`pi-subagents.fixture.${crypto.randomUUID()}`);
+	sharedKeys.push(key);
+	Reflect.set(globalThis, key, {
+		provider: testProvider(streamFn),
+		onChildStart,
+		onChildLoad,
+	});
+	await mkdir(join(context.agentDir, "extensions"));
+	await writeFile(
+		join(context.agentDir, "extensions", "provider.js"),
+		`export default function(pi) {
+			const shared = globalThis[Symbol.for(${JSON.stringify(Symbol.keyFor(key))})];
+			pi.registerProvider(shared.provider);
+			shared.onChildLoad?.(pi);
+			if (shared.onChildStart) pi.on("session_start", (_event, ctx) => shared.onChildStart(ctx));
+		}`,
+	);
+	const settingsManager = SettingsManager.inMemory({
+		cacheWarming: "off",
+		compaction: { enabled: false },
+		retry: { enabled: false },
+	});
+	const resourceLoader = new DefaultResourceLoader({
+		cwd: context.cwd,
+		agentDir: context.agentDir,
+		settingsManager,
+		noExtensions: true,
+		noSkills: true,
+		noContextFiles: true,
+		noPromptTemplates: true,
+		noThemes: true,
+		extensionFactories: [
+			// reload() resets API registrations; restore the root's deterministic provider too.
+			(pi) => pi.registerProvider(testProvider(streamFn)),
+			...extensionFactories,
+		],
+	});
+	await resourceLoader.reload();
+	const { session } = await createAgentSession({
+		...context,
+		settingsManager,
+		resourceLoader,
+		sessionManager: SessionManager.inMemory(context.cwd),
+	});
+	await session.bindExtensions({ mode: "print", shutdownHandler: () => {} });
+	return session;
+}
+
 export function waiting(signal?: AbortSignal): Promise<never> {
 	return new Promise((_resolve, reject) => {
 		if (signal?.aborted) reject(new Error("aborted"));
@@ -222,8 +308,11 @@ export function waiting(signal?: AbortSignal): Promise<never> {
 	});
 }
 
-export async function until(predicate: () => boolean): Promise<void> {
-	const deadline = Date.now() + 5000;
+export async function until(
+	predicate: () => boolean,
+	timeoutMs = 5000,
+): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
 		if (predicate()) return;
 		await Bun.sleep(1);

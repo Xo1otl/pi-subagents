@@ -17,9 +17,10 @@ import {
 	stream,
 	testProvider,
 	toolCall,
+	until,
 } from "./fixtures.ts";
 
-test("loads as a real pi extension and delegates runtime instructions without intermediate parent events", async () => {
+test("loads as a real pi extension and delivers completion separately from the running receipt", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "pi-subagents-sdk-"));
 	const settings = SettingsManager.inMemory({
 		cacheWarming: "off",
@@ -45,13 +46,14 @@ test("loads as a real pi extension and delegates runtime instructions without in
 	});
 	const dispatch = stream((context) => {
 		const last = context.messages.at(-1);
-		if (
-			last?.role === "user" &&
-			lastText(context) === 'spawn subagent with: "say hello"'
-		) {
+		const text = lastText(context);
+		if (last?.role === "user" && text === 'spawn subagent with: "say hello"')
 			return toolCall("subagent", { instructions: "say hello" });
-		}
-		return response(last?.role === "toolResult" ? lastText(context) : "hello");
+		const completion =
+			/^Subagent [\d.]+ (?:done|error|aborted)\.\n([\s\S]*)$/.exec(text);
+		return response(
+			completion?.[1] ?? (last?.role === "toolResult" ? "Delegated" : "hello"),
+		);
 	});
 	modelRuntime.registerNativeProvider(testProvider(dispatch));
 	const name = `pi-subagents.test-provider.${crypto.randomUUID()}`;
@@ -87,6 +89,15 @@ test("loads as a real pi extension and delegates runtime instructions without in
 			events.push(event.type);
 		});
 		await session.prompt('spawn subagent with: "say hello"');
+		await until(
+			() =>
+				session.isIdle &&
+				session.messages.some(
+					(message) =>
+						message.role === "custom" &&
+						message.customType === "subagent-result",
+				),
+		);
 		expect(session.getLastAssistantText()).toBe("hello");
 		expect(
 			events.filter((event) => event === "tool_execution_start"),
@@ -99,35 +110,27 @@ test("loads as a real pi extension and delegates runtime instructions without in
 		).toHaveLength(1);
 		expect(
 			session.messages.filter((message) => message.role === "assistant"),
-		).toHaveLength(2);
+		).toHaveLength(3);
 		const result = session.messages.find(
 			(message) => message.role === "toolResult",
 		);
-		expect(result?.role === "toolResult" && result.usage?.totalTokens).toBe(3);
+		expect(result?.role === "toolResult" && result.details).toEqual({
+			id: "1",
+			status: "running",
+		});
+		expect(result?.role === "toolResult" && result.usage).toBeUndefined();
+		expect(session.getSessionStats().tokens.total).toBe(12);
+		expect(
+			session.sessionManager
+				.getEntries()
+				.filter(
+					(entry) =>
+						entry.type === "custom" && entry.customType === "subagent-usage",
+				),
+		).toHaveLength(1);
 		const tool = session.getToolDefinition("subagent");
-		// Renderers use no host context or theme for their empty in-flight display.
-		expect(
-			tool
-				?.renderCall?.({ instructions: "hello" }, {} as never, {} as never)
-				.render(80),
-		).toEqual([]);
-		expect(
-			tool
-				?.renderResult?.(
-					{ content: [], details: {} },
-					{ expanded: false, isPartial: true },
-					{} as never,
-					{} as never,
-				)
-				.render(80),
-		).toEqual([]);
-		await session.prompt("/subagents depth 0");
-		await session.prompt('spawn subagent with: "say hello"');
-		const results = session.messages.filter(
-			(message) => message.role === "toolResult",
-		);
-		expect(results.at(-1)?.isError).toBe(true);
-		expect(JSON.stringify(results.at(-1)?.content)).toContain("max depth 0");
+		expect(tool?.renderCall).toBeDefined();
+		expect(tool?.renderResult).toBeDefined();
 		unsubscribe();
 	} finally {
 		await session.extensionRunner?.emit({

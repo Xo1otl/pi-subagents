@@ -10,14 +10,10 @@ import {
 	SessionManager,
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { createSubagentRuntime } from "../agent/index.ts";
+import { spawnContext } from "../agent/sessions.ts";
 import extension from "../index.ts";
-import {
-	createSubagents,
-	ROOT,
-	type SpawnContext,
-	type Subagents,
-} from "../runtime.ts";
-import { spawnContext } from "../sessions.ts";
+import { ROOT, type SpawnContext, type Subagents } from "../runtime/index.ts";
 import {
 	lastText,
 	model,
@@ -84,7 +80,7 @@ async function setup({
 	});
 	parents.push(parent);
 	await parent.bindExtensions({ mode: "print" });
-	const tree = createSubagents();
+	const tree = createSubagentRuntime();
 	trees.push(tree);
 	return { parent, tree, context, cwd, agentDir };
 }
@@ -140,12 +136,10 @@ test("loads workspace instructions, skills, templates and settings into a fresh 
 		"STANDARD_TEMPLATE_MARKER $1",
 	);
 	await parent.prompt("an earlier task");
-	const result = await tree.spawn(ROOT, "/standard details", context);
+	const result = await tree.start(ROOT, "/standard details", context).result;
 	const child = tree.get("1")?.session;
 	if (!child) throw new Error("Missing child");
-	expect(result.content).toEqual([
-		{ type: "text", text: "STANDARD_TEMPLATE_MARKER details" },
-	]);
+	expect(result.output).toBe("STANDARD_TEMPLATE_MARKER details");
 	for (const marker of [
 		"expert coding assistant",
 		"PROJECT_INSTRUCTIONS_MARKER",
@@ -164,25 +158,36 @@ test("loads workspace instructions, skills, templates and settings into a fresh 
 	expect(JSON.stringify(child.messages)).not.toContain("an earlier task");
 });
 
-test("loads the same subagents extension in every session", async () => {
+test("provides machine-facing delegation in children without loading UI registrations", async () => {
 	const { tree, context } = await setup();
-	await tree.spawn(ROOT, "child", context);
+	await tree.start(ROOT, "child", context).result;
 	const child = tree.get("1")?.session;
 	if (!child) throw new Error("Missing child");
-	expect(child.getToolDefinition("subagent")).toBeDefined();
-	await child.prompt("/subagents depth 0");
-	expect(tree.maxDepth).toBe(0);
-	await child.prompt("/subagents depth 3");
-	expect(tree.maxDepth).toBe(3);
+	const tool = child.getToolDefinition("subagent");
+	expect(tool).toBeDefined();
+	expect(tool?.renderCall).toBeUndefined();
+	expect(tool?.renderResult).toBeUndefined();
+	const extensions = child.resourceLoader.getExtensions();
+	expect(extensions.errors).toEqual([]);
+	const delegation = extensions.extensions.find((entry) =>
+		entry.tools.has("subagent"),
+	);
+	expect(delegation?.path).toBe("<inline:subagents>");
+	expect(delegation?.commands.size).toBe(0);
+	expect(delegation?.shortcuts.size).toBe(0);
+	expect(delegation?.toolRenderers ?? []).toHaveLength(0);
+	expect(child.systemPrompt).not.toContain("/subagents");
 });
 
 test("configured web search remains available throughout nested delegation", async () => {
 	const { tree, context } = await setup({
 		settings: { defaultTools: ["read", "grep"] },
 		streamFn: stream((context) => {
-			if (context.messages.at(-1)?.role === "toolResult")
-				return response(lastText(context));
-			return lastText(context) === "delegate search"
+			const text = lastText(context);
+			if (text.startsWith("Subagent "))
+				return response(text.split("\n").slice(1).join("\n"));
+			if (context.messages.at(-1)?.role === "toolResult") return response(text);
+			return text === "delegate search"
 				? toolCall("subagent", { instructions: "search" })
 				: toolCall("web_search", { query: "pi" });
 		}),
@@ -199,11 +204,9 @@ test("configured web search remains available throughout nested delegation", asy
 		});
 	`,
 	);
-	const result = await tree.spawn(ROOT, "delegate search", context);
-	expect(result.isError).toBe(false);
-	expect(result.content).toEqual([
-		{ type: "text", text: `pi:${tree.get("1.1")?.session?.sessionId}` },
-	]);
+	const result = await tree.start(ROOT, "delegate search", context).result;
+	expect(result.status).toBe("done");
+	expect(result.output).toBe(`pi:${tree.get("1.1")?.session?.sessionId}`);
 	expect(tree.tree()).toHaveLength(2);
 	for (const node of tree.tree()) {
 		expect(node.session?.getActiveToolNames().toSorted()).toEqual(
@@ -216,8 +219,10 @@ test("runs recursive delegation through pi's codemode extension", async () => {
 	const { tree, context } = await setup({
 		settings: { defaultTools: ["+codemode"] },
 		streamFn: stream((context) => {
-			if (context.messages.at(-1)?.role === "toolResult")
-				return response(lastText(context));
+			const text = lastText(context);
+			if (text.startsWith("Subagent "))
+				return response(text.split("\n").slice(1).join("\n"));
+			if (context.messages.at(-1)?.role === "toolResult") return response(text);
 			return toolCall("codemode", {
 				code:
 					lastText(context) === "delegate"
@@ -226,12 +231,11 @@ test("runs recursive delegation through pi's codemode extension", async () => {
 			});
 		}),
 	});
-	const result = await tree.spawn(ROOT, "delegate", context);
-	expect(result.isError).toBe(false);
-	expect(JSON.stringify(result.content)).toContain(
-		"PROJECT_INSTRUCTIONS_MARKER",
-	);
-	expect(result.usage?.totalTokens).toBe(12);
+	const result = await tree.start(ROOT, "delegate", context).result;
+	expect(result.status).toBe("done");
+	expect(result.output).toContain("PROJECT_INSTRUCTIONS_MARKER");
+	// The background receipt and completion are separate parent turns.
+	expect(result.usage?.totalTokens).toBe(15);
 	expect(tree.tree().map((node) => node.id)).toEqual(["1", "1.1"]);
 });
 
@@ -258,9 +262,9 @@ test("uses configured MCP servers during nested delegation", async () => {
 			},
 		}),
 	);
-	const result = await tree.spawn(ROOT, "delegate", context);
-	expect(result.isError).toBe(false);
-	expect(result.content).toEqual([{ type: "text", text: "MCP_MARKER" }]);
+	const result = await tree.start(ROOT, "delegate", context).result;
+	expect(result.status).toBe("done");
+	expect(result.output).toBe("MCP_MARKER");
 	expect(tree.tree().map((node) => node.id)).toEqual(["1", "1.1"]);
 });
 
@@ -276,7 +280,7 @@ test.each([false, true])(
 			JSON.stringify({ transport: "websocket" }),
 		);
 		await writeFile(join(cwd, ".pi", "SYSTEM.md"), "PROJECT_SYSTEM_MARKER");
-		await tree.spawn(ROOT, "child", { ...context, projectTrusted });
+		await tree.start(ROOT, "child", { ...context, projectTrusted }).result;
 		const child = tree.get("1")?.session;
 		expect(child?.settingsManager.isProjectTrusted()).toBe(projectTrusted);
 		expect(child?.settingsManager.getSettings().transport).toBe(
@@ -310,13 +314,11 @@ test("runs standard extension permission and result hooks in the child's context
 		});
 	`,
 	);
-	const blocked = await tree.spawn(ROOT, "write", context);
-	expect(blocked.content).toEqual([{ type: "text", text: "POLICY_BLOCKED" }]);
+	const blocked = await tree.start(ROOT, "write", context).result;
+	expect(blocked.output).toBe("POLICY_BLOCKED");
 	expect(await Bun.file(join(cwd, "blocked.txt")).exists()).toBe(false);
-	const result = await tree.spawn(ROOT, "read", context);
-	expect(result.content).toEqual([
-		{ type: "text", text: tree.get("2")?.session?.sessionId ?? "missing" },
-	]);
+	const result = await tree.start(ROOT, "read", context).result;
+	expect(result.output).toBe(tree.get("2")?.session?.sessionId ?? "missing");
 	expect(JSON.stringify(parent.messages)).not.toContain("POLICY_BLOCKED");
 });
 
@@ -331,12 +333,12 @@ test("a normally installed subagents extension shares the explicit child ownersh
 		}),
 	);
 	const recursive = await testContext();
-	const result = await tree.spawn(ROOT, "nest:2", {
+	const result = await tree.start(ROOT, "nest:2", {
 		...context,
 		modelRuntime: recursive.modelRuntime,
-	});
-	expect(result.isError).toBe(false);
-	expect(result.content).toEqual([{ type: "text", text: "hello" }]);
+	}).result;
+	expect(result.status).toBe("done");
+	expect(result.output).toBe("hello");
 	expect(tree.tree().map((node) => node.id)).toEqual(["1", "1.1", "1.1.1"]);
 	for (const node of tree.tree()) {
 		const extensions = node.session?.resourceLoader.getExtensions();
@@ -349,9 +351,9 @@ test("a normally installed subagents extension shares the explicit child ownersh
 
 test("nested spawning uses the child's current public model and thinking selection", async () => {
 	const context = await testContext();
-	const tree = createSubagents();
+	const tree = createSubagentRuntime();
 	trees.push(tree);
-	await tree.spawn(ROOT, "say hello", context);
+	await tree.start(ROOT, "say hello", context).result;
 	const alternate = { ...model, id: "alternate-model" };
 	context.modelRuntime?.registerNativeProvider({
 		...testProvider(),
@@ -384,9 +386,9 @@ test("uses retries from standard settings and bills all attempts", async () => {
 				: response("recovered"),
 		),
 	});
-	const result = await tree.spawn(ROOT, "retry", context);
-	expect(result.isError).toBe(false);
-	expect(result.content).toEqual([{ type: "text", text: "recovered" }]);
+	const result = await tree.start(ROOT, "retry", context).result;
+	expect(result.status).toBe("done");
+	expect(result.output).toBe("recovered");
 	expect(attempts).toBe(2);
 	expect(result.usage?.totalTokens).toBe(6);
 });
@@ -414,9 +416,9 @@ test("standard compaction preserves final output and summarization usage", async
 		} }));
 	`,
 	);
-	const result = await tree.spawn(ROOT, "compact", context);
-	expect(result.isError).toBe(false);
-	expect(result.content).toEqual([{ type: "text", text: output }]);
+	const result = await tree.start(ROOT, "compact", context).result;
+	expect(result.status).toBe("done");
+	expect(result.output).toBe(output);
 	expect(
 		tree
 			.get("1")
@@ -442,8 +444,8 @@ test("dispatches standard extension commands without sending them to the model",
 		} });
 	`,
 	);
-	const result = await tree.spawn(ROOT, "/ping", context);
-	expect(result.isError).toBe(false);
+	const result = await tree.start(ROOT, "/ping", context).result;
+	expect(result.status).toBe("done");
 	expect(modelCalls).toBe(0);
 	expect(JSON.stringify(tree.get("1")?.session?.messages)).toContain(
 		"PING_MARKER",
@@ -477,11 +479,11 @@ test("cancellation during async standard input hooks stops the later agent loop"
 			context,
 			`pi.on("input", () => globalThis[Symbol.for("${name}")]());`,
 		);
-		const result = tree.spawn(ROOT, "wait", context);
+		const result = tree.start(ROOT, "wait", context).result;
 		await until(() => entered);
 		tree.abort("1");
 		release();
-		expect((await result).isError).toBe(true);
+		expect((await result).status).toBe("aborted");
 		expect(tree.get("1")?.status).toBe("aborted");
 		expect(modelCalls).toBe(0);
 	} finally {
@@ -493,7 +495,7 @@ test("cancellation during async standard input hooks stops the later agent loop"
 test("children are ephemeral even when the parent persists its conversation", async () => {
 	const { parent, tree, context } = await setup({ persist: true });
 	await parent.prompt("ROOT_PERSISTED_HISTORY");
-	await tree.spawn(ROOT, "child", context);
+	await tree.start(ROOT, "child", context).result;
 	expect(parent.sessionFile).toBeDefined();
 	expect(tree.get("1")?.session?.sessionFile).toBeUndefined();
 	expect(JSON.stringify(tree.get("1")?.session?.messages)).not.toContain(

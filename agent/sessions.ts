@@ -1,33 +1,17 @@
-import { fileURLToPath } from "node:url";
-import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { Api, Model } from "@earendil-works/pi-ai";
 import {
 	type AgentSession,
-	type CreateAgentSessionOptions,
 	createAgentSession,
 	createCodemodeExtension,
 	createMcpExtension,
 	createToolSearchExtension,
 	DefaultResourceLoader,
 	type ExtensionContext,
+	type ExtensionFactory,
 	getAgentDir,
 	SessionManager,
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import type { Subagents } from "./runtime.ts";
-
-export interface SessionOwner {
-	runtime: Subagents;
-	id: string;
-}
-
-export interface SpawnContext
-	extends Pick<CreateAgentSessionOptions, "agentDir" | "modelRuntime"> {
-	cwd: string;
-	model: Model<Api>;
-	thinkingLevel?: ThinkingLevel;
-	projectTrusted: boolean;
-}
+import type { SessionOwner, SpawnContext } from "../runtime/index.ts";
 
 // Pi's extension loader can evaluate another copy of this module.
 const key = Symbol.for("pi-subagents.owners");
@@ -57,19 +41,33 @@ export async function createChildSession(
 	context: SpawnContext,
 	owner: SessionOwner,
 	onCreated: (session: AgentSession) => void,
+	extension: ExtensionFactory,
 ): Promise<AgentSession> {
 	const agentDir = context.agentDir ?? getAgentDir();
 	const settingsManager = SettingsManager.create(context.cwd, agentDir, {
 		projectTrusted: context.projectTrusted,
 	});
+	// Use the supported decision hook rather than changing the configured policy.
+	// Idle refreshes must not add charges after this run's result was captured.
+	const ownedWarming: ExtensionFactory = (pi) => {
+		pi.on("cache_warming_decision", () => {
+			if (owner.runtime.get(owner.id)?.status !== "running")
+				return { action: "stop" };
+		});
+	};
 	const resourceLoader = new DefaultResourceLoader({
 		cwd: context.cwd,
 		agentDir,
 		settingsManager,
-		additionalExtensionPaths: [
-			fileURLToPath(new URL("./index.ts", import.meta.url)),
-		],
 		extensionFactories: [
+			ownedWarming,
+			// A configured installation takes precedence, without duplicate registrations.
+			// Otherwise children receive only the machine-facing extension, not the UI entrypoint.
+			{
+				name: "subagents",
+				factory: extension,
+				replaceable: true,
+			},
 			{
 				name: "codemode",
 				factory: createCodemodeExtension(),
@@ -103,15 +101,25 @@ export async function createChildSession(
 		resourceLoader,
 		sessionManager,
 	});
+	// Publication transfers cleanup to the runtime, including failed binding.
+	onCreated(session);
+	await session.bindExtensions({
+		mode: "print",
+		shutdownHandler: () => owner.runtime.abort(owner.id),
+	});
+	return session;
+}
+
+export async function disposeChildSession(
+	session: AgentSession,
+): Promise<void> {
 	try {
-		onCreated(session);
-		await session.bindExtensions({
-			mode: "print",
-			shutdownHandler: () => owner.runtime.abort(owner.id),
+		await session.extensionRunner.emit({
+			type: "session_shutdown",
+			reason: "quit",
 		});
-		return session;
-	} catch (error) {
+	} finally {
+		owners.delete(session.sessionManager);
 		session.dispose();
-		throw error;
 	}
 }
