@@ -37,6 +37,48 @@ export function spawnContext(ctx: ExtensionContext): SpawnContext {
 	};
 }
 
+/** Keep a delegated run open while monitors it started in the background are running,
+ * so its final reply reflects their results while the agent stays free to converse.
+ * pi-monitor's contract: an interactive monitor_start ends the turn with a monitorId, and
+ * its terminal result arrives later as a "monitor-result" message unless monitor_stop
+ * ends it silently.
+ */
+function backgroundMonitors(owner: SessionOwner): ExtensionFactory {
+	return (pi) => {
+		const running: (() => void)[] = [];
+		const finish = (count: number) => {
+			for (const done of running.splice(0, count)) done();
+		};
+		pi.on("tool_execution_end", ({ toolName, result, isError }) => {
+			if (isError) return;
+			if (
+				toolName === "monitor_start" &&
+				result?.terminate === true &&
+				typeof result.details?.monitorId === "string"
+			)
+				owner.runtime.trackCompletion(
+					owner.id,
+					new Promise<void>((resolve) => running.push(resolve)),
+				);
+			else if (toolName === "monitor_stop")
+				finish(Number(result?.details?.stopped) || 0);
+		});
+		pi.on("message_end", ({ message }) => {
+			if (message.role === "custom" && message.customType === "monitor-result")
+				finish(1);
+		});
+		// Cancellation stops the wait; session shutdown stops the monitors themselves.
+		const unsubscribe = owner.runtime.subscribe(() => {
+			if (running.length && owner.runtime.get(owner.id)?.cancelled)
+				finish(running.length);
+		});
+		pi.on("session_shutdown", () => {
+			unsubscribe();
+			finish(running.length);
+		});
+	};
+}
+
 export async function createChildSession(
 	context: SpawnContext,
 	owner: SessionOwner,
@@ -61,6 +103,7 @@ export async function createChildSession(
 		settingsManager,
 		extensionFactories: [
 			ownedWarming,
+			backgroundMonitors(owner),
 			// A configured installation takes precedence, without duplicate registrations.
 			// Otherwise children receive only the machine-facing extension, not the UI entrypoint.
 			{
@@ -103,8 +146,10 @@ export async function createChildSession(
 	});
 	// Publication transfers cleanup to the runtime, including failed binding.
 	onCreated(session);
+	// Headless but long-lived, unlike one-shot print mode: background tools return at
+	// once and wake the agent later, as in the main chat.
 	await session.bindExtensions({
-		mode: "print",
+		mode: "rpc",
 		shutdownHandler: () => owner.runtime.abort(owner.id),
 	});
 	return session;

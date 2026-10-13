@@ -34,7 +34,7 @@ interface Block {
 	id: string;
 	label: string;
 	text: string;
-	kind: "message" | "thinking" | "tool";
+	kind: "message" | "thinking" | "tool" | "queued";
 	args?: unknown;
 	status?: SubagentToolExecution["status"] | "aborted";
 	nested?: boolean;
@@ -192,6 +192,15 @@ function transcriptBlocks(node: Subagent): Block[] {
 			live.args,
 			Boolean(live.parentToolCallId),
 		);
+	// Sent input stays visible while it waits, e.g. for a long-running tool.
+	node.queuedInput.forEach((text, index) => {
+		blocks.push({
+			id: `queued:${index}`,
+			kind: "queued",
+			label: "queued · delivered after the current step",
+			text,
+		});
+	});
 	return blocks;
 }
 
@@ -232,6 +241,11 @@ function renderBlock(
 	expanded: boolean,
 ): string[] {
 	const text = plain(block.text);
+	if (block.kind === "queued")
+		return [
+			truncateToWidth(theme.fg("dim", singleLine(block.label)), width),
+			...new Text(theme.fg("dim", text), 0, 0).render(width),
+		];
 	if (block.kind !== "tool") {
 		const header = theme.fg(
 			block.label === "user" ? "accent" : "muted",

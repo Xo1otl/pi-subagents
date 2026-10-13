@@ -181,17 +181,16 @@ test("completion is a follow-up to a busy parent's newer prompt, not an interrup
 		}
 		return defaultDispatch(model, context, options).result();
 	});
-	const { session } = await setup(dispatch);
+	const { session, tree } = await setup(dispatch);
 	await session.prompt("delegate");
 	await until(() => childRunning);
 	const busy = session.prompt("busy prompt");
 	await until(() => parentRunning);
 	child.resolve();
-	await until(() =>
-		session.agent
-			.peekQueuedMessages()
-			.some((message) => message.role === "custom"),
-	);
+	await until(() => tree.get("1")?.status === "done");
+	await Bun.sleep(10);
+	// Held by the integration, so an interrupt clearing pi's queue cannot drop it.
+	expect(session.agent.hasQueuedMessages()).toBe(false);
 	expect(completions(session)).toHaveLength(0);
 	expect(completionRequests).toBe(0);
 	parent.resolve();
@@ -274,9 +273,9 @@ test("an already-aborted tool call rejects, but aborting its signal after receip
 	expect(tree.get("1")?.cancelled).toBe(false);
 	expect(aborted).toBe(false);
 	tree.abort("1");
-	await until(() => tree.get("1")?.status === "aborted");
+	await until(() => completions(session).length === 1 && session.isIdle);
 	expect(aborted).toBe(true);
-	expect(completions(session)).toHaveLength(0);
+	expect(completionDetails(session)).toMatchObject({ status: "aborted" });
 });
 
 test("deliberate child cancellation produces an aborted completion for a live parent", async () => {
@@ -301,7 +300,7 @@ test("deliberate child cancellation produces an aborted completion for a live pa
 	expect(session.getSessionStats().tokens.total).toBe(12);
 });
 
-test("aborting the originating parent suppresses late completion but leaves the child running", async () => {
+test("interrupting the originating parent leaves the child running and still delivers its result", async () => {
 	const child = gate();
 	let childRunning = false;
 	const dispatch = stream(async (context, options) => {
@@ -322,14 +321,17 @@ test("aborting the originating parent suppresses late completion but leaves the 
 			childRunning &&
 			session.messages.some((message) => message.role === "toolResult"),
 	);
+	// Pi's interactive interrupt clears queued messages before aborting.
+	session.clearQueue();
 	await session.abort();
 	await prompt;
 	expect(tree.get("1")?.cancelled).toBe(false);
-	child.resolve();
-	await until(() => tree.get("1")?.status === "done");
-	await session.prompt("another prompt");
-	expect(completions(session)).toHaveLength(0);
+	await session.prompt("corrected prompt");
 	expect(session.getLastAssistantText()).toBe("another prompt accepted");
+	child.resolve();
+	await until(() => completions(session).length === 1 && session.isIdle);
+	expect(completionDetails(session)).toMatchObject({ id: "1", status: "done" });
+	expect(session.getLastAssistantText()).toBe("completion accepted");
 	expect(
 		session.sessionManager
 			.getEntries()
@@ -339,22 +341,30 @@ test("aborting the originating parent suppresses late completion but leaves the 
 	).toHaveLength(1);
 });
 
-test("aborting a newer root prompt fences old completions before delayed agent_end settles", async () => {
+test("a result arriving during an interrupt is kept without restarting the turn", async () => {
 	const child = gate();
 	const agentEnd = gate();
 	const ending = deferred();
 	let childRunning = false;
 	let parentRunning = false;
+	let completionRequests = 0;
+	let resultInContext = false;
 	const dispatch = stream(async (context, options) => {
-		if (lastText(context) === "child task") {
+		const text = lastText(context);
+		if (text === "child task") {
 			childRunning = true;
 			await Promise.race([child.promise, waiting(options?.signal)]);
 			return response("child answer");
 		}
-		if (lastText(context) === "newer root prompt") {
+		if (text === "newer root prompt") {
 			parentRunning = true;
 			return waiting(options?.signal);
 		}
+		if (text.startsWith("Subagent ")) completionRequests++;
+		if (text === "another prompt")
+			resultInContext = JSON.stringify(context.messages).includes(
+				"child answer",
+			);
 		return defaultDispatch(model, context, options).result();
 	});
 	const { session, tree } = await setup(dispatch, undefined, {
@@ -371,6 +381,7 @@ test("aborting a newer root prompt fences old completions before delayed agent_e
 	await until(() => childRunning);
 	const prompt = session.prompt("newer root prompt");
 	await until(() => parentRunning);
+	session.clearQueue();
 	const aborted = session.abort();
 	await ending.promise;
 	child.resolve();
@@ -382,14 +393,142 @@ test("aborting a newer root prompt fences old completions before delayed agent_e
 			),
 	);
 	expect(tree.get("1")?.status).toBe("done");
-	expect(session.agent.peekQueuedMessages()).toHaveLength(0);
 	expect(completions(session)).toHaveLength(0);
 	agentEnd.resolve();
 	await aborted;
 	await prompt;
+	expect(session.isIdle).toBe(true);
+	expect(completions(session)).toHaveLength(1);
+	expect(completionRequests).toBe(0);
 	await session.prompt("another prompt");
+	expect(resultInContext).toBe(true);
+	expect(session.getLastAssistantText()).toBe("another prompt accepted");
+	expect(completionRequests).toBe(0);
+});
+
+test("a result waiting for a busy parent survives an interrupt", async () => {
+	const child = gate();
+	let childRunning = false;
+	let parentRunning = false;
+	let completionRequests = 0;
+	const dispatch = stream(async (context, options) => {
+		const text = lastText(context);
+		if (text === "child task") {
+			childRunning = true;
+			await Promise.race([child.promise, waiting(options?.signal)]);
+			return response("child answer");
+		}
+		if (text === "busy prompt") {
+			parentRunning = true;
+			return waiting(options?.signal);
+		}
+		if (text.startsWith("Subagent ")) completionRequests++;
+		return defaultDispatch(model, context, options).result();
+	});
+	const { session, tree } = await setup(dispatch);
+	await session.prompt("delegate");
+	await until(() => childRunning);
+	const busy = session.prompt("busy prompt");
+	await until(() => parentRunning);
+	child.resolve();
+	await until(() => tree.get("1")?.status === "done");
+	await Bun.sleep(10);
 	expect(completions(session)).toHaveLength(0);
-	expect(session.getSessionStats().tokens.total).toBe(15);
+	session.clearQueue();
+	await session.abort();
+	await busy;
+	expect(completions(session)).toHaveLength(1);
+	expect(completionRequests).toBe(0);
+	expect(session.isIdle).toBe(true);
+});
+
+test("results held by a busy parent are released together, starting one turn", async () => {
+	const parent = gate();
+	let parentRunning = false;
+	let completionRequests = 0;
+	let children = 0;
+	const dispatch = stream(async (context, options) => {
+		const text = lastText(context);
+		if (text === "delegate twice")
+			return response("", {
+				stopReason: "toolUse",
+				content: ["first", "second"].map((instructions) => ({
+					type: "toolCall" as const,
+					id: crypto.randomUUID(),
+					name: "subagent",
+					arguments: { instructions },
+				})),
+			});
+		if (text === "first" || text === "second") {
+			children++;
+			return response(`${text} answer`);
+		}
+		if (context.messages.at(-1)?.role === "toolResult") {
+			parentRunning = true;
+			await Promise.race([parent.promise, waiting(options?.signal)]);
+			return response("parent finished");
+		}
+		if (text.startsWith("Subagent ")) {
+			completionRequests++;
+			return response("completions accepted");
+		}
+		return defaultDispatch(model, context, options).result();
+	});
+	const { session, tree } = await setup(dispatch);
+	const prompt = session.prompt("delegate twice");
+	await until(
+		() =>
+			parentRunning &&
+			children === 2 &&
+			tree.tree().every((node) => node.status === "done"),
+	);
+	await Bun.sleep(10);
+	expect(completions(session)).toHaveLength(0);
+	parent.resolve();
+	await prompt;
+	await session.waitForIdle();
+	expect(completions(session)).toHaveLength(2);
+	expect(completionRequests).toBe(1);
+	expect(session.getLastAssistantText()).toBe("completions accepted");
+});
+
+test("a one-shot root settles only after delegated results are delivered and answered", async () => {
+	const child = gate();
+	const dispatch = stream(async (context, options) => {
+		if (lastText(context) === "child task") {
+			await Promise.race([child.promise, waiting(options?.signal)]);
+			return response("child answer");
+		}
+		return defaultDispatch(model, context, options).result();
+	});
+	let integration!: ReturnType<typeof createSubagentIntegration>;
+	const session = await parentSession(
+		dispatch,
+		[
+			(pi) => {
+				integration = createSubagentIntegration(pi);
+				pi.registerTool(integration.tool);
+			},
+		],
+		undefined,
+		undefined,
+		"print",
+	);
+	const tree = integration.current();
+	parents.push({ session, tree });
+	let finished = false;
+	const prompt = session.prompt("delegate").then(() => {
+		finished = true;
+	});
+	await until(() => Boolean(tree.get("1")?.session?.isStreaming));
+	await Bun.sleep(10);
+	expect(finished).toBe(false);
+	expect(completions(session)).toHaveLength(0);
+	child.resolve();
+	await prompt;
+	expect(tree.get("1")?.status).toBe("done");
+	expect(completions(session)).toHaveLength(1);
+	expect(session.getLastAssistantText()).toBe("completion accepted");
 });
 
 test("accounting preserves other extensions' boundary drafts both with and without completion metadata", async () => {
@@ -701,6 +840,12 @@ test("completion output is bounded with full output saved, and rich usage is bil
 	expect(
 		session.messages.find((message) => message.role === "toolResult")?.usage,
 	).toBeUndefined();
+	// Only undelivered completions are discarded with the session.
+	await session.extensionRunner.emit({
+		type: "session_shutdown",
+		reason: "quit",
+	});
+	expect(await readFile(details.fullOutputPath, "utf8")).toBe(huge);
 });
 
 test("the view binds only to root sessions and is released before runtime teardown", async () => {

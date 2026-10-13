@@ -1,11 +1,13 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
-import { readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { createSubagentRuntime } from "../agent/index.ts";
 import type { SubagentCompletionDetails } from "../agent/protocol.ts";
 import { ROOT, type Subagents } from "../runtime/index.ts";
 import {
+	blockingTool,
 	deferred,
+	fakeMonitor,
 	hierarchyStream,
 	lastText,
 	model,
@@ -448,6 +450,185 @@ describe("interaction and cleanup", () => {
 		const result = tree.start(ROOT, "initial", await spawnContext()).result;
 		expect((await result).output).toBe("late steering");
 		expect(tree.get("1")?.session?.pendingMessageCount).toBe(0);
+	});
+
+	test("input sent during a long-running tool stays queued and visible, then steers", async () => {
+		const tree = runtime();
+		const context = await spawnContext(
+			stream((context) =>
+				lastText(context) === "monitor"
+					? toolCall("blocking", {})
+					: response(lastText(context)),
+			),
+		);
+		const release = await blockingTool(context);
+		const result = tree.start(ROOT, "monitor", context).result;
+		const node = tree.get("1");
+		expect(node?.queuedInput).toEqual([]);
+		await until(() =>
+			[...(node?.liveTools.values() ?? [])].some(
+				(tool) => tool.status === "running",
+			),
+		);
+		const sent = tree.send("1", "are you there?");
+		expect(node?.queuedInput).toEqual(["are you there?"]);
+		await sent;
+		expect(node?.queuedInput).toEqual(["are you there?"]);
+		release.resolve();
+		expect((await result).output).toBe("are you there?");
+		expect(node?.queuedInput).toEqual([]);
+	});
+
+	test("stopping returns sent input that never reached the agent, not its task", async () => {
+		const tree = runtime();
+		const context = await spawnContext(
+			stream((context) =>
+				lastText(context) === "monitor"
+					? toolCall("blocking", {})
+					: response(lastText(context)),
+			),
+		);
+		await blockingTool(context);
+		const early = tree.start(ROOT, "monitor", context);
+		// Waits for session initialization, before pi's own queue exists.
+		const pending = tree.send("1", "before startup");
+		expect(tree.get("1")?.queuedInput).toEqual(["before startup"]);
+		expect(tree.abort("1")).toEqual(new Map([["1", ["before startup"]]]));
+		await pending;
+		expect((await early.result).status).toBe("aborted");
+		expect(
+			JSON.stringify(tree.get("1")?.session?.messages ?? []),
+		).not.toContain("before startup");
+
+		const steered = tree.start(ROOT, "monitor", context);
+		const node = tree.get("2");
+		await until(() =>
+			[...(node?.liveTools.values() ?? [])].some(
+				(tool) => tool.status === "running",
+			),
+		);
+		await tree.send("2", "first");
+		await tree.send("2", "second");
+		expect(tree.abort("2")).toEqual(new Map([["2", ["first", "second"]]]));
+		expect(node?.queuedInput).toEqual([]);
+		expect((await steered.result).status).toBe("aborted");
+	});
+
+	test("input stopped inside slow input hooks is handed back without reaching the agent", async () => {
+		const tree = runtime();
+		const context = await spawnContext(
+			stream((context) =>
+				lastText(context) === "monitor"
+					? toolCall("blocking", {})
+					: response(lastText(context)),
+			),
+		);
+		await blockingTool(context);
+		const hook = deferred();
+		const entered = deferred();
+		const key = Symbol.for(`pi-subagents.input.${crypto.randomUUID()}`);
+		Reflect.set(globalThis, key, { hook: hook.promise, entered });
+		try {
+			if (!context.agentDir) throw new Error("Missing agent directory");
+			await mkdir(join(context.agentDir, "extensions"), { recursive: true });
+			await writeFile(
+				join(context.agentDir, "extensions", "input.js"),
+				`export default function(pi) {
+					pi.on("input", async (event) => {
+						if (event.text !== "in flight") return;
+						const shared = globalThis[Symbol.for(${JSON.stringify(Symbol.keyFor(key))})];
+						shared.entered.resolve();
+						await shared.hook;
+					});
+				}`,
+			);
+			const result = tree.start(ROOT, "monitor", context).result;
+			const node = tree.get("1");
+			await until(() =>
+				[...(node?.liveTools.values() ?? [])].some(
+					(tool) => tool.status === "running",
+				),
+			);
+			const sent = tree.send("1", "in flight");
+			await entered.promise;
+			expect(tree.abort("1")).toEqual(new Map([["1", ["in flight"]]]));
+			hook.resolve();
+			await sent;
+			expect((await result).status).toBe("aborted");
+			expect(JSON.stringify(node?.session?.messages)).not.toContain(
+				"in flight",
+			);
+			expect(node?.session?.pendingMessageCount).toBe(0);
+		} finally {
+			hook.resolve();
+			Reflect.deleteProperty(globalThis, key);
+		}
+	});
+
+	describe("background monitors", () => {
+		const monitoring = () =>
+			stream((context) => {
+				const text = lastText(context);
+				if (text === "watch build") return toolCall("monitor_start", {});
+				if (text === "stop it") return toolCall("monitor_stop", {});
+				if (text === "status=success") return response("build passed");
+				if (context.messages.at(-1)?.role === "toolResult")
+					return response(`after tool: ${text}`);
+				return response(`reply: ${text}`);
+			});
+		async function watching(tree: Subagents) {
+			const context = await spawnContext(monitoring());
+			const finished = await fakeMonitor(context);
+			const { result } = tree.start(ROOT, "watch build", context);
+			const node = tree.get("1");
+			await until(
+				() =>
+					Boolean(node?.session?.isIdle) &&
+					Boolean(
+						node?.session?.messages.some(
+							(message) => message.role === "toolResult",
+						),
+					),
+			);
+			let completed = false;
+			void result.then(() => {
+				completed = true;
+			});
+			return { node, result, finished, completed: () => completed };
+		}
+
+		test("the agent converses while its monitor runs and reports after the result", async () => {
+			const tree = runtime();
+			const { node, result, finished, completed } = await watching(tree);
+			await tree.send("1", "are you there?");
+			expect(node?.session?.getLastAssistantText()).toBe(
+				"reply: are you there?",
+			);
+			expect(node?.status).toBe("running");
+			expect(completed()).toBe(false);
+			finished.resolve();
+			expect(await result).toMatchObject({
+				status: "done",
+				output: "build passed",
+			});
+		});
+
+		test("monitor_stop releases the run", async () => {
+			const tree = runtime();
+			const { result } = await watching(tree);
+			await tree.send("1", "stop it");
+			expect(await result).toMatchObject({
+				status: "done",
+				output: "after tool: Stopped 1 monitor(s).",
+			});
+		});
+
+		test("stopping the agent stops waiting for its monitor", async () => {
+			const tree = runtime();
+			const { result } = await watching(tree);
+			tree.abort("1");
+			expect((await result).status).toBe("aborted");
+		});
 	});
 
 	test("UI cancellation before a prompt is active is not lost", async () => {

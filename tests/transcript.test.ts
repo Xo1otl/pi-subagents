@@ -23,6 +23,7 @@ function node(
 		status: "running",
 		cancelled: false,
 		liveTools: new Map(),
+		queuedInput: [],
 		session: {
 			sessionManager: {
 				getBranch: () =>

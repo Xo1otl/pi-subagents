@@ -20,7 +20,16 @@ import {
 	type SubagentSwitcher,
 	type SwitcherFocus,
 } from "../ui/switcher.ts";
-import { response, spawnContext, stream, until, waiting } from "./fixtures.ts";
+import {
+	blockingTool,
+	lastText,
+	response,
+	spawnContext,
+	stream,
+	toolCall,
+	until,
+	waiting,
+} from "./fixtures.ts";
 
 const theme: Pick<Theme, "fg"> = { fg: (_color, text) => text };
 const keybindings: Pick<KeybindingsManager, "matches"> = {
@@ -464,6 +473,37 @@ test("Ctrl+C stops the selected subtree and active shutdown finishes the overlay
 	await siblings;
 	switcher.handleInput("\x1b");
 	expect(done).toHaveBeenCalledTimes(1);
+});
+
+test("a message sent during a blocking tool stays visible, and Ctrl+C returns it to the draft", async () => {
+	const { tree, switcher } = await setup({ empty: true });
+	const context = await spawnContext(
+		stream((context) =>
+			lastText(context) === "monitor"
+				? toolCall("blocking", {})
+				: response(lastText(context)),
+		),
+	);
+	await blockingTool(context);
+	const result = tree.start(ROOT, "monitor", context).result;
+	await until(() =>
+		[...(tree.get("1")?.liveTools.values() ?? [])].some(
+			(tool) => tool.status === "running",
+		),
+	);
+	const screen = () => stripTerminalSequences(switcher.render(100).join("\n"));
+	switcher.handleInput("QUEUED_MESSAGE");
+	switcher.handleInput("\r");
+	await until(() => tree.get("1")?.queuedInput.length === 1);
+	expect(screen()).toContain("queued");
+	expect(screen()).toContain("QUEUED_MESSAGE");
+	switcher.handleInput("newer draft");
+	switcher.handleInput("\x03");
+	expect((await result).status).toBe("aborted");
+	const composer = switcher.render(100).slice(-12).join("\n");
+	expect(stripTerminalSequences(composer)).toContain("QUEUED_MESSAGE");
+	expect(stripTerminalSequences(composer)).toContain("newer draft");
+	expect(screen()).not.toContain("queued");
 });
 
 test("shows the tree and conversation side by side with a conversation-only composer", async () => {

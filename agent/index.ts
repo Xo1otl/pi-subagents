@@ -21,7 +21,6 @@ import {
 import {
 	SUBAGENT_RESULT_TYPE,
 	SUBAGENT_USAGE_TYPE,
-	type SubagentCompletionDetails,
 	type SubagentCompletionMessage,
 	subagentReceipt,
 } from "./protocol.ts";
@@ -55,11 +54,16 @@ interface SessionBinding {
 	manager: ExtensionContext["sessionManager"];
 	sessionId: string;
 	active: boolean;
+	/** Only cancellation aborts a headless session; it fences that session's older children. */
 	abortEpoch: number;
 	stopWatchingAbort: () => void;
 	accounting: SessionBoundaryDraft[];
 	/** Formatting artifacts remain ours until the queued message is persisted. */
 	pendingCompletions: Set<SubagentCompletionMessage>;
+	/** Root completions wait here while it is busy: an interrupt clears pi's queue. */
+	held: SubagentCompletionMessage[];
+	/** A one-shot root holds results until all of its delegated work has finished. */
+	awaitingResults: boolean;
 }
 
 /** Wire Pi's lifecycle and expose the undecorated, machine-facing tool. */
@@ -73,6 +77,7 @@ export function createSubagentIntegration(
 	function discardPending(source: SessionBinding): Promise<void> {
 		const messages = [...source.pendingCompletions];
 		source.pendingCompletions.clear();
+		source.held.length = 0;
 		if (!messages.length) return Promise.resolve();
 		const cleanup = Promise.all(messages.map(discardSubagentCompletion)).then(
 			() => {},
@@ -105,6 +110,22 @@ export function createSubagentIntegration(
 		}
 	}
 
+	/** Persist held root completions in order; only the last may start a turn. */
+	function release(source: SessionBinding, triggerTurn: boolean): void {
+		const messages = source.held.splice(0);
+		messages.forEach((message, index) => {
+			const trigger = triggerTurn && index === messages.length - 1;
+			pi.sendMessage(message, { deliverAs: "followUp", triggerTurn: trigger });
+			// An idle session appends an untriggered message at once, without message_end.
+			if (!trigger) source.pendingCompletions.delete(message);
+		});
+	}
+
+	function releaseIfIdle(source: SessionBinding, ctx: ExtensionContext): void {
+		if (isCurrent(source, ctx) && ctx.isIdle() && !source.awaitingResults)
+			release(source, true);
+	}
+
 	function takeAccounting(ctx: ExtensionContext): SessionBoundaryDraft[] {
 		if (!binding || !isCurrent(binding, ctx)) return [];
 		return binding.accounting.splice(0);
@@ -130,7 +151,8 @@ export function createSubagentIntegration(
 
 	pi.on("agent_start", (_event, ctx) => {
 		const source = binding;
-		if (!source || !isCurrent(source, ctx)) return;
+		// Interrupting the root stops its turn, never the delivery of results.
+		if (!source || source.parentId === ROOT || !isCurrent(source, ctx)) return;
 		source.stopWatchingAbort();
 		const signal = ctx.signal;
 		const fence = () => {
@@ -151,23 +173,45 @@ export function createSubagentIntegration(
 			event.message.customType !== SUBAGENT_RESULT_TYPE
 		)
 			return;
-		const details = event.message.details as SubagentCompletionDetails;
+		// A continued agent reuses its ID, so match this exact completion.
 		for (const message of source.pendingCompletions)
-			if (message.details.id === details?.id)
+			if (message.details === event.message.details)
 				source.pendingCompletions.delete(message);
 	});
 	pi.on("agent_settled", async (event, ctx) => {
 		const source = binding;
 		if (source && isCurrent(source, ctx)) {
-			if (event.aborted) source.abortEpoch++;
 			source.stopWatchingAbort();
-			// Core subtree cancellation clears this headless session's queues.
-			if (event.aborted && source.runtime.get(source.parentId)?.cancelled)
-				await discardPending(source);
+			if (source.parentId !== ROOT) {
+				if (event.aborted) source.abortEpoch++;
+				// Core subtree cancellation clears this headless session's queues.
+				if (event.aborted && source.runtime.get(source.parentId)?.cancelled)
+					await discardPending(source);
+			} else {
+				if (ctx.mode === "print" || ctx.mode === "json") {
+					// One-shot modes exit after settling, which would cancel delegated work.
+					source.awaitingResults = true;
+					try {
+						await source.runtime.settled(ROOT);
+					} finally {
+						source.awaitingResults = false;
+					}
+				}
+				// After an interrupt, keep the results without restarting the turn.
+				if (isCurrent(source, ctx)) release(source, !event.aborted);
+			}
 		}
 		// Aborted runs may skip the final actionable boundary.
 		flushAccounting(ctx);
 	});
+	// Compaction and branch summaries occupy an idle root without a run to settle.
+	const releaseAfterIdleWork = (_event: unknown, ctx: ExtensionContext) => {
+		const source = binding;
+		if (source?.held.length) setImmediate(() => releaseIfIdle(source, ctx));
+	};
+	pi.on("session_compact", releaseAfterIdleWork);
+	pi.on("session_compact_failed", releaseAfterIdleWork);
+	pi.on("session_tree", releaseAfterIdleWork);
 
 	const current = (): Subagents => {
 		if (!runtime) throw new Error("Subagents are not initialized.");
@@ -195,6 +239,8 @@ export function createSubagentIntegration(
 			stopWatchingAbort: () => {},
 			accounting: [],
 			pendingCompletions: new Set(),
+			held: [],
+			awaitingResults: false,
 		};
 		// Delegated sessions stay headless, even under a configured installation.
 		if (!owner) view?.bind(runtime, ctx);
@@ -244,9 +290,10 @@ export function createSubagentIntegration(
 			const canDeliver = () =>
 				isCurrent(source, ctx) &&
 				!tree.closed &&
-				source.abortEpoch === epoch &&
-				!signal?.aborted &&
-				(source.parentId === ROOT || !tree.get(source.parentId)?.cancelled);
+				(source.parentId === ROOT ||
+					(source.abortEpoch === epoch &&
+						!signal?.aborted &&
+						!tree.get(source.parentId)?.cancelled));
 			const completion = started.result
 				.then(async (result) => {
 					// Billing belongs to the captured session, even if notification is suppressed.
@@ -276,18 +323,19 @@ export function createSubagentIntegration(
 								customType: SUBAGENT_USAGE_TYPE,
 								data,
 							});
-							const options = {
-								deliverAs: "followUp" as const,
-								triggerTurn: true,
-							};
-							if (source.parentId === ROOT) pi.sendMessage(message, options);
-							else {
+							if (source.parentId === ROOT) {
+								source.held.push(message);
+								releaseIfIdle(source, ctx);
+							} else {
 								const parent = tree.get(source.parentId)?.session;
 								if (!parent)
 									throw new Error("Subagent parent session is unavailable.");
 								// Unlike pi.sendMessage (void), the SDK promise observes turn
 								// startup failures and keeps headless settlement/billing fenced.
-								await parent.sendCustomMessage(message, options);
+								await parent.sendCustomMessage(message, {
+									deliverAs: "followUp",
+									triggerTurn: true,
+								});
 							}
 							delivered = true;
 						} else {

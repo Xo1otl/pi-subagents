@@ -241,12 +241,15 @@ export function deferred<T = void>() {
 	return { promise, resolve, reject };
 }
 
-/** A root SDK session, with the same deterministic provider available to children. */
+/** A root SDK session, with the same deterministic provider available to children.
+ * Long-lived by default; one-shot modes wait for delegated results before settling.
+ */
 export async function parentSession(
 	streamFn: Provider["streamSimple"],
 	extensionFactories: ExtensionFactory[],
 	onChildStart?: (ctx: ExtensionContext) => Promise<void>,
 	onChildLoad?: ExtensionFactory,
+	mode: ExtensionContext["mode"] = "rpc",
 ) {
 	const context = await spawnContext(streamFn);
 	if (!context.agentDir) throw new Error("Missing test agent directory");
@@ -294,8 +297,88 @@ export async function parentSession(
 		resourceLoader,
 		sessionManager: SessionManager.inMemory(context.cwd),
 	});
-	await session.bindExtensions({ mode: "print", shutdownHandler: () => {} });
+	await session.bindExtensions({ mode, shutdownHandler: () => {} });
 	return session;
+}
+
+/** A child tool that blocks its step, like a monitor waiting in a headless session. */
+export async function blockingTool(context: SpawnContext, name = "blocking") {
+	if (!context.agentDir) throw new Error("Missing test agent directory");
+	const release = deferred();
+	const key = Symbol.for(`pi-subagents.blocking.${crypto.randomUUID()}`);
+	sharedKeys.push(key);
+	Reflect.set(globalThis, key, release.promise);
+	const directory = join(context.agentDir, "extensions");
+	await mkdir(directory, { recursive: true });
+	await writeFile(
+		join(directory, `${name}.js`),
+		`export default function(pi) {
+			pi.registerTool({
+				name: ${JSON.stringify(name)}, label: "Blocking", description: "Blocks until released",
+				parameters: { type: "object", properties: {} },
+				async execute(_id, _args, signal) {
+					await Promise.race([
+						globalThis[Symbol.for(${JSON.stringify(Symbol.keyFor(key))})],
+						new Promise((_resolve, reject) => signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true })),
+					]);
+					return { content: [{ type: "text", text: "tool done" }], details: undefined };
+				},
+			});
+		}`,
+	);
+	return release;
+}
+
+/** pi-monitor's contract: one-shot modes wait inside the tool; others end the turn and
+ * report later as a "monitor-result" message, unless monitor_stop ends it silently.
+ */
+export async function fakeMonitor(context: SpawnContext) {
+	if (!context.agentDir) throw new Error("Missing test agent directory");
+	const finished = deferred();
+	const key = Symbol.for(`pi-subagents.monitor.${crypto.randomUUID()}`);
+	sharedKeys.push(key);
+	Reflect.set(globalThis, key, finished.promise);
+	const directory = join(context.agentDir, "extensions");
+	await mkdir(directory, { recursive: true });
+	await writeFile(
+		join(directory, "monitor.js"),
+		`export default function(pi) {
+			const finished = globalThis[Symbol.for(${JSON.stringify(Symbol.keyFor(key))})];
+			const active = new Set();
+			let next = 0;
+			const result = { type: "text", text: "status=success" };
+			pi.registerTool({
+				name: "monitor_start", label: "Monitor", description: "Background monitor",
+				parameters: { type: "object", properties: {} },
+				async execute(_id, _args, _signal, _onUpdate, ctx) {
+					const monitorId = "monitor_" + ++next;
+					if (ctx.mode === "print" || ctx.mode === "json") {
+						await finished;
+						return { content: [result], details: { monitorId } };
+					}
+					active.add(monitorId);
+					finished.then(() => {
+						if (active.delete(monitorId))
+							pi.sendMessage(
+								{ customType: "monitor-result", content: [result], display: true, details: {} },
+								{ deliverAs: "steer", triggerTurn: true },
+							);
+					});
+					return { content: [{ type: "text", text: "Monitor started" }], details: { monitorId }, terminate: true };
+				},
+			});
+			pi.registerTool({
+				name: "monitor_stop", label: "Stop monitors", description: "Stop monitors",
+				parameters: { type: "object", properties: {} },
+				async execute() {
+					const stopped = active.size;
+					active.clear();
+					return { content: [{ type: "text", text: "Stopped " + stopped + " monitor(s)." }], details: { stopped } };
+				},
+			});
+		}`,
+	);
+	return finished;
 }
 
 export function waiting(signal?: AbortSignal): Promise<never> {

@@ -65,6 +65,10 @@ export interface Subagent {
 	readonly cancelled: boolean;
 	/** Raw execution snapshots, retained until the next delegated run. */
 	readonly liveTools: ReadonlyMap<string, SubagentToolExecution>;
+	/** Messages sent to this agent that have not reached its transcript;
+	 * steering waits for the current step, such as a long-running tool, to finish.
+	 */
+	readonly queuedInput: readonly string[];
 }
 
 /** Complete run data, independent of tool output limits and presentation. */
@@ -87,10 +91,14 @@ export interface Subagents {
 	): SubagentStart;
 	/** Include asynchronous result delivery in a headless parent's settlement. */
 	trackCompletion(parentId: string, completion: Promise<void>): void;
+	/** Resolves once a parent's tracked delivery work, including late additions, drains. */
+	settled(parentId: string): Promise<void>;
 	/** Steer an active run; otherwise continue the same conversation. */
 	send(id: string, instructions: string): Promise<void>;
-	/** Cancellation reaches the whole subtree, including user-restarted descendants. */
-	abort(id?: string): void;
+	/** Cancellation reaches the whole subtree, including user-restarted descendants.
+	 * Returns the queued input it discarded, by agent, so callers can restore it.
+	 */
+	abort(id?: string): ReadonlyMap<string, readonly string[]>;
 	dispose(): Promise<void>;
 }
 
@@ -98,6 +106,8 @@ type Writable<T> = { -readonly [K in keyof T]: T[K] };
 
 interface SubagentNode extends Writable<Subagent> {
 	liveTools: Map<string, SubagentToolExecution>;
+	/** Input awaiting the session's preflight; identity distinguishes equal texts. */
+	pendingInput: Set<{ readonly text: string }>;
 	/** Settles once the current run, including descendant delivery, finishes. */
 	operation?: Promise<void>;
 	unsubscribe: () => void;
@@ -136,6 +146,14 @@ function subagentTree(nodes: Iterable<Subagent>): Subagent[] {
 		stack.push(...[...(children.get(node.id) ?? [])].reverse());
 	}
 	return result;
+}
+
+function queuedInput(node: SubagentNode): string[] {
+	return [
+		...(node.session?.getSteeringMessages() ?? []),
+		...(node.session?.getFollowUpMessages() ?? []),
+		...[...node.pendingInput].map((input) => input.text),
+	];
 }
 
 function belongsTo(
@@ -204,6 +222,10 @@ export function createSubagents({
 			cancelled: false,
 			unsubscribe: () => {},
 			liveTools: new Map(),
+			pendingInput: new Set(),
+			get queuedInput() {
+				return queuedInput(node);
+			},
 		};
 		state.nodes.set(id, node);
 		const parentUsage = state.delegatedUsage.get(parentId);
@@ -244,12 +266,22 @@ export function createSubagents({
 		node: SubagentNode,
 		active: ActiveRun,
 		instructions: string,
+		sent: boolean,
 	): Promise<void> {
 		const previous = active.preflight;
-		let accepted = () => {};
+		let resolvePreflight = () => {};
 		active.preflight = new Promise<void>((resolve) => {
-			accepted = resolve;
+			resolvePreflight = resolve;
 		});
+		// Sent input is queued until the session queues, starts or handles it.
+		const input = { text: instructions };
+		if (sent) node.pendingInput.add(input);
+		const accepted = (disposition?: string) => {
+			const withdrawn = sent && !node.pendingInput.delete(input);
+			// Stopping already handed this input back; it must not reach the agent too.
+			if (withdrawn && disposition === "queued") node.session?.clearQueue();
+			resolvePreflight();
+		};
 		const prompt = previous.then(async () => {
 			try {
 				if (!node.session || node.cancelled || state.disposed) return;
@@ -267,6 +299,15 @@ export function createSubagents({
 		return prompt;
 	}
 
+	async function settled(parentId: string): Promise<void> {
+		for (
+			let pending = state.completions.get(parentId);
+			pending?.size;
+			pending = state.completions.get(parentId)
+		)
+			await Promise.allSettled([...pending]);
+	}
+
 	async function drain(node: SubagentNode): Promise<void> {
 		const pending = state.completions.get(node.id);
 		if (pending?.size) await Promise.allSettled([...pending]);
@@ -282,15 +323,18 @@ export function createSubagents({
 		const active = state.runs.get(id);
 		if (active) {
 			if (node.cancelled) throw new Error(`Subagent ${id} is stopping.`);
-			await submit(node, active, instructions);
+			const prompt = submit(node, active, instructions, true);
 			changed();
-		} else await run(node, instructions);
+			await prompt;
+			changed();
+		} else await run(node, instructions, undefined, true);
 	}
 
 	async function run(
 		node: SubagentNode,
 		instructions: string,
 		signal?: AbortSignal,
+		sent = false,
 	): Promise<SubagentResult> {
 		node.cancelled = false;
 		node.status = "running";
@@ -312,7 +356,7 @@ export function createSubagents({
 		};
 		state.runs.set(node.id, active);
 		// Reserve the original input ahead of sends made by initialization listeners.
-		const prompt = submit(node, active, instructions);
+		const prompt = submit(node, active, instructions, sent);
 		const cancel = () => abort(node.id);
 		const finish = () => {
 			signal?.removeEventListener("abort", cancel);
@@ -468,19 +512,26 @@ export function createSubagents({
 		}
 	}
 
-	function abort(id = ROOT): void {
+	function abort(id = ROOT): Map<string, string[]> {
+		const discarded = new Map<string, string[]>();
 		for (const node of state.nodes.values()) {
 			if (!belongsTo(state.nodes, node, id) || node.status !== "running")
 				continue;
 			node.cancelled = true;
+			// Pending prompts observe cancellation and are never submitted.
+			const input = [...node.pendingInput].map((entry) => entry.text);
+			node.pendingInput.clear();
 			try {
-				node.session?.clearQueue();
+				const queued = node.session?.clearQueue();
+				if (queued) input.unshift(...queued.steering, ...queued.followUp);
 			} catch (error) {
 				state.completionErrors.push(error);
 			}
+			if (input.length) discarded.set(node.id, input);
 			if (node.session) stopSession(node.session);
 			changed();
 		}
+		return discarded;
 	}
 
 	function dispose(): Promise<void> {
@@ -539,6 +590,7 @@ export function createSubagents({
 		},
 		start,
 		trackCompletion,
+		settled,
 		send,
 		abort,
 		dispose,

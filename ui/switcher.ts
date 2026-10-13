@@ -121,8 +121,7 @@ export function createSubagentSwitcher({
 	let mouseLayout: MouseLayout | undefined;
 	let unsubscribe = () => {};
 
-	function conversation(): Conversation {
-		const id = selected ?? "";
+	function conversationFor(id: string): Conversation {
 		let chat = conversations.get(id);
 		if (!chat) {
 			const editor = new ChatEditor(tui, theme);
@@ -157,8 +156,23 @@ export function createSubagentSwitcher({
 				tui.requestRender();
 			};
 		}
+		return chat;
+	}
+
+	function conversation(): Conversation {
+		const chat = conversationFor(selected ?? "");
 		chat.editor.focused = focused && focus === "conversation";
 		return chat;
+	}
+
+	/** Like pi's interrupt, return discarded queued input to each agent's draft. */
+	function stop(id: string): void {
+		for (const [agent, input] of runtime.abort(id)) {
+			const editor = conversationFor(agent).editor;
+			editor.setText(
+				[...input, editor.getText()].filter((text) => text.trim()).join("\n\n"),
+			);
+		}
 	}
 
 	function focusMarker(pane: SwitcherFocus): string {
@@ -313,7 +327,7 @@ export function createSubagentSwitcher({
 				holdViewport();
 				chat.preferences.showThinking = !chat.preferences.showThinking;
 			} else if (matchesKey(data, "ctrl+c")) {
-				if (selected) runtime.abort(selected);
+				if (selected) stop(selected);
 			} else if (focus === "tree") {
 				if (
 					matchesKey(data, "up") ||
