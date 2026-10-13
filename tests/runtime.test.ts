@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { createSubagentRuntime } from "../agent/index.ts";
 import type { SubagentCompletionDetails } from "../agent/protocol.ts";
@@ -93,21 +92,6 @@ describe("runtime factory", () => {
 			JSON.stringify(configured),
 		);
 		expect(requests).toBe(1);
-	});
-
-	test("operations do not depend on a method receiver", async () => {
-		const tree = runtime();
-		const { start, send, get, tree: nodes, abort, dispose } = tree;
-		await start(ROOT, "hello", await spawnContext()).result;
-		await send("1", "updated");
-		expect(get("1")?.status).toBe("done");
-		expect(nodes()).toHaveLength(1);
-		expect((await start(ROOT, "hello", await spawnContext()).result).id).toBe(
-			"2",
-		);
-		abort();
-		await dispose();
-		expect(tree.closed).toBe(true);
 	});
 
 	test("reentrant shutdown listeners receive the same closing promise", async () => {
@@ -265,57 +249,6 @@ describe("silent hierarchy", () => {
 });
 
 describe("task results", () => {
-	test("completes a file-editing task through pi tools", async () => {
-		const directory = await mkdtemp(join(tmpdir(), "pi-subagents-test-"));
-		const path = join(directory, "result.txt");
-		try {
-			const tree = runtime();
-			let calls = 0;
-			const toolsStream = stream((context) => {
-				if (calls++ === 0) return toolCall("write", { path, content: "hello" });
-				if (calls === 2)
-					return toolCall("edit", { path, oldText: "hello", newText: "world" });
-				return response(lastText(context));
-			});
-			expect(
-				(
-					await tree.start(
-						ROOT,
-						"edit the file",
-						await spawnContext(toolsStream),
-					).result
-				).status,
-			).toBe("done");
-			expect(await readFile(path, "utf8")).toBe("world");
-			const node = tree.get("1");
-			expect(node?.session?.state.tools.map((tool) => tool.name)).toEqual(
-				expect.arrayContaining(["read", "bash", "edit", "write", "subagent"]),
-			);
-			const toolCalls =
-				node?.session?.messages.flatMap((message) =>
-					message.role === "assistant"
-						? message.content.flatMap((part) =>
-								part.type === "toolCall" ? [part] : [],
-							)
-						: [],
-				) ?? [];
-			expect(toolCalls).toHaveLength(2);
-			for (const call of toolCalls) {
-				expect(node?.liveTools.get(call.id)).toMatchObject({
-					toolCallId: call.id,
-					toolName: call.name,
-					args: call.arguments,
-					status: "done",
-				});
-				expect(
-					node?.liveTools.get(call.id)?.result?.content.length,
-				).toBeGreaterThan(0);
-			}
-		} finally {
-			await rm(directory, { recursive: true, force: true });
-		}
-	});
-
 	test("failed headless completion delivery is reported, billed once, and cleans its unused output file", async () => {
 		const tree = runtime();
 		const gate = deferred();

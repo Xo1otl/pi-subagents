@@ -1,7 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname } from "node:path";
 import type { Provider, Usage } from "@earendil-works/pi-ai";
 import {
 	type AgentSession,
@@ -10,10 +9,6 @@ import {
 	type ExtensionContext,
 	type ExtensionFactory,
 } from "@earendil-works/pi-coding-agent";
-import {
-	discardSubagentCompletion,
-	subagentCompletionMessage,
-} from "../agent/completions.ts";
 import {
 	createSubagentIntegration,
 	type SubagentView,
@@ -642,51 +637,6 @@ test("reload cancels and fences old results while the reloaded integration can s
 	expect(completionDetails(session)).toMatchObject({ id: "1", status: "done" });
 	expect(integration().current()).not.toBe(tree);
 	await integration().current().dispose();
-});
-
-test("a failed output-file write still produces bounded completion content and preserves usage", async () => {
-	const output = "large output\n".repeat(3000);
-	const previous = process.env.TMPDIR;
-	const missing = join(
-		tmpdir(),
-		`pi-subagents-missing-${crypto.randomUUID()}`,
-		"missing",
-	);
-	let message: Awaited<ReturnType<typeof subagentCompletionMessage>>;
-	try {
-		process.env.TMPDIR = missing;
-		message = await subagentCompletionMessage({
-			id: "1",
-			status: "done",
-			output,
-			usage: response("").usage,
-		});
-	} finally {
-		if (previous === undefined) delete process.env.TMPDIR;
-		else process.env.TMPDIR = previous;
-	}
-	const text = message.content
-		.flatMap((part) => (part.type === "text" ? [part.text] : []))
-		.join("\n");
-	expect(text).toContain("Could not save full output");
-	expect(Buffer.byteLength(text)).toBeLessThanOrEqual(DEFAULT_MAX_BYTES);
-	expect(text.split("\n").length).toBeLessThanOrEqual(DEFAULT_MAX_LINES);
-	expect(message.details.usage.totalTokens).toBe(3);
-	expect(message.details.fullOutputPath).toBeUndefined();
-});
-
-test("discarding a completion that became stale after formatting removes its unused output file", async () => {
-	const message = await subagentCompletionMessage({
-		id: "1",
-		status: "done",
-		output: "output\n".repeat(3000),
-		usage: response("").usage,
-	});
-	const path = message.details.fullOutputPath;
-	if (!path) throw new Error("Missing output file");
-	outputDirectories.push(dirname(path));
-	await discardSubagentCompletion(message);
-	await expect(readFile(path)).rejects.toThrow();
 });
 
 test("completion output is bounded with full output saved, and rich usage is billed once outside the receipt", async () => {

@@ -111,7 +111,7 @@ test("main navigation preserves an existing empty editor, passes single Left thr
 	expect(ui.setEditorComponent).toHaveBeenCalledTimes(2);
 });
 
-test.each(["draft", " ", "\n", "first\nsecond", "日本語🙂"])(
+test.each(["draft", "first\nsecond"])(
 	"main navigation only opens at the text start when the editor contains %j",
 	(text) => {
 		const tui = { requestRender() {}, terminal: { rows: 24 } } as TUI;

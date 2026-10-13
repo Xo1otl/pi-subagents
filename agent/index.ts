@@ -1,4 +1,6 @@
 import {
+	type BoundaryResult,
+	type BoundaryState,
 	defineTool,
 	type ExtensionAPI,
 	type ExtensionContext,
@@ -103,24 +105,25 @@ export function createSubagentIntegration(
 		}
 	}
 
-	function takeAccounting(ctx: ExtensionContext) {
-		if (!binding || !isCurrent(binding, ctx)) return;
-		return { entries: binding.accounting.splice(0) };
+	function takeAccounting(ctx: ExtensionContext): SessionBoundaryDraft[] {
+		if (!binding || !isCurrent(binding, ctx)) return [];
+		return binding.accounting.splice(0);
 	}
 
 	// Custom drafts persist metadata, not model context. Pi 1.1.0 cannot attach
 	// usage to these drafts; the actual billing entry is appended separately.
-	pi.on("turn_end", (event, ctx) => {
-		const drafts = takeAccounting(ctx)?.entries;
-		if (drafts?.length) return { entries: [...event.entries, ...drafts] };
-	});
-	pi.on("agent_before_settle", (event, ctx) => {
-		const drafts = takeAccounting(ctx)?.entries;
-		if (drafts?.length) return { entries: [...event.entries, ...drafts] };
-	});
+	function appendAccounting(
+		event: BoundaryState,
+		ctx: ExtensionContext,
+	): BoundaryResult | undefined {
+		const drafts = takeAccounting(ctx);
+		if (drafts.length) return { entries: [...event.entries, ...drafts] };
+	}
+	pi.on("turn_end", appendAccounting);
+	pi.on("agent_before_settle", appendAccounting);
 
 	function flushAccounting(ctx: ExtensionContext): void {
-		for (const draft of takeAccounting(ctx)?.entries ?? []) {
+		for (const draft of takeAccounting(ctx)) {
 			if (draft.type === "custom") pi.appendEntry(draft.customType, draft.data);
 		}
 	}

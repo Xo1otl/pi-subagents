@@ -19,12 +19,6 @@ import { response, spawnContext, stream, toolCall, until } from "./fixtures.ts";
 const theme = { fg: (_color: string, text: string) => text };
 const keys: Pick<KeybindingsManager, "matches"> = {
 	matches(data, action) {
-		if (action === "app.interrupt") return matchesKey(data, "escape");
-		if (action === "tui.input.submit") return matchesKey(data, "enter");
-		if (action === "tui.altScreen.pageUp") return matchesKey(data, "pageUp");
-		if (action === "tui.altScreen.pageDown")
-			return matchesKey(data, "pageDown");
-		if (action === "tui.altScreen.top") return matchesKey(data, "ctrl+home");
 		if (action === "tui.altScreen.bottom") return matchesKey(data, "ctrl+end");
 		if (action === "app.tools.expand") return matchesKey(data, "ctrl+o");
 		if (action === "app.thinking.toggle") return matchesKey(data, "ctrl+t");

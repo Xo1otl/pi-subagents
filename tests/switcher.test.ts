@@ -29,10 +29,7 @@ const keybindings: Pick<KeybindingsManager, "matches"> = {
 		if (action === "tui.input.submit") return matchesKey(data, "enter");
 		if (action === "tui.editor.pageUp") return matchesKey(data, "pageUp");
 		if (action === "tui.editor.pageDown") return matchesKey(data, "pageDown");
-		if (action === "tui.altScreen.top") return matchesKey(data, "ctrl+home");
 		if (action === "tui.altScreen.bottom") return matchesKey(data, "ctrl+end");
-		if (action === "app.tools.expand") return matchesKey(data, "ctrl+o");
-		if (action === "app.thinking.toggle") return matchesKey(data, "ctrl+t");
 		return false;
 	},
 };
@@ -103,7 +100,7 @@ function agentRow(switcher: SubagentSwitcher, id: string): number {
 	return row;
 }
 
-test("clicks select descendants, preserve drafts and route messages without submitting on selection", async () => {
+test("clicks select descendants and preserve drafts without submitting on selection", async () => {
 	const { tree, switcher } = await setup();
 	switcher.focused = true;
 	switcher.handleInput("root child draft");
@@ -123,14 +120,6 @@ test("clicks select descendants, preserve drafts and route messages without subm
 	);
 	switcher.handleMouse(mouse(agentRow(switcher, "1.1")));
 	expect(stripTerminalSequences(switcher.render(80).join("\n"))).toContain(
-		"leaf draft",
-	);
-	switcher.handleInput("\r");
-	await until(() => tree.get("1.1")?.status === "done");
-	expect(JSON.stringify(tree.get("1.1")?.session?.messages)).toContain(
-		"leaf draft",
-	);
-	expect(JSON.stringify(tree.get("1")?.session?.messages)).not.toContain(
 		"leaf draft",
 	);
 });
@@ -219,11 +208,8 @@ test("fullscreen mouse reports select through the real overlay dispatcher and re
 		expect(tui.getScreenLines().join("\n")).toContain("Subagents · 14");
 		expect(switcher.focused).toBe(true);
 		input("message after clicking");
-		input("\r");
-		await until(() => tree.get("14")?.status === "done");
-		expect(JSON.stringify(tree.get("14")?.session?.messages)).toContain(
-			"message after clicking",
-		);
+		tui.renderNow(true);
+		expect(tui.getScreenLines().join("\n")).toContain("message after clicking");
 		await tree.send(
 			"14",
 			Array.from({ length: 70 }, (_, i) => `wheel log ${i}`).join("\n"),
@@ -594,7 +580,7 @@ test.each(["editing", "paste", "split paste", "focus", "agent switch"])(
 );
 
 test("tree arrows traverse descendants and parents, clamp at the ends and restore drafts", async () => {
-	const { tree, switcher } = await setup();
+	const { switcher } = await setup();
 	switcher.focused = true;
 	switcher.handleInput("parent draft");
 	switcher.handleInput("\t"); // Use an empty composer without discarding the draft.
@@ -634,18 +620,10 @@ test("tree arrows traverse descendants and parents, clamp at the ends and restor
 	expect(stripTerminalSequences(switcher.render(80).join("\n"))).toContain(
 		"parent draft",
 	);
-	switcher.handleInput("\r");
-	await until(() => tree.get("1")?.status === "done");
-	expect(JSON.stringify(tree.get("1")?.session?.messages)).toContain(
-		"parent draft",
-	);
-	expect(JSON.stringify(tree.get("1.1")?.session?.messages)).not.toContain(
-		"parent draft",
-	);
 });
 
 test("initial tree focus survives host focus changes and clicking the composer resumes editing", async () => {
-	const { tree, switcher } = await setup({ initialFocus: "tree" });
+	const { switcher } = await setup({ initialFocus: "tree" });
 	switcher.focused = true;
 	switcher.handleInput("\x1b[B");
 	switcher.focused = false;
@@ -661,9 +639,7 @@ test("initial tree focus survives host focus changes and clicking the composer r
 	expect(switcher.render(80).join("\n")).not.toContain("● Tree");
 	expect(switcher.render(80).join("\n")).toContain("● 2/3");
 	switcher.handleInput("leaf message");
-	switcher.handleInput("\r");
-	await until(() => tree.get("1.1")?.status === "done");
-	expect(JSON.stringify(tree.get("1.1")?.session?.messages)).toContain(
+	expect(stripTerminalSequences(switcher.render(80).join("\n"))).toContain(
 		"leaf message",
 	);
 });

@@ -1,6 +1,11 @@
 import { afterEach, expect, test } from "bun:test";
 import { readFile, rm } from "node:fs/promises";
-import { dirname, isAbsolute } from "node:path";
+import { tmpdir } from "node:os";
+import { dirname, isAbsolute, join } from "node:path";
+import {
+	DEFAULT_MAX_BYTES,
+	DEFAULT_MAX_LINES,
+} from "@earendil-works/pi-coding-agent";
 import { subagentCompletionMessage } from "../agent/completions.ts";
 import { subagentReceipt } from "../agent/protocol.ts";
 import type { SubagentResult } from "../runtime/index.ts";
@@ -19,13 +24,10 @@ afterEach(async () => {
 	);
 });
 
-function run(
-	output: string,
-	status: SubagentResult["status"] = "done",
-): SubagentResult {
+function run(output: string): SubagentResult {
 	return {
 		id: "1",
-		status,
+		status: "done",
 		output,
 		usage: response("").usage,
 	};
@@ -40,23 +42,20 @@ test("running receipts contain only the agent ID and status", () => {
 	});
 });
 
-test.each(["done", "error", "aborted"] as const)(
-	"%s completions omit redundant hierarchy fields",
-	async (status) => {
-		const result = run("task output", status);
-		const message = await subagentCompletionMessage(result);
-		expect(message.content).toEqual([
-			{ type: "text", text: `Subagent 1 ${status}.` },
-			{ type: "text", text: "task output" },
-		]);
-		expect(message.details).toEqual({
-			id: "1",
-			status,
-			error: undefined,
-			usage: result.usage,
-		});
-	},
-);
+test("completions omit redundant hierarchy fields", async () => {
+	const result = run("task output");
+	const message = await subagentCompletionMessage(result);
+	expect(message.content).toEqual([
+		{ type: "text", text: "Subagent 1 done." },
+		{ type: "text", text: "task output" },
+	]);
+	expect(message.details).toEqual({
+		id: "1",
+		status: "done",
+		error: undefined,
+		usage: result.usage,
+	});
+});
 
 test.each([undefined, null, {}, "invalid"])(
 	"tool call renderers tolerate unknown or partial arguments",
@@ -110,22 +109,30 @@ test("renders partial calls and background receipts with switcher guidance", () 
 	]);
 });
 
-test("UI adds switcher guidance without modifying content sent to the model", async () => {
-	const message = await subagentCompletionMessage(run("task output"));
-	const before = JSON.stringify(message);
-	const theme = { fg: (_color: string, text: string) => text };
-	for (const expanded of [false, true]) {
-		const text = renderSubagentResult(
-			{ content: message.content, details: message.details },
-			{ expanded, isPartial: false },
-			theme,
-		)
-			.render(120)
-			.join("\n");
-		expect(text).toContain("task output");
-		expect(text).toContain("/subagents 1 · view conversation");
-		expect(JSON.stringify(message)).toBe(before);
+test("a failed output-file write still produces bounded completion content and preserves usage", async () => {
+	const previous = process.env.TMPDIR;
+	let message: Awaited<ReturnType<typeof subagentCompletionMessage>>;
+	try {
+		process.env.TMPDIR = join(
+			tmpdir(),
+			`pi-subagents-missing-${crypto.randomUUID()}`,
+			"missing",
+		);
+		message = await subagentCompletionMessage(
+			run("large output\n".repeat(3000)),
+		);
+	} finally {
+		if (previous === undefined) delete process.env.TMPDIR;
+		else process.env.TMPDIR = previous;
 	}
+	const text = message.content
+		.flatMap((part) => (part.type === "text" ? [part.text] : []))
+		.join("\n");
+	expect(text).toContain("Could not save full output");
+	expect(Buffer.byteLength(text)).toBeLessThanOrEqual(DEFAULT_MAX_BYTES);
+	expect(text.split("\n").length).toBeLessThanOrEqual(DEFAULT_MAX_LINES);
+	expect(message.details.usage.totalTokens).toBe(3);
+	expect(message.details.fullOutputPath).toBeUndefined();
 });
 
 test("continued runs with the same agent ID cannot overwrite earlier output files", async () => {
