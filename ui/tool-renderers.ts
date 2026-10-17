@@ -1,17 +1,11 @@
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { contentText } from "@earendil-works/pi-ai";
-import type {
-	Theme,
-	ToolRenderResultOptions,
-} from "@earendil-works/pi-coding-agent";
+import type { ToolRenderResultOptions } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { isSubagentReceipt, subagentId } from "../agent/protocol.ts";
-import { plain, singleLine } from "./text.ts";
+import { plain, singleLine, type UITheme } from "./text.ts";
 
-export function renderSubagentCall(
-	args: unknown,
-	theme: Pick<Theme, "fg">,
-): Text {
+export function renderSubagentCall(args: unknown, theme: UITheme): Text {
 	const instructions =
 		args && typeof args === "object" && "instructions" in args
 			? args.instructions
@@ -30,7 +24,7 @@ export function renderSubagentResult(
 		isPartial,
 		expanded,
 	}: Pick<ToolRenderResultOptions, "isPartial" | "expanded">,
-	theme: Pick<Theme, "fg">,
+	theme: UITheme,
 ): Text {
 	if (isPartial) return new Text(theme.fg("muted", "Delegating…"), 0, 0);
 	const text = plain(contentText(result.content));

@@ -2,7 +2,7 @@ import type {
 	AgentSession,
 	ContextUsage,
 } from "@earendil-works/pi-coding-agent";
-import type { ChatTheme } from "./transcript.ts";
+import type { UITheme } from "./text.ts";
 
 interface CachedContextUsage {
 	sessionId: string;
@@ -12,29 +12,30 @@ interface CachedContextUsage {
 	usage: ContextUsage | undefined;
 }
 
-/** Context scans finalized history; streaming and editor frames can reuse it. */
-export function createContextUsageReader() {
-	const cache = new WeakMap<AgentSession, CachedContextUsage>();
-	return (session: AgentSession | undefined): ContextUsage | undefined => {
-		if (!session) return undefined;
-		const manager = session.sessionManager;
-		const sessionId = manager.getSessionId();
-		const leafId = manager.getLeafId();
-		const entryCount = manager.getEntryCount();
-		const model = session.routedModel?.model ?? session.model;
-		const previous = cache.get(session);
-		if (
-			previous &&
-			previous.sessionId === sessionId &&
-			previous.leafId === leafId &&
-			previous.entryCount === entryCount &&
-			previous.model === model
-		)
-			return previous.usage;
-		const usage = session.getContextUsage();
-		cache.set(session, { sessionId, leafId, entryCount, model, usage });
-		return usage;
-	};
+const cache = new WeakMap<AgentSession, CachedContextUsage>();
+
+/** Context scans finalized history; streaming and editor frames reuse the last scan. */
+export function readContextUsage(
+	session: AgentSession | undefined,
+): ContextUsage | undefined {
+	if (!session) return undefined;
+	const manager = session.sessionManager;
+	const sessionId = manager.getSessionId();
+	const leafId = manager.getLeafId();
+	const entryCount = manager.getEntryCount();
+	const model = session.routedModel?.model ?? session.model;
+	const previous = cache.get(session);
+	if (
+		previous &&
+		previous.sessionId === sessionId &&
+		previous.leafId === leafId &&
+		previous.entryCount === entryCount &&
+		previous.model === model
+	)
+		return previous.usage;
+	const usage = session.getContextUsage();
+	cache.set(session, { sessionId, leafId, entryCount, model, usage });
+	return usage;
 }
 
 function formatTokens(count: number): string {
@@ -45,10 +46,10 @@ function formatTokens(count: number): string {
 	return `${Math.round(count / 1_000_000)}M`;
 }
 
-/** Use Pi's context estimate, never cumulative or delegated token charges. */
+/** Use pi's context estimate, never cumulative or delegated token charges. */
 export function renderContextUsage(
 	usage: ContextUsage | undefined,
-	theme: ChatTheme,
+	theme: UITheme,
 	compact = false,
 ): string {
 	const percent = usage?.percent;

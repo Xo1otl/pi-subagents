@@ -8,7 +8,13 @@ import {
 	type SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { createSubagents, ROOT, type Subagents } from "../runtime/index.ts";
+import {
+	createSubagents,
+	ROOT,
+	type SessionOwner,
+	type SubagentResult,
+	type Subagents,
+} from "../runtime/index.ts";
 import {
 	discardSubagentCompletion,
 	subagentCompletionMessage,
@@ -54,8 +60,8 @@ export interface SubagentView {
 
 interface SessionBinding {
 	runtime: Subagents;
-	parentId: string;
-	manager: ExtensionContext["sessionManager"];
+	/** Pi's public SessionManager behind the context's read-only view. */
+	manager: SessionManager;
 	sessionId: string;
 	/** Only cancellation aborts a headless session; it fences that session's older children. */
 	abortEpoch: number;
@@ -69,13 +75,15 @@ interface SessionBinding {
 	awaitingResults: boolean;
 }
 
-/** Wire Pi's lifecycle and expose the undecorated, machine-facing tool. */
+/** Wire Pi's lifecycle and return the undecorated, machine-facing tool. */
 export function createSubagentIntegration(
 	pi: ExtensionAPI,
 	view?: SubagentView,
 ) {
 	// Each delegated session loads its own extensions, so the owner is fixed.
 	const owner = sessionOwner(pi.events);
+	// A root session's children report to ROOT, a delegated session's to its node.
+	const parentId = owner?.id ?? ROOT;
 	let binding: SessionBinding | undefined;
 
 	function discardPending(source: SessionBinding): Promise<void> {
@@ -86,15 +94,28 @@ export function createSubagentIntegration(
 		const cleanup = Promise.all(messages.map(discardSubagentCompletion)).then(
 			() => {},
 		);
-		source.runtime.trackCompletion(source.parentId, cleanup);
+		source.runtime.trackCompletion(parentId, cleanup);
 		return cleanup;
 	}
 
-	function invalidate(): Promise<void> {
+	/** Release presentation, fence deliveries, then stop the session's work:
+	 * a root disposes its runtime, a delegated session runs `stopDelegated`.
+	 */
+	async function teardown(
+		stopDelegated: (owner: SessionOwner) => void = () => {},
+	): Promise<void> {
 		const source = binding;
-		source?.stopWatchingAbort();
-		binding = undefined;
-		return source ? discardPending(source) : Promise.resolve();
+		try {
+			view?.dispose();
+		} finally {
+			// Fence deliveries before awaiting cancellation or asynchronous initialization.
+			source?.stopWatchingAbort();
+			binding = undefined;
+			const cleanup = source ? discardPending(source) : Promise.resolve();
+			if (owner) stopDelegated(owner);
+			else await source?.runtime.dispose();
+			await cleanup;
+		}
 	}
 
 	function isCurrent(source: SessionBinding, ctx: ExtensionContext): boolean {
@@ -149,10 +170,61 @@ export function createSubagentIntegration(
 		}
 	}
 
+	/** Add one result to its parent's context, or only record it when fenced.
+	 * Run billing is already persisted, independently of this notification.
+	 */
+	async function deliver(
+		source: SessionBinding,
+		ctx: ExtensionContext,
+		result: SubagentResult,
+		canDeliver: () => boolean,
+	): Promise<void> {
+		const data = { id: result.id, status: result.status, usage: result.usage };
+		const message = canDeliver()
+			? await subagentCompletionMessage(result)
+			: undefined;
+		if (!message || !canDeliver()) {
+			try {
+				// Cancellation suppresses context delivery, not already-incurred billing.
+				if (source.manager.getSessionId() === source.sessionId)
+					source.manager.appendCustomEntry(SUBAGENT_USAGE_TYPE, data);
+			} finally {
+				if (message) await discardSubagentCompletion(message);
+			}
+			return;
+		}
+		source.pendingCompletions.add(message);
+		source.accounting.push({
+			type: "custom",
+			customType: SUBAGENT_USAGE_TYPE,
+			data,
+		});
+		try {
+			if (!owner) {
+				source.held.push(message);
+				releaseIfIdle(source, ctx);
+				return;
+			}
+			const parent = source.runtime.get(owner.id)?.session;
+			if (!parent) throw new Error("Subagent parent session is unavailable.");
+			// Unlike pi.sendMessage (void), the SDK promise observes turn
+			// startup failures and keeps headless settlement/billing fenced.
+			await parent.sendCustomMessage(message, {
+				deliverAs: "followUp",
+				triggerTurn: true,
+			});
+		} catch (error) {
+			// Unless it was already persisted or discarded with its binding.
+			if (source.pendingCompletions.delete(message))
+				await discardSubagentCompletion(message);
+			throw error;
+		}
+	}
+
 	pi.on("agent_start", (_event, ctx) => {
 		const source = binding;
 		// Interrupting the root stops its turn, never the delivery of results.
-		if (!source || source.parentId === ROOT || !isCurrent(source, ctx)) return;
+		if (!owner || !source || !isCurrent(source, ctx)) return;
 		source.stopWatchingAbort();
 		const signal = ctx.signal;
 		const fence = () => {
@@ -182,10 +254,10 @@ export function createSubagentIntegration(
 		const source = binding;
 		if (source && isCurrent(source, ctx)) {
 			source.stopWatchingAbort();
-			if (source.parentId !== ROOT) {
+			if (owner) {
 				if (event.aborted) source.abortEpoch++;
 				// Core subtree cancellation clears this headless session's queues.
-				if (event.aborted && source.runtime.get(source.parentId)?.cancelled)
+				if (event.aborted && source.runtime.get(owner.id)?.cancelled)
 					await discardPending(source);
 			} else {
 				if (ctx.mode === "print" || ctx.mode === "json") {
@@ -213,30 +285,16 @@ export function createSubagentIntegration(
 	pi.on("session_compact_failed", releaseAfterIdleWork);
 	pi.on("session_tree", releaseAfterIdleWork);
 
-	const current = (): Subagents => {
-		if (!binding) throw new Error("Subagents are not initialized.");
-		return binding.runtime;
-	};
-
 	pi.on("session_start", async (_event, ctx) => {
-		const previous = binding;
-		try {
-			view?.dispose();
-		} finally {
-			const cleanup = invalidate();
-			if (previous?.parentId === ROOT) await previous.runtime.dispose();
-			await cleanup;
-		}
+		await teardown();
 		// ExtensionContext exposes a read-only view of Pi's public SessionManager.
 		// Capture the actual ledger once; run billing must survive binding teardown.
-		const runtime =
-			owner?.runtime ??
-			createSubagentRuntime(ctx.sessionManager as SessionManager);
+		const manager = ctx.sessionManager as SessionManager;
+		const runtime = owner?.runtime ?? createSubagentRuntime(manager);
 		binding = {
 			runtime,
-			parentId: owner?.id ?? ROOT,
-			manager: ctx.sessionManager,
-			sessionId: ctx.sessionManager.getSessionId(),
+			manager,
+			sessionId: manager.getSessionId(),
 			abortEpoch: 0,
 			stopWatchingAbort: () => {},
 			accounting: [],
@@ -248,28 +306,21 @@ export function createSubagentIntegration(
 		if (!owner) view?.bind(runtime, ctx);
 	});
 	pi.on("session_shutdown", async (event, ctx) => {
-		const previous = binding?.runtime;
 		flushAccounting(ctx);
-		// Fence deliveries before awaiting cancellation or asynchronous initialization.
-		try {
-			view?.dispose();
-		} finally {
-			const cleanup = invalidate();
-			if (owner) {
-				if (event.reason === "quit") owner.runtime.abort(owner.id);
-				else {
-					for (const child of owner.runtime.tree())
-						if (child.parentId === owner.id) owner.runtime.abort(child.id);
-				}
-			} else await previous?.dispose();
-			await cleanup;
-		}
+		await teardown(({ runtime, id }) => {
+			// Quitting ends this subagent's run; replacing its conversation only
+			// cancels its children.
+			if (event.reason === "quit") runtime.abort(id);
+			else
+				for (const child of runtime.tree())
+					if (child.parentId === id) runtime.abort(child.id);
+		});
 	});
 
-	const tool = defineTool({
+	return defineTool({
 		name: "subagent",
 		label: "Subagent",
-		description: "Final reply is sent to the parent.",
+		description: "Replies to the parent when done.",
 		parameters: Type.Object({
 			instructions: Type.String({ minLength: 1 }),
 		}),
@@ -280,74 +331,23 @@ export function createSubagentIntegration(
 		executionMode: "parallel",
 		async execute(_id, { instructions }, signal, _onUpdate, ctx) {
 			signal?.throwIfAborted();
-			const tree = current();
 			const source = binding;
 			if (!source || !isCurrent(source, ctx))
 				throw new Error("Subagent parent session is no longer active.");
+			const tree = source.runtime;
 			const epoch = source.abortEpoch;
 			const context = spawnContext(ctx, owner);
 			// After receipt, this job belongs to the runtime, not the parent's turn signal.
-			const started = tree.start(source.parentId, instructions, context);
+			const started = tree.start(parentId, instructions, context);
 			const canDeliver = () =>
 				isCurrent(source, ctx) &&
 				!tree.closed &&
-				(source.parentId === ROOT ||
+				(!owner ||
 					(source.abortEpoch === epoch &&
 						!signal?.aborted &&
-						!tree.get(source.parentId)?.cancelled));
+						!tree.get(owner.id)?.cancelled));
 			const completion = started.result
-				.then(async (result) => {
-					// Run billing is already persisted, independently of this notification.
-					if (source.manager.getSessionId() !== source.sessionId) return;
-					const manager = source.manager as SessionManager;
-					const data = {
-						id: result.id,
-						status: result.status,
-						usage: result.usage,
-					};
-					const message = canDeliver()
-						? await subagentCompletionMessage(result)
-						: undefined;
-					let queued = false;
-					let delivered = false;
-					try {
-						if (message && canDeliver()) {
-							source.pendingCompletions.add(message);
-							queued = true;
-							source.accounting.push({
-								type: "custom",
-								customType: SUBAGENT_USAGE_TYPE,
-								data,
-							});
-							if (source.parentId === ROOT) {
-								source.held.push(message);
-								releaseIfIdle(source, ctx);
-							} else {
-								const parent = tree.get(source.parentId)?.session;
-								if (!parent)
-									throw new Error("Subagent parent session is unavailable.");
-								// Unlike pi.sendMessage (void), the SDK promise observes turn
-								// startup failures and keeps headless settlement/billing fenced.
-								await parent.sendCustomMessage(message, {
-									deliverAs: "followUp",
-									triggerTurn: true,
-								});
-							}
-							delivered = true;
-						} else {
-							// Cancellation suppresses context delivery, not already-incurred billing.
-							if (manager.getSessionId() === source.sessionId)
-								manager.appendCustomEntry(SUBAGENT_USAGE_TYPE, data);
-						}
-					} finally {
-						if (
-							message &&
-							!delivered &&
-							(!queued || source.pendingCompletions.delete(message))
-						)
-							await discardSubagentCompletion(message);
-					}
-				})
+				.then((result) => deliver(source, ctx, result, canDeliver))
 				.catch((error: unknown) => {
 					if (canDeliver())
 						ctx.ui.notify(
@@ -358,15 +358,13 @@ export function createSubagentIntegration(
 					// (or shutdown reporting at root) instead of silently losing it.
 					throw error;
 				});
-			tree.trackCompletion(source.parentId, completion);
+			tree.trackCompletion(parentId, completion);
 			return subagentReceipt(started);
 		},
 	});
-
-	return { current, tool };
 }
 
 /** Headless entrypoint for delegated sessions. */
 export default function subagentsExtension(pi: ExtensionAPI): void {
-	pi.registerTool(createSubagentIntegration(pi).tool);
+	pi.registerTool(createSubagentIntegration(pi));
 }

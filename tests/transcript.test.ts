@@ -52,7 +52,7 @@ function text(
 ) {
 	return renderer
 		.render(agent, width, prefs)
-		.rows.map((row) => stripTerminalSequences(row.text))
+		.map((row) => stripTerminalSequences(row.text))
 		.join("\n");
 }
 
@@ -95,7 +95,7 @@ test("tool calls and results form one independently collapsible block, with thin
 	prefs.showThinking = true;
 	expect(text(renderer, agent, prefs)).toContain("PRIVATE_THINKING");
 	expect(
-		renderer.render(agent, 80, prefs).rows.filter((row) => row.toolId),
+		renderer.render(agent, 80, prefs).filter((row) => row.toolId),
 	).toHaveLength(1);
 });
 
@@ -125,7 +125,8 @@ test("live execution snapshots replace previews and terminal results take preced
 	};
 	expect(text(renderer, agent)).not.toContain("old snapshot");
 	expect(text(renderer, agent)).toContain("new snapshot");
-	const before = renderer.render(agent, 80, preferences()).rows[0]?.blockId;
+	const before = renderer.render(agent, 80, preferences())[0]?.toolId;
+	expect(before).toBe(`tool:${part.id}`);
 	messages.push(call, {
 		role: "toolResult",
 		toolCallId: part.id,
@@ -137,11 +138,9 @@ test("live execution snapshots replace previews and terminal results take preced
 	expect(text(renderer, agent)).toContain("bash [error]");
 	expect(text(renderer, agent)).toContain("authoritative final");
 	expect(text(renderer, agent)).not.toContain("new snapshot");
-	expect(renderer.render(agent, 80, preferences()).rows[0]?.blockId).toBe(
-		before,
-	);
+	expect(renderer.render(agent, 80, preferences())[0]?.toolId).toBe(before);
 	expect(
-		renderer.render(agent, 80, preferences()).rows.filter((row) => row.toolId),
+		renderer.render(agent, 80, preferences()).filter((row) => row.toolId),
 	).toHaveLength(1);
 });
 
@@ -203,7 +202,7 @@ test("sanitizes untrusted controls, respects terminal columns and invalidates ca
 	expect(text(renderer, agent)).toContain("Bassistant");
 	const normal = createTranscriptRenderer(theme);
 	for (const width of [1, 2, 3, 10, 40, 80])
-		for (const row of normal.render(agent, width, preferences()).rows) {
+		for (const row of normal.render(agent, width, preferences())) {
 			expect(visibleWidth(row.text)).toBeLessThanOrEqual(width);
 			expect(row.text).not.toContain("\n");
 		}

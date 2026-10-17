@@ -57,17 +57,15 @@ test("completions omit redundant hierarchy fields", async () => {
 	});
 });
 
-test.each([undefined, null, {}, "invalid"])(
-	"tool call renderers tolerate unknown or partial arguments",
-	(args) => {
-		const theme = { fg: (_color: string, text: string) => text };
+test("tool call renderers tolerate unknown or partial arguments", () => {
+	const theme = { fg: (_color: string, text: string) => text };
+	for (const args of [undefined, null, {}, "invalid"])
 		expect(
 			renderSubagentCall(args, theme)
 				.render(80)
 				.map((line) => line.trimEnd()),
 		).toEqual(["Subagent …"]);
-	},
-);
+});
 
 test.each([
 	"日本語".repeat(20_000),

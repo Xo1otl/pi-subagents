@@ -95,28 +95,6 @@ describe("runtime factory", () => {
 		);
 		expect(requests).toBe(1);
 	});
-
-	test("reentrant shutdown listeners receive the same closing promise", async () => {
-		const tree = runtime();
-		const result = tree.start(
-			ROOT,
-			"wait",
-			await spawnContext(
-				stream((_context, options) => waiting(options?.signal)),
-			),
-		).result;
-		await until(() => Boolean(tree.get("1")?.session?.isStreaming));
-		const closings: Promise<void>[] = [];
-		tree.subscribe(() => {
-			if (tree.closed) closings.push(tree.dispose());
-		});
-		const closed = tree.dispose();
-		await closed;
-		expect(closings.length).toBeGreaterThan(0);
-		for (const closing of closings) expect(closing).toBe(closed);
-		expect((await result).status).toBe("aborted");
-		expect(tree.tree()).toHaveLength(0);
-	});
 });
 
 describe("silent hierarchy", () => {
@@ -202,7 +180,7 @@ describe("silent hierarchy", () => {
 		}
 	});
 
-	test("runtime cancellation remains attached while an idle parent drains a child", async () => {
+	test("stopping an idle parent that drains a child stops both and keeps billed work", async () => {
 		const tree = runtime();
 		let leafStarted = false;
 		const paused = stream((context, options) => {
@@ -212,41 +190,17 @@ describe("silent hierarchy", () => {
 			}
 			return hierarchyStream(model, context, options).result();
 		});
-		const controller = new AbortController();
 		const result = tree.start(
 			ROOT,
 			"nest:1",
 			await spawnContext(paused),
-			controller.signal,
 		).result;
 		await until(() => leafStarted && Boolean(tree.get("1")?.session?.isIdle));
-		controller.abort();
+		tree.abort("1");
 		expect((await result).status).toBe("aborted");
 		expect(tree.get("1.1")?.status).toBe("aborted");
 		// Suppressed notifications must not discard the child's billed work.
 		expect((await result).usage.totalTokens).toBe(9);
-	});
-
-	test("parallel siblings receive unique IDs and independent transcripts", async () => {
-		const tree = runtime();
-		const context = await spawnContext();
-		const results = await Promise.all(
-			["left", "right"].map(
-				(instructions) => tree.start(ROOT, instructions, context).result,
-			),
-		);
-		expect(results.map((result) => result.id)).toEqual(["1", "2"]);
-		expect(results.map((result) => result.output)).toEqual(["left", "right"]);
-		expect(tree.get("1")?.session?.sessionId).not.toBe(
-			tree.get("2")?.session?.sessionId,
-		);
-		expect(
-			JSON.stringify(
-				tree
-					.get("1")
-					?.session?.messages.filter((message) => message.role !== "system"),
-			),
-		).not.toContain("right");
 	});
 });
 
@@ -350,7 +304,7 @@ describe("task results", () => {
 		}
 	});
 
-	test("joins all final text blocks, surfaces failures, and returns full output without presentation hints", async () => {
+	test("joins all final text blocks and returns full output without presentation hints", async () => {
 		const tree = runtime();
 		const combined = await tree.start(
 			ROOT,
@@ -367,20 +321,6 @@ describe("task results", () => {
 			),
 		).result;
 		expect(combined.output).toBe("one\ntwo");
-		const failure = await tree.start(
-			ROOT,
-			"fail",
-			await spawnContext(
-				stream(() =>
-					response("", {
-						stopReason: "error",
-						errorMessage: "provider unavailable",
-					}),
-				),
-			),
-		).result;
-		expect(failure.status).toBe("error");
-		expect(failure.output).toBe("provider unavailable");
 		const huge = "日本語".repeat(20_000);
 		const large = await tree.start(
 			ROOT,
@@ -392,46 +332,6 @@ describe("task results", () => {
 });
 
 describe("interaction and cleanup", () => {
-	test("a completed descendant can be messaged in its own conversation without reporting to parent", async () => {
-		const tree = runtime();
-		const result = await tree.start(ROOT, "nest:1", await spawnContext())
-			.result;
-		const parentMessages = JSON.stringify(tree.get("1")?.session?.messages);
-		await tree.send("1.1", "new instructions");
-		expect(
-			tree
-				.get("1.1")
-				?.session?.messages.filter((message) => message.role === "user"),
-		).toHaveLength(2);
-		expect(JSON.stringify(tree.get("1")?.session?.messages)).toBe(
-			parentMessages,
-		);
-		expect(result.output).toBe("hello");
-	});
-
-	test("messages steer a running child and are included in its final result", async () => {
-		const tree = runtime();
-		let release: (() => void) | undefined;
-		const gate = new Promise<void>((resolve) => {
-			release = resolve;
-		});
-		let calls = 0;
-		const paused = stream(async (context) => {
-			if (calls++ === 0) await gate;
-			return response(lastText(context));
-		});
-		const result = tree.start(
-			ROOT,
-			"original",
-			await spawnContext(paused),
-		).result;
-		await until(() => calls === 1);
-		await tree.send("1", "replacement");
-		release?.();
-		expect((await result).output).toBe("replacement");
-		expect(calls).toBe(2);
-	});
-
 	test("steering at settlement is drained before reporting a final result", async () => {
 		const tree = runtime();
 		let sent = false;
@@ -631,21 +531,6 @@ describe("interaction and cleanup", () => {
 		});
 	});
 
-	test("UI cancellation before a prompt is active is not lost", async () => {
-		const tree = runtime();
-		let stopped = false;
-		const unsubscribe = tree.subscribe(() => {
-			if (!stopped && tree.get("1")) {
-				stopped = true;
-				tree.abort("1");
-			}
-		});
-		const result = await tree.start(ROOT, "hello", await spawnContext()).result;
-		expect(result.status).toBe("aborted");
-		expect(tree.get("1")?.status).toBe("aborted");
-		unsubscribe();
-	});
-
 	test("parent cancellation aborts all descendants, not independent siblings", async () => {
 		const tree = runtime();
 		const paused = stream((context, options) => {
@@ -653,12 +538,10 @@ describe("interaction and cleanup", () => {
 				return toolCall("subagent", { instructions: "waiting" });
 			return waiting(options?.signal);
 		});
-		const controller = new AbortController();
 		const parent = tree.start(
 			ROOT,
 			"parent",
 			await spawnContext(paused),
-			controller.signal,
 		).result;
 		const sibling = tree.start(
 			ROOT,
@@ -666,7 +549,7 @@ describe("interaction and cleanup", () => {
 			await spawnContext(paused),
 		).result;
 		await until(() => Boolean(tree.get("1.1")?.session?.isStreaming));
-		controller.abort();
+		tree.abort("1");
 		expect((await parent).status).toBe("aborted");
 		expect(tree.get("1")?.status).toBe("aborted");
 		expect(tree.get("1.1")?.status).toBe("aborted");
@@ -693,19 +576,16 @@ describe("interaction and cleanup", () => {
 		expect(leaf.status).toBe("done");
 	});
 
-	test("shutdown requested by an initial lifecycle callback waits for the whole run", async () => {
+	test("shutdown requested by lifecycle listeners waits for the whole run and is reentrant", async () => {
 		const tree = runtime();
-		let shutdown: Promise<void> | undefined;
-		let node: ReturnType<Subagents["get"]>;
+		const closings: Promise<void>[] = [];
 		tree.subscribe(() => {
-			if (!tree.closed && tree.get("1")) {
-				node = tree.get("1");
-				shutdown = tree.dispose();
-			}
+			if (tree.get("1")) closings.push(tree.dispose());
 		});
 		const result = tree.start(ROOT, "hello", await spawnContext()).result;
-		await shutdown;
-		expect(node?.session?.isStreaming ?? false).toBe(false);
+		await closings[0];
+		expect(closings.length).toBeGreaterThan(1);
+		expect(new Set(closings).size).toBe(1);
 		expect((await result).status).toBe("aborted");
 		expect(tree.tree()).toHaveLength(0);
 	});

@@ -13,16 +13,15 @@ import {
 	SettingsManager,
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
-import {
-	type Component,
-	CURSOR_MARKER,
-	type EditorComponent,
-	isFocusable,
-	matchesKey,
-	type TUI,
+import type {
+	Component,
+	EditorComponent,
+	OverlayHandle,
+	TUI,
 } from "@earendil-works/pi-tui";
-import type { SubagentSwitcher } from "../ui/switcher.ts";
+import { SWITCHER_OVERLAY } from "../ui/switcher.ts";
 import {
+	fullscreen,
 	lastText,
 	response,
 	spawnContext,
@@ -33,7 +32,9 @@ import {
 	waiting,
 } from "./fixtures.ts";
 
-test("a real root extension keeps the indicator independent of overlays and clears it on reload", async () => {
+type Custom = ExtensionUIContext["custom"];
+
+test("a real root extension opens the switcher overlay from commands and the root editor, and cleans up on reload", async () => {
 	const dispatch = stream((context, options) => {
 		if (context.messages.at(-1)?.role === "toolResult") {
 			const root = context.messages.some(
@@ -94,51 +95,52 @@ test("a real root extension keeps the indicator independent of overlays and clea
 		sessionManager: SessionManager.inMemory(cwd),
 	});
 	const theme = { fg: (_color: string, text: string) => text } as Theme;
-	const tui = { requestRender() {}, terminal: { rows: 24 } } as TUI;
-	const keybindings = {
-		matches(data: string, action: string) {
-			if (action === "app.interrupt") return matchesKey(data, "escape");
-			if (action === "tui.input.submit") return matchesKey(data, "enter");
-			return false;
-		},
-	} as KeybindingsManager;
-	const widgets = new Map<string, Component>();
+	const terminal = fullscreen({ columns: 80 });
+	const tui = terminal.tui;
+	const keybindings = terminal.keybindings as KeybindingsManager;
 	const editorTheme = {
 		borderColor: (text: string) => text,
 		selectList: getSelectListTheme(),
 	};
+	// Like pi's interactive mode: a focused root editor that extensions may replace.
 	let editor: EditorComponent = new CustomEditor(tui, editorTheme, keybindings);
+	tui.addChild(editor);
+	tui.setFocus(editor);
 	let editorFactory: ReturnType<ExtensionUIContext["getEditorComponent"]>;
 	const getEditorComponent = () => editorFactory;
 	const setEditorComponent = (factory: typeof editorFactory) => {
 		const text = editor.getText();
 		editorFactory = factory;
-		editor =
+		const next =
 			factory?.(tui, editorTheme, keybindings) ??
 			new CustomEditor(tui, editorTheme, keybindings);
+		tui.removeChild(editor);
+		tui.addChild(next);
+		editor = next;
 		editor.setText(text);
-		if (isFocusable(editor)) editor.focused = true;
+		tui.setFocus(editor);
 	};
-	let switcher: SubagentSwitcher | undefined;
+	let switcher: Component | undefined;
 	const custom = mock(
-		async (
-			factory: Parameters<ExtensionUIContext["custom"]>[0],
-			_options?: Parameters<ExtensionUIContext["custom"]>[1],
-		) => {
-			let done = (_result: unknown) => {};
-			const completed = new Promise<unknown>((resolve) => {
-				done = resolve;
-			});
-			if (isFocusable(editor)) editor.focused = false;
-			const component = await factory(tui, theme, keybindings, done);
-			switcher = component as SubagentSwitcher;
-			switcher.focused = true;
-			await completed;
-			component.dispose?.();
-			switcher = undefined;
-			if (isFocusable(editor)) editor.focused = true;
-		},
+		(factory: Parameters<Custom>[0], options?: Parameters<Custom>[1]) =>
+			new Promise<unknown>((resolve) => {
+				let overlay: OverlayHandle | undefined;
+				const component = factory(tui, theme, keybindings, (result) => {
+					overlay?.hide();
+					switcher = undefined;
+					resolve(result);
+				}) as Component;
+				const overlayOptions = options?.overlayOptions;
+				overlay = tui.showOverlay(
+					component,
+					typeof overlayOptions === "function"
+						? overlayOptions()
+						: overlayOptions,
+				);
+				switcher = component;
+			}),
 	);
+	const widgets = new Map<string, Component>();
 	const setWidget = mock(
 		(
 			key: string,
@@ -157,77 +159,73 @@ test("a real root extension keeps the indicator independent of overlays and clea
 	} as unknown as ExtensionUIContext;
 	const indicator = () =>
 		[...widgets.values()].flatMap((widget) => widget.render(100)).join("\n");
+	const header = () =>
+		terminal.screen().find((line) => line.startsWith("Subagent")) ?? "";
+	const left = "\x1b[D";
 	try {
 		await session.bindExtensions({ mode: "tui", uiContext: ui });
 		expect(getEditorComponent()).toBeDefined();
-		editor.handleInput("\x1b[D");
-		editor.handleInput("\x1b[D");
+		terminal.input(left);
+		terminal.input(left);
 		expect(custom).not.toHaveBeenCalled();
-		expect(switcher).toBeUndefined();
 		const run = session.prompt("delegate");
 		await until(() => indicator().includes("2 running"));
 		expect(indicator()).toContain("1, 1.1");
 		const open = session.prompt("/subagents 1.1");
 		await until(() => Boolean(switcher));
-		expect(switcher?.render(80)[1]).toContain("Subagents · 1.1");
 		expect(custom.mock.calls[0]?.[1]).toEqual({
 			overlay: true,
-			overlayOptions: {
-				width: "100%",
-				maxHeight: "100%",
-				anchor: "top-left",
-				margin: 0,
-			},
+			overlayOptions: SWITCHER_OVERLAY,
 		});
-		switcher?.handleInput("\x1b");
+		expect(header()).toContain("Subagent 1.1");
+		terminal.input("\x1b");
 		await open;
+		expect(terminal.text()).toContain("ROOT_TRANSCRIPT");
 		expect(indicator()).toContain("2 running");
 		// Cursor-moving Left presses stay in the editor. At the text start, the
-		// chord opens the tree while the root is running without losing the draft.
-		const terminalInput = (data: string) => {
-			if (switcher) switcher.handleInput(data);
-			else editor.handleInput(data);
-		};
+		// chord opens the picker while the root is running without losing the draft.
 		editor.setText("root draft");
-		terminalInput("\x1b[D");
-		expect(switcher).toBeUndefined();
-		terminalInput("\x1b[D");
-		expect(custom).toHaveBeenCalledTimes(1);
-		expect(switcher).toBeUndefined();
-		terminalInput("X");
+		terminal.input(left);
+		terminal.input(left);
+		terminal.input("X");
 		expect(editor.getText()).toBe("root draXft");
-		terminalInput("\x01"); // Ctrl+A moves to the beginning.
-		terminalInput("\x1b[D");
 		expect(custom).toHaveBeenCalledTimes(1);
-		terminalInput("\x1b[D");
+		terminal.input("\x01"); // Ctrl+A moves to the beginning.
+		terminal.input(left);
+		expect(custom).toHaveBeenCalledTimes(1);
+		terminal.input(left);
 		await until(() => Boolean(switcher));
 		expect(editor.getText()).toBe("root draXft");
-		expect(switcher?.render(80).join("\n")).not.toContain(CURSOR_MARKER);
-		terminalInput("\x1b[D");
-		terminalInput("\x1b[B");
-		expect(switcher?.render(80)[1]).toContain("Subagents · 1.1");
+		expect(header()).toContain("Subagents · 2");
+		expect(terminal.cursor()).toBeUndefined();
+		terminal.input(left); // Opening consumed the chord.
+		terminal.input("\x1b[B");
+		expect(terminal.screen().find((line) => line.startsWith(">"))).toStartWith(
+			">   1.1 [running] wait",
+		);
 		expect(custom).toHaveBeenCalledTimes(2);
-		switcher?.handleInput("\x1b");
+		terminal.input("\x1b");
 		await until(() => !switcher);
+		expect(tui.getFocusedComponent()).toBe(editor);
 		await session.abort();
 		await run;
 		// Background jobs outlive the root turn. Stop them explicitly in the switcher.
 		expect(indicator()).toContain("2 running");
 		const stopping = session.prompt("/subagents 1");
 		await until(() => Boolean(switcher));
-		switcher?.handleInput("\x03");
+		terminal.input("\x03");
 		await until(() => widgets.size === 0);
-		switcher?.handleInput("\x1b");
+		terminal.input("\x1b");
 		await stopping;
 
-		// Restart a completed descendant from the overlay while the root stays idle.
+		// Restart a completed descendant from the switcher while the root stays idle.
 		const reopened = session.prompt("/subagents 1.1");
 		await until(() => Boolean(switcher));
-		switcher?.handleInput("wait again");
-		switcher?.handleInput("\r");
+		terminal.input("wait again");
+		terminal.input("\r");
 		await until(() => indicator().includes("1 running · 1.1"));
 		expect(session.isStreaming).toBe(false);
-		switcher?.handleInput("\x1b");
+		terminal.input("\x1b");
 		await reopened;
 		expect(indicator()).toContain("1 running · 1.1");
 		await session.extensionRunner.emit({
@@ -242,10 +240,9 @@ test("a real root extension keeps the indicator independent of overlays and clea
 		expect(setWidget).not.toHaveBeenCalled();
 		custom.mockClear();
 		editor.setText("");
-		editor.handleInput("\x1b[D");
-		editor.handleInput("\x1b[D");
+		terminal.input(left);
+		terminal.input(left);
 		expect(custom).not.toHaveBeenCalled();
-		expect(switcher).toBeUndefined();
 	} finally {
 		await session.abort();
 		await session.extensionRunner.emit({
@@ -254,6 +251,7 @@ test("a real root extension keeps the indicator independent of overlays and clea
 		});
 		expect(getEditorComponent()).toBeUndefined();
 		session.dispose();
+		terminal.stop();
 		delete shared[key];
 	}
 });

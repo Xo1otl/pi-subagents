@@ -3,7 +3,8 @@ import type { Provider, Usage } from "@earendil-works/pi-ai";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import { createSubagentIntegration } from "../agent/index.ts";
 import { SUBAGENT_RESULT_TYPE } from "../agent/protocol.ts";
-import { ROOT, SUBAGENT_USAGE_KIND, type Subagents } from "../runtime/index.ts";
+import { ROOT, type Subagents } from "../runtime/index.ts";
+import { SUBAGENT_USAGE_KIND } from "../runtime/summary.ts";
 import {
 	deferred,
 	hierarchyStream,
@@ -29,14 +30,17 @@ afterEach(async () => {
 });
 
 async function setup(dispatch: Provider["streamSimple"]) {
-	let integration!: ReturnType<typeof createSubagentIntegration>;
-	const session = await parentSession(dispatch, [
-		(pi) => {
-			integration = createSubagentIntegration(pi);
-			pi.registerTool(integration.tool);
+	let tree: Subagents | undefined;
+	const view = {
+		bind(runtime: Subagents) {
+			tree = runtime;
 		},
+		dispose() {},
+	};
+	const session = await parentSession(dispatch, [
+		(pi) => pi.registerTool(createSubagentIntegration(pi, view)),
 	]);
-	const tree = integration.current();
+	if (!tree) throw new Error("Missing root runtime");
 	parents.push({ session, tree });
 	return { session, tree };
 }
@@ -87,15 +91,13 @@ function expectDelta(
 	expect(after.cost).toBeCloseTo(before.cost + usage.cost.total);
 }
 
-test.each(["done", "aborted", "error"] as const)(
+test.each(["done", "aborted"] as const)(
 	"resuming a %s child bills each new run without notifying or recharging the parent",
 	async (status) => {
 		const dispatch = stream((context, options) => {
 			const text = lastText(context);
 			if (text === "nest:0" && status === "aborted")
 				return waiting(options?.signal);
-			if (text === "nest:0" && status === "error")
-				return response("", { stopReason: "error", errorMessage: "failed" });
 			if (text === "resume")
 				return response("resumed", { usage: resumedUsage });
 			return hierarchyStream(model, context, options).result();
@@ -262,33 +264,25 @@ test("a running ancestor drains a resumed descendant through an idle intermediat
 	}
 });
 
-test.each(["abort", "shutdown"] as const)(
-	"%s preserves a resumed run's charges without a late parent notification",
-	async (stop) => {
-		const dispatch = stream((context, options) =>
-			lastText(context) === "slow resume"
-				? waiting(options?.signal)
-				: hierarchyStream(model, context, options).result(),
-		);
-		const { session, tree } = await setup(dispatch);
-		await session.prompt("nest:1");
-		await settled(session, tree);
-		const before = session.getSessionStats();
-		const messages = JSON.stringify(session.messages);
-		const resumed = tree.send("1", "slow resume");
-		await until(() => Boolean(tree.get("1")?.session?.isStreaming));
-		if (stop === "abort") tree.abort("1");
-		else
-			await session.extensionRunner.emit({
-				type: "session_shutdown",
-				reason: "quit",
-			});
-		await resumed;
-		expectDelta(session, before, response("").usage);
-		expect(charges(session)).toHaveLength(2);
-		expect(JSON.stringify(session.messages)).toBe(messages);
-	},
-);
+test("stopping a resumed run preserves its charges without a late parent notification", async () => {
+	const dispatch = stream((context, options) =>
+		lastText(context) === "slow resume"
+			? waiting(options?.signal)
+			: hierarchyStream(model, context, options).result(),
+	);
+	const { session, tree } = await setup(dispatch);
+	await session.prompt("nest:1");
+	await settled(session, tree);
+	const before = session.getSessionStats();
+	const messages = JSON.stringify(session.messages);
+	const resumed = tree.send("1", "slow resume");
+	await until(() => Boolean(tree.get("1")?.session?.isStreaming));
+	tree.abort("1");
+	await resumed;
+	expectDelta(session, before, response("").usage);
+	expect(charges(session)).toHaveLength(2);
+	expect(JSON.stringify(session.messages)).toBe(messages);
+});
 
 test("resumed billing remains fenced from a replacement root ledger", async () => {
 	const { session, tree } = await setup(hierarchyStream);

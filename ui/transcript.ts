@@ -1,24 +1,15 @@
 import {
 	getMarkdownTheme,
 	sessionEntryToContextMessages,
-	type Theme,
 } from "@earendil-works/pi-coding-agent";
 import { Markdown, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import type { Subagent, SubagentToolExecution } from "../runtime/index.ts";
-import { plain, singleLine } from "./text.ts";
-
-export type ChatTheme = Pick<Theme, "fg">;
+import { plain, singleLine, type UITheme } from "./text.ts";
 
 export interface TranscriptRow {
 	text: string;
-	blockId: string;
-	offset: number;
 	/** Only the disclosure header is clickable, leaving logs selectable. */
 	toolId?: string;
-}
-
-export interface TranscriptLayout {
-	rows: readonly TranscriptRow[];
 }
 
 export interface TranscriptPreferences {
@@ -191,7 +182,7 @@ function argumentPreview(args: unknown): string {
 function renderBlock(
 	block: Block,
 	width: number,
-	theme: ChatTheme,
+	theme: UITheme,
 	expanded: boolean,
 ): string[] {
 	const text = plain(block.text);
@@ -255,7 +246,7 @@ function renderBlock(
 }
 
 /** Cache each block independently so a live log does not re-render old Markdown. */
-export function createTranscriptRenderer(theme: ChatTheme) {
+export function createTranscriptRenderer(theme: UITheme) {
 	let cache = new Map<
 		string,
 		{ block: Block; width: number; expanded: boolean; lines: string[] }
@@ -265,7 +256,7 @@ export function createTranscriptRenderer(theme: ChatTheme) {
 			node: Subagent,
 			width: number,
 			preferences: TranscriptPreferences,
-		): TranscriptLayout {
+		): TranscriptRow[] {
 			const rows: TranscriptRow[] = [];
 			const next: typeof cache = new Map();
 			for (const block of transcriptBlocks(node)) {
@@ -286,12 +277,10 @@ export function createTranscriptRenderer(theme: ChatTheme) {
 						? cached.lines
 						: renderBlock(block, width, theme, expanded);
 				next.set(block.id, { block, width, expanded, lines });
-				if (rows.length) rows.push({ text: "", blockId: block.id, offset: -1 });
+				if (rows.length) rows.push({ text: "" });
 				lines.forEach((text, offset) => {
 					rows.push({
 						text: truncateToWidth(text, width, ""),
-						blockId: block.id,
-						offset,
 						toolId:
 							block.kind === "tool" && offset === 0 ? block.id : undefined,
 					});
@@ -304,10 +293,8 @@ export function createTranscriptRenderer(theme: ChatTheme) {
 						"dim",
 						node.status === "running" ? "(starting…)" : "(no messages)",
 					),
-					blockId: "empty",
-					offset: 0,
 				});
-			return { rows };
+			return rows;
 		},
 		invalidate() {
 			cache.clear();

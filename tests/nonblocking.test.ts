@@ -19,7 +19,8 @@ import {
 	type SubagentCompletionDetails,
 } from "../agent/protocol.ts";
 import { spawnContext } from "../agent/sessions.ts";
-import { SUBAGENT_USAGE_KIND, type Subagents } from "../runtime/index.ts";
+import type { Subagents } from "../runtime/index.ts";
+import { SUBAGENT_USAGE_KIND } from "../runtime/summary.ts";
 import {
 	deferred,
 	lastText,
@@ -62,27 +63,42 @@ afterEach(async () => {
 	);
 });
 
+/** A root integration whose view exposes the runtime bound to the current session. */
+function rootIntegration(view: Partial<SubagentView> = {}) {
+	let tool!: ReturnType<typeof createSubagentIntegration>;
+	let bound: Subagents | undefined;
+	const factory: ExtensionFactory = (pi) => {
+		tool = createSubagentIntegration(pi, {
+			bind(runtime, ctx) {
+				bound = runtime;
+				view.bind?.(runtime, ctx);
+			},
+			dispose: () => view.dispose?.(),
+		});
+		pi.registerTool(tool);
+	};
+	const runtime = () => {
+		if (!bound) throw new Error("Missing runtime");
+		return bound;
+	};
+	return { factory, tool: () => tool, runtime };
+}
+
 async function setup(
 	dispatch: Provider["streamSimple"],
 	onChildStart?: (ctx: ExtensionContext) => Promise<void>,
 	hooks: { parent?: ExtensionFactory; child?: ExtensionFactory } = {},
 ) {
-	let integration!: ReturnType<typeof createSubagentIntegration>;
+	const root = rootIntegration();
 	const session = await parentSession(
 		dispatch,
-		[
-			...(hooks.parent ? [hooks.parent] : []),
-			(pi) => {
-				integration = createSubagentIntegration(pi);
-				pi.registerTool(integration.tool);
-			},
-		],
+		[...(hooks.parent ? [hooks.parent] : []), root.factory],
 		onChildStart,
 		hooks.child,
 	);
-	const tree = integration.current();
+	const tree = root.runtime();
 	parents.push({ session, tree });
-	return { session, tree, integration: () => integration };
+	return { session, tree, tool: root.tool, runtime: root.runtime };
 }
 
 function completions(session: AgentSession) {
@@ -246,11 +262,11 @@ test("an already-aborted tool call rejects, but aborting its signal after receip
 		}
 		return defaultDispatch(model, context, options).result();
 	});
-	const { session, tree, integration } = await setup(dispatch);
+	const { session, tree, tool } = await setup(dispatch);
 	const cancelled = new AbortController();
 	cancelled.abort(new Error("already cancelled"));
 	await expect(
-		integration().tool.execute(
+		tool().execute(
 			"rejected",
 			{ instructions: "child task" },
 			cancelled.signal,
@@ -260,7 +276,7 @@ test("an already-aborted tool call rejects, but aborting its signal after receip
 	).rejects.toThrow("already cancelled");
 	expect(tree.tree()).toHaveLength(0);
 	const controller = new AbortController();
-	const receipt = await integration().tool.execute(
+	const receipt = await tool().execute(
 		"detached",
 		{ instructions: "child task" },
 		controller.signal,
@@ -275,29 +291,11 @@ test("an already-aborted tool call rejects, but aborting its signal after receip
 	tree.abort("1");
 	await until(() => completions(session).length === 1 && session.isIdle);
 	expect(aborted).toBe(true);
-	expect(completionDetails(session)).toMatchObject({ status: "aborted" });
-});
-
-test("deliberate child cancellation produces an aborted completion for a live parent", async () => {
-	let running = false;
-	const dispatch = stream((context, options) => {
-		if (lastText(context) === "child task") {
-			running = true;
-			return waiting(options?.signal);
-		}
-		return defaultDispatch(model, context, options).result();
-	});
-	const { session, tree } = await setup(dispatch);
-	await session.prompt("delegate");
-	await until(() => running);
-	tree.abort("1");
-	await until(() => completions(session).length === 1 && session.isIdle);
 	expect(completionDetails(session)).toMatchObject({
 		status: "aborted",
 		error: "Subagent was aborted.",
 		usage: { totalTokens: 3 },
 	});
-	expect(session.getSessionStats().tokens.total).toBe(12);
 });
 
 test("interrupting the originating parent leaves the child running and still delivers its result", async () => {
@@ -501,20 +499,15 @@ test("a one-shot root settles only after delegated results are delivered and ans
 		}
 		return defaultDispatch(model, context, options).result();
 	});
-	let integration!: ReturnType<typeof createSubagentIntegration>;
+	const root = rootIntegration();
 	const session = await parentSession(
 		dispatch,
-		[
-			(pi) => {
-				integration = createSubagentIntegration(pi);
-				pi.registerTool(integration.tool);
-			},
-		],
+		[root.factory],
 		undefined,
 		undefined,
 		"print",
 	);
-	const tree = integration.current();
+	const tree = root.runtime();
 	parents.push({ session, tree });
 	let finished = false;
 	const prompt = session.prompt("delegate").then(() => {
@@ -577,7 +570,7 @@ test.each([false, true])(
 			}
 			return response(lastText(context));
 		});
-		const { session, tree, integration } = await setup(dispatch, undefined, {
+		const { session, tree } = await setup(dispatch, undefined, {
 			child: (pi) => {
 				pi.on("input", async (event) => {
 					if (event.text === "late input") {
@@ -633,26 +626,22 @@ test.each([false, true])(
 		});
 		await closing;
 		expect(node.session?.isStreaming).toBe(false);
-		expect(integration().current().closed).toBe(true);
+		expect(tree.closed).toBe(true);
 	},
 );
 
 test("headless extension command failures become run errors rather than successful empty results", async () => {
-	const { session, tree, integration } = await setup(
-		defaultDispatch,
-		undefined,
-		{
-			child: (pi) => {
-				pi.registerCommand("fail", {
-					description: "Fail deterministically",
-					handler: async () => {
-						throw new Error("command failed");
-					},
-				});
-			},
+	const { session, tree, tool } = await setup(defaultDispatch, undefined, {
+		child: (pi) => {
+			pi.registerCommand("fail", {
+				description: "Fail deterministically",
+				handler: async () => {
+					throw new Error("command failed");
+				},
+			});
 		},
-	);
-	await integration().tool.execute(
+	});
+	await tool().execute(
 		"command",
 		{ instructions: "/fail" },
 		undefined,
@@ -716,33 +705,11 @@ test("shutdown preserves billed child usage in the old parent's ledger without t
 	expect(session.getLastAssistantText()).toBe("parent available");
 });
 
-test("shutdown fences a completion during delayed initialization", async () => {
-	const child = gate();
-	const { session, tree } = await setup(defaultDispatch, async () => {
-		await child.promise;
-	});
-	await session.prompt("delegate");
-	const oldNode = tree.get("1");
-	const shutdown = session.extensionRunner.emit({
-		type: "session_shutdown",
-		reason: "new",
-	});
-	expect(tree.closed).toBe(true);
-	child.resolve();
-	await shutdown;
-	expect(oldNode?.status).toBe("aborted");
-	expect(tree.tree()).toHaveLength(0);
-	expect(completions(session)).toHaveLength(0);
-});
-
 test("session_start replacement without prior shutdown also fences pending results", async () => {
 	const child = gate();
-	const { session, tree, integration } = await setup(
-		defaultDispatch,
-		async () => {
-			await child.promise;
-		},
-	);
+	const { session, tree, runtime } = await setup(defaultDispatch, async () => {
+		await child.promise;
+	});
 	await session.prompt("delegate");
 	const replacement = session.extensionRunner.emit({
 		type: "session_start",
@@ -751,20 +718,17 @@ test("session_start replacement without prior shutdown also fences pending resul
 	child.resolve();
 	await replacement;
 	expect(tree.closed).toBe(true);
-	expect(integration().current()).not.toBe(tree);
+	expect(runtime()).not.toBe(tree);
 	await session.prompt("another prompt");
 	expect(completions(session)).toHaveLength(0);
-	await integration().current().dispose();
+	await runtime().dispose();
 });
 
 test("reload cancels and fences old results while the reloaded integration can spawn again", async () => {
 	const child = gate();
-	const { session, tree, integration } = await setup(
-		defaultDispatch,
-		async () => {
-			await child.promise;
-		},
-	);
+	const { session, tree, runtime } = await setup(defaultDispatch, async () => {
+		await child.promise;
+	});
 	await session.prompt("delegate");
 	const reload = session.reload();
 	child.resolve();
@@ -774,8 +738,8 @@ test("reload cancels and fences old results while the reloaded integration can s
 	await session.prompt("delegate");
 	await until(() => completions(session).length === 1 && session.isIdle);
 	expect(completionDetails(session)).toMatchObject({ id: "1", status: "done" });
-	expect(integration().current()).not.toBe(tree);
-	await integration().current().dispose();
+	expect(runtime()).not.toBe(tree);
+	await runtime().dispose();
 });
 
 test("completion output is bounded with full output saved, and rich usage is billed once outside the receipt", async () => {
@@ -861,23 +825,17 @@ test("the view binds only to root sessions and is released before runtime teardo
 			calls.push(`${label} dispose${closed ? " after teardown" : ""}`);
 		},
 	});
-	let integration!: ReturnType<typeof createSubagentIntegration>;
 	const session = await parentSession(
 		defaultDispatch,
-		[
-			(pi) => {
-				integration = createSubagentIntegration(pi, view("root"));
-				pi.registerTool(integration.tool);
-			},
-		],
+		[(pi) => pi.registerTool(createSubagentIntegration(pi, view("root")))],
 		undefined,
 		// A configured installation of the full extension also loads in children.
 		(pi) => void createSubagentIntegration(pi, view("child")),
 	);
-	const tree = integration.current();
+	const tree = bound.get("root");
+	if (!tree) throw new Error("Missing root runtime");
 	parents.push({ session, tree });
 	expect(calls).toEqual(["root dispose", "root bind"]);
-	expect(bound.get("root")).toBe(tree);
 	await session.prompt("delegate");
 	await until(() => completions(session).length === 1 && session.isIdle);
 	expect(calls).toContain("child dispose");
@@ -896,24 +854,18 @@ test.each(["session_start", "session_shutdown"] as const)(
 	"%s cleans up the runtime even when view disposal throws",
 	async (event) => {
 		let failDispose = false;
-		let integration!: ReturnType<typeof createSubagentIntegration>;
+		const root = rootIntegration({
+			dispose() {
+				if (failDispose) throw new Error("view cleanup failed");
+			},
+		});
 		const dispatch = stream((context, options) =>
 			lastText(context) === "child task"
 				? waiting(options?.signal)
 				: defaultDispatch(model, context, options).result(),
 		);
-		const session = await parentSession(dispatch, [
-			(pi) => {
-				integration = createSubagentIntegration(pi, {
-					bind() {},
-					dispose() {
-						if (failDispose) throw new Error("view cleanup failed");
-					},
-				});
-				pi.registerTool(integration.tool);
-			},
-		]);
-		const tree = integration.current();
+		const session = await parentSession(dispatch, [root.factory]);
+		const tree = root.runtime();
 		parents.push({ session, tree });
 		const errors: string[] = [];
 		const unsubscribe = session.extensionRunner.onError((error) => {
@@ -931,7 +883,19 @@ test.each(["session_start", "session_shutdown"] as const)(
 			expect(tree.tree()).toHaveLength(0);
 			expect(child?.status).toBe("aborted");
 			expect(child?.session?.isStreaming).toBe(false);
-			expect(() => integration.current()).toThrow("not initialized");
+			// The binding is gone: no rebind, and the tool refuses new work.
+			expect(root.runtime()).toBe(tree);
+			await expect(
+				root
+					.tool()
+					.execute(
+						"late",
+						{ instructions: "child task" },
+						undefined,
+						undefined,
+						session.extensionRunner.createToolContext("late", undefined),
+					),
+			).rejects.toThrow("no longer active");
 			expect(completions(session)).toHaveLength(0);
 			expect(errors).toEqual(["view cleanup failed"]);
 		} finally {

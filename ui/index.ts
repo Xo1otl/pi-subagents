@@ -3,11 +3,12 @@ import type {
 	ExtensionContext,
 	ToolRenderers,
 } from "@earendil-works/pi-coding-agent";
+import { isViewportTUI } from "@earendil-works/pi-tui";
 import { SUBAGENT_RESULT_TYPE } from "../agent/protocol.ts";
 import type { Subagents } from "../runtime/index.ts";
 import { bindDoubleLeftNavigation } from "./navigation.ts";
 import { bindRunningIndicator } from "./running-indicator.ts";
-import { createSubagentSwitcher, type SwitcherFocus } from "./switcher.ts";
+import { createSubagentSwitcher, SWITCHER_OVERLAY } from "./switcher.ts";
 import { renderSubagentCall, renderSubagentResult } from "./tool-renderers.ts";
 
 /** Register human controls and expose default tool renderers for composition.
@@ -17,21 +18,17 @@ import { renderSubagentCall, renderSubagentResult } from "./tool-renderers.ts";
 export function createSubagentUI(pi: ExtensionAPI) {
 	let runtime: Subagents | undefined;
 	let switcherOpen = false;
-	let clearIndicator = () => {};
-	let clearNavigation = () => {};
+	let unbind = () => {};
 
 	function dispose(): void {
 		runtime = undefined;
-		clearIndicator();
-		clearIndicator = () => {};
-		clearNavigation();
-		clearNavigation = () => {};
+		unbind();
+		unbind = () => {};
 	}
 
 	async function showSwitcher(
 		ctx: ExtensionContext,
 		initialId?: string,
-		initialFocus: SwitcherFocus = "conversation",
 	): Promise<void> {
 		if (ctx.mode !== "tui")
 			throw new Error("The subagent switcher requires pi's terminal UI.");
@@ -44,25 +41,21 @@ export function createSubagentUI(pi: ExtensionAPI) {
 		switcherOpen = true;
 		try {
 			await ctx.ui.custom<void>(
-				(tui, theme, keybindings, done) =>
-					createSubagentSwitcher({
+				(tui, theme, keybindings, done) => {
+					if (!isViewportTUI(tui))
+						throw new Error(
+							'The subagent switcher requires pi\'s fullscreen mode ("tuiMode": "fullscreen").',
+						);
+					return createSubagentSwitcher({
 						runtime: shown,
 						tui,
 						theme,
 						keybindings,
 						onClose: () => done(),
 						initialId,
-						initialFocus,
-					}),
-				{
-					overlay: true,
-					overlayOptions: {
-						width: "100%",
-						maxHeight: "100%",
-						anchor: "top-left",
-						margin: 0,
-					},
+					});
 				},
+				{ overlay: true, overlayOptions: SWITCHER_OVERLAY },
 			);
 		} finally {
 			switcherOpen = false;
@@ -83,13 +76,13 @@ export function createSubagentUI(pi: ExtensionAPI) {
 		),
 	);
 	pi.registerCommand("subagents", {
-		description: "View and message any subagent: /subagents [id]",
+		description: "Pick a subagent, or chat with one: /subagents [id]",
 		handler: async (args, ctx) => {
 			await showSwitcher(ctx, args.trim() || undefined);
 		},
 	});
 	pi.registerShortcut("ctrl+shift+a", {
-		description: "Open the subagent switcher (also while the root is running)",
+		description: "Pick a subagent to view (also while the root is running)",
 		handler: (ctx) => showSwitcher(ctx),
 	});
 
@@ -103,12 +96,12 @@ export function createSubagentUI(pi: ExtensionAPI) {
 			dispose();
 			runtime = next;
 			if (ctx.mode !== "tui") return;
-			clearIndicator = bindRunningIndicator(next, ctx.ui);
-			clearNavigation = bindDoubleLeftNavigation(
+			const clearIndicator = bindRunningIndicator(next, ctx.ui);
+			const clearNavigation = bindDoubleLeftNavigation(
 				ctx.ui,
 				() => !switcherOpen && !next.closed && next.tree().length > 0,
 				() => {
-					void showSwitcher(ctx, undefined, "tree").catch((error: unknown) => {
+					void showSwitcher(ctx).catch((error: unknown) => {
 						ctx.ui.notify(
 							error instanceof Error ? error.message : String(error),
 							"error",
@@ -116,6 +109,10 @@ export function createSubagentUI(pi: ExtensionAPI) {
 					});
 				},
 			);
+			unbind = () => {
+				clearIndicator();
+				clearNavigation();
+			};
 		},
 		dispose,
 		toolRenderers,

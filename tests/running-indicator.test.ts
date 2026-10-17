@@ -29,8 +29,9 @@ afterEach(async () => {
 
 type Widget = string[] | ((tui: TUI, theme: Theme) => Component);
 const theme = { fg: (_color: string, text: string) => text } as Theme;
+const paused = stream((_context, options) => waiting(options?.signal));
 
-function setup() {
+function setup(bind = true) {
 	const runtime = createSubagentRuntime();
 	runtimes.push(runtime);
 	const widgets = new Map<string, Widget>();
@@ -46,12 +47,8 @@ function setup() {
 	const ui: Pick<
 		ExtensionUIContext,
 		"setWidget" | "getEditorComponent" | "setEditorComponent"
-	> = {
-		setWidget,
-		getEditorComponent,
-		setEditorComponent,
-	};
-	const dispose = bindRunningIndicator(runtime, ui);
+	> = { setWidget, getEditorComponent, setEditorComponent };
+	const dispose = bind ? bindRunningIndicator(runtime, ui) : () => {};
 	disposers.push(dispose);
 	const render = (width = 100, currentTheme = theme) =>
 		[...widgets.values()]
@@ -65,36 +62,41 @@ function setup() {
 		runtime,
 		ui,
 		setWidget,
+		setEditorComponent,
 		widgets,
 		dispose,
 		render,
-		getEditorComponent,
-		setEditorComponent,
 	};
 }
 
-const paused = stream((_context, options) => waiting(options?.signal));
-
-test("counts concurrent runs from startup through stopping and settlement", async () => {
+test("counts concurrent runs from startup through stopping and settlement, bounded to the terminal width", async () => {
 	const { runtime, setWidget, widgets, render } = setup();
 	expect(setWidget).not.toHaveBeenCalled();
 	const context = await spawnContext(paused);
-	const first = runtime.start(ROOT, "one", context).result;
-	const second = runtime.start(ROOT, "two", context).result;
-	expect(render()).toContain("Subagents: 2 running · 1, 2");
-	expect(render()).toContain("Ctrl+Shift+A to view");
+	const runs = Array.from(
+		{ length: 5 },
+		(_, i) => runtime.start(ROOT, `run ${i}`, context).result,
+	);
+	expect(render()).toBe(
+		"● Subagents: 5 running · 1, 2, 3, … · ←← / Ctrl+Shift+A to view",
+	);
+	setWidget.mockClear();
 	await until(() =>
 		runtime.tree().every((node) => Boolean(node.session?.isStreaming)),
 	);
 	// Session creation and streamed events do not reinstall an unchanged summary.
-	expect(setWidget).toHaveBeenCalledTimes(2);
-	setWidget.mockClear();
+	expect(setWidget).not.toHaveBeenCalled();
+	for (const width of [1, 5, 20])
+		expect(visibleWidth(render(width))).toBeLessThanOrEqual(width);
+	// The active theme is evaluated at render time.
+	const upper = { fg: (_color: string, text: string) => text.toUpperCase() };
+	expect(render(100, upper as Theme)).toContain("SUBAGENTS: 5 RUNNING");
 	runtime.abort("1");
-	expect(render()).toContain("1 running · 1 stopping");
-	await first;
-	expect(render()).toContain("Subagents: 1 running · 2");
-	runtime.abort("2");
-	await second;
+	expect(render()).toContain("4 running · 1 stopping · 1, 2, 3, …");
+	await runs[0];
+	expect(render()).toContain("Subagents: 4 running · 2, 3, 4, …");
+	runtime.abort();
+	await Promise.all(runs);
 	expect(widgets.size).toBe(0);
 });
 
@@ -122,28 +124,11 @@ test("includes nested agents and conversations restarted while the root is idle"
 	expect(widgets.size).toBe(0);
 });
 
-test("bounds summaries, fits narrow widths and evaluates the active theme at render time", async () => {
-	const { runtime, render } = setup();
-	const context = await spawnContext(paused);
-	const runs = Array.from(
-		{ length: 5 },
-		() => runtime.start(ROOT, "wait", context).result,
-	);
-	expect(render()).toContain("Subagents: 5 running · 1, 2, 3, …");
-	for (const width of [1, 5, 20, 100])
-		expect(visibleWidth(render(width))).toBeLessThanOrEqual(width);
-	const changedTheme = {
-		fg: (_color: string, text: string) => text.toUpperCase(),
-	} as Theme;
-	expect(render(100, changedTheme)).toContain("SUBAGENTS: 5 RUNNING");
-	runtime.abort();
-	await Promise.all(runs);
-});
-
-test("disposal is idempotent and late updates cannot change this or another widget", async () => {
+test("disposal is idempotent, late updates touch no widget, and runtime shutdown clears it at once", async () => {
 	const { runtime, widgets, setWidget, dispose, render } = setup();
 	widgets.set("another-extension", ["unrelated widget"]);
-	const run = runtime.start(ROOT, "wait", await spawnContext(paused)).result;
+	const context = await spawnContext(paused);
+	const run = runtime.start(ROOT, "wait", context).result;
 	expect(render()).toContain("Subagents: 1 running");
 	dispose();
 	dispose();
@@ -152,30 +137,18 @@ test("disposal is idempotent and late updates cannot change this or another widg
 	runtime.abort();
 	await run;
 	expect(setWidget).not.toHaveBeenCalled();
-	expect(render()).toBe("unrelated widget");
-});
 
-test("runtime shutdown immediately clears the indicator", async () => {
-	const { runtime, widgets, setWidget } = setup();
-	const run = runtime.start(ROOT, "wait", await spawnContext(paused)).result;
-	const closing = runtime.dispose();
-	expect(widgets.size).toBe(0);
+	const next = setup();
+	const running = next.runtime.start(ROOT, "wait", context).result;
+	expect(next.widgets.size).toBe(1);
+	const closing = next.runtime.dispose();
+	expect(next.widgets.size).toBe(0);
 	await closing;
-	await run;
-	expect(setWidget).toHaveBeenLastCalledWith("pi-subagents.running", undefined);
+	await running;
 });
 
-test("UI bindings are terminal-only and rebinding removes the old runtime subscription", async () => {
-	const {
-		runtime,
-		ui,
-		setWidget,
-		dispose,
-		render,
-		getEditorComponent,
-		setEditorComponent,
-	} = setup();
-	dispose();
+test("UI bindings are terminal-only, and rebinding or disposal removes the old runtime's widget and editor", async () => {
+	const { runtime, ui, setWidget, setEditorComponent, render } = setup(false);
 	const controller = createSubagentUI({
 		registerMessageRenderer() {},
 		registerCommand() {},
@@ -188,15 +161,14 @@ test("UI bindings are terminal-only and rebinding removes the old runtime subscr
 	expect(setWidget).not.toHaveBeenCalled();
 	expect(setEditorComponent).not.toHaveBeenCalled();
 	controller.bind(runtime, { mode: "tui", ui } as ExtensionContext);
-	expect(getEditorComponent()).toBeDefined();
-	const firstFactory = getEditorComponent();
+	const firstFactory = ui.getEditorComponent();
+	expect(firstFactory).toBeDefined();
 	expect(render()).toContain("Subagents: 1 running");
 	const next = createSubagentRuntime();
 	runtimes.push(next);
 	controller.bind(next, { mode: "tui", ui } as ExtensionContext);
-	expect(getEditorComponent()).toBeDefined();
-	expect(getEditorComponent()).not.toBe(firstFactory);
-	expect(setEditorComponent).toHaveBeenCalledTimes(3);
+	expect(ui.getEditorComponent()).toBeDefined();
+	expect(ui.getEditorComponent()).not.toBe(firstFactory);
 	expect(render()).toBe("");
 	setWidget.mockClear();
 	runtime.abort();
@@ -204,6 +176,6 @@ test("UI bindings are terminal-only and rebinding removes the old runtime subscr
 	expect(setWidget).not.toHaveBeenCalled();
 	controller.dispose();
 	controller.dispose();
-	expect(getEditorComponent()).toBeUndefined();
+	expect(ui.getEditorComponent()).toBeUndefined();
 	expect(setEditorComponent).toHaveBeenCalledTimes(4);
 });

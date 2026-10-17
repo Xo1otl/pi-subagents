@@ -12,16 +12,39 @@ import {
 	type TuiAltScreen,
 } from "@earendil-works/pi-tui";
 
-/** A short Left-Left chord; the first key can still move the cursor. */
-export function createDoubleLeftDetector() {
+type TextCursor = Pick<EditorComponent, "getText"> &
+	Partial<Pick<Editor, "getCursor">>;
+
+function atTextStart(editor: TextCursor): boolean {
+	const cursor = editor.getCursor?.();
+	return cursor
+		? cursor.line === 0 && cursor.col === 0
+		: editor.getText() === "";
+}
+
+/** Bracketed paste may span several input chunks; none of it is a shortcut. */
+export function createPasteGuard(): (data: string) => boolean {
+	let pasting = false;
+	return (data) => {
+		const pasted = pasting || data.includes("\x1b[200~");
+		if (pasted) pasting = !data.includes("\x1b[201~");
+		return pasted;
+	};
+}
+
+/** Left twice within 500 ms at the editor's text start. The first Left still
+ * reaches the editor, and a Left that moves the cursor does not arm the chord.
+ */
+export function createDoubleLeft() {
 	let previous: number | undefined;
 	return {
-		matches(data: string, now = performance.now()): boolean {
+		matches(data: string, editor: TextCursor, now = performance.now()) {
 			// Kitty releases occur between taps; holding a key is not a second tap.
 			if (isKeyRelease(data)) return false;
 			const last = previous;
 			previous = undefined;
 			if (isKeyRepeat(data) || !matchesKey(data, "left")) return false;
+			if (!atTextStart(editor)) return false;
 			if (last !== undefined && now - last <= 500) return true;
 			previous = now;
 			return false;
@@ -32,9 +55,13 @@ export function createDoubleLeftDetector() {
 	};
 }
 
+type EditorFactory = NonNullable<
+	ReturnType<ExtensionUIContext["getEditorComponent"]>
+>;
+
 function focusedEditor(tui: TUI): EditorComponent | undefined {
-	// Both pi renderers expose this public method, though the common TUI interface
-	// omits it. Reuse the live editor to retain undo and prompt history.
+	// Pi's renderers expose this method, though the common TUI interface omits it.
+	// Reusing the live editor retains its undo and prompt history.
 	const renderer = tui as TUI &
 		Partial<Pick<TuiAltScreen, "getFocusedComponent">>;
 	const editor = renderer.getFocusedComponent?.();
@@ -50,55 +77,36 @@ function focusedEditor(tui: TUI): EditorComponent | undefined {
 	return undefined;
 }
 
-export function atTextStart(
-	editor: Pick<EditorComponent, "getText"> & Partial<Pick<Editor, "getCursor">>,
-): boolean {
-	const cursor = editor.getCursor?.();
-	return cursor
-		? cursor.line === 0 && cursor.col === 0
-		: editor.getText() === "";
-}
-
-/** Scope the chord to the text start, preserving any existing custom editor. */
+/** Open on Left-Left at the root editor's text start, wrapping any existing
+ * custom editor. The returned cleanup is idempotent.
+ */
 export function bindDoubleLeftNavigation(
 	ui: Pick<ExtensionUIContext, "getEditorComponent" | "setEditorComponent">,
 	enabled: () => boolean,
 	onOpen: () => void,
 ): () => void {
 	const previousFactory = ui.getEditorComponent();
-	const doubleLeft = createDoubleLeftDetector();
+	const restores: (() => void)[] = [];
 	let disposed = false;
-	const restoreInputs: (() => void)[] = [];
-	const factory: NonNullable<
-		ReturnType<ExtensionUIContext["getEditorComponent"]>
-	> = (tui, theme, keybindings) => {
-		doubleLeft.reset();
+	const factory: EditorFactory = (tui, theme, keybindings) => {
 		const editor =
 			focusedEditor(tui) ??
 			previousFactory?.(tui, theme, keybindings) ??
 			new CustomEditor(tui, theme, keybindings, { embedWorkingStatus: true });
 		const handleInput = editor.handleInput;
-		let pasting = false;
-		const wrappedInput = (data: string) => {
-			const pasteStart = data.includes("\x1b[200~");
-			if (
-				disposed ||
-				!enabled() ||
-				pasting ||
-				pasteStart ||
-				!atTextStart(editor)
-			)
-				doubleLeft.reset();
-			else if (doubleLeft.matches(data)) {
+		const isPaste = createPasteGuard();
+		const doubleLeft = createDoubleLeft();
+		const wrapped = (data: string) => {
+			if (isPaste(data) || disposed || !enabled()) doubleLeft.reset();
+			else if (doubleLeft.matches(data, editor)) {
 				onOpen();
 				return;
 			}
-			if (pasting || pasteStart) pasting = !data.includes("\x1b[201~");
 			handleInput.call(editor, data);
 		};
-		editor.handleInput = wrappedInput;
-		restoreInputs.push(() => {
-			if (editor.handleInput === wrappedInput) editor.handleInput = handleInput;
+		editor.handleInput = wrapped;
+		restores.push(() => {
+			if (editor.handleInput === wrapped) editor.handleInput = handleInput;
 		});
 		return editor;
 	};
@@ -106,9 +114,8 @@ export function bindDoubleLeftNavigation(
 	return () => {
 		if (disposed) return;
 		disposed = true;
-		doubleLeft.reset();
-		for (const restore of restoreInputs.reverse()) restore();
-		restoreInputs.length = 0;
+		for (const restore of restores.reverse()) restore();
+		restores.length = 0;
 		// Another extension may have installed its own editor after ours.
 		if (ui.getEditorComponent() === factory)
 			ui.setEditorComponent(previousFactory);

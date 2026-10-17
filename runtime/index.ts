@@ -17,8 +17,6 @@ import {
 	summarizeRun,
 } from "./summary.ts";
 
-export { appendDelegatedUsage, SUBAGENT_USAGE_KIND } from "./summary.ts";
-
 export interface SpawnContext
 	extends Pick<CreateAgentSessionOptions, "agentDir" | "modelRuntime"> {
 	cwd: string;
@@ -32,18 +30,16 @@ export interface SessionOwner {
 	id: string;
 }
 
-/** onCreated transfers cleanup ownership, even if initialization later rejects.
- * onError receives the session's extension errors, e.g. through bindExtensions.
- */
-export type ChildSessionFactory = (
-	context: SpawnContext,
-	owner: SessionOwner,
-	onCreated: (session: AgentSession) => void,
-	onError: (error: ExtensionError) => void,
-) => Promise<AgentSession>;
-
 export interface SubagentsOptions {
-	createSession: ChildSessionFactory;
+	/** onCreated transfers cleanup ownership, even if initialization later rejects.
+	 * onError receives the session's extension errors, e.g. through bindExtensions.
+	 */
+	createSession: (
+		context: SpawnContext,
+		owner: SessionOwner,
+		onCreated: (session: AgentSession) => void,
+		onError: (error: ExtensionError) => void,
+	) => Promise<AgentSession>;
 	disposeSession: (session: AgentSession) => Promise<void>;
 	/** Captured root ledger; billing never follows session replacement. */
 	rootSessionManager?: SessionManager;
@@ -100,11 +96,10 @@ export interface Subagents {
 		parentId: string,
 		instructions: string,
 		context: SpawnContext,
-		signal?: AbortSignal,
 	): SubagentStart;
-	/** Include asynchronous result delivery in a headless parent's settlement. */
+	/** Include asynchronous work, such as result delivery, in a parent's settlement. */
 	trackCompletion(parentId: string, completion: Promise<void>): void;
-	/** Resolves once a parent's tracked delivery work, including late additions, drains. */
+	/** Resolves once a parent's tracked work, including late additions, drains. */
 	settled(parentId: string): Promise<void>;
 	/** Steer an active run; otherwise continue the same conversation. */
 	send(id: string, instructions: string): Promise<void>;
@@ -115,8 +110,6 @@ export interface Subagents {
 	dispose(): Promise<void>;
 }
 
-type Writable<T> = { -readonly [K in keyof T]: T[K] };
-
 interface ActiveRun {
 	/** Serialize input preflight, not entire prompts or delegated runs. */
 	preflight: Promise<void>;
@@ -124,10 +117,15 @@ interface ActiveRun {
 	settled: Promise<void>;
 }
 
-interface SubagentNode extends Writable<Subagent> {
-	liveTools: Map<string, SubagentToolExecution>;
+/** The runtime's private side of a node: these fields change, the rest is fixed. */
+interface SubagentNode extends Subagent {
+	session?: AgentSession;
+	status: Subagent["status"];
+	error?: string;
+	cancelled: boolean;
+	readonly liveTools: Map<string, SubagentToolExecution>;
 	/** Input awaiting the session's preflight; identity distinguishes equal texts. */
-	pendingInput: Set<{ readonly text: string }>;
+	readonly pendingInput: Set<{ readonly text: string }>;
 	/** Present exactly while status is "running". */
 	run?: ActiveRun;
 	unsubscribe: () => void;
@@ -142,16 +140,6 @@ function usageLedger(manager: SessionManager): UsageLedger {
 	return { manager, sessionId: manager.getSessionId() };
 }
 
-interface SubagentsState {
-	nodes: Map<string, SubagentNode>;
-	completions: Map<string, Set<Promise<void>>>;
-	completionErrors: unknown[];
-	listeners: Set<() => void>;
-	childCounts: Map<string, number>;
-	closing?: Promise<void>;
-	disposed: boolean;
-}
-
 function subagentTree(nodes: Iterable<Subagent>): Subagent[] {
 	const children = new Map<string, Subagent[]>();
 	for (const node of nodes) {
@@ -159,23 +147,9 @@ function subagentTree(nodes: Iterable<Subagent>): Subagent[] {
 		siblings.push(node);
 		children.set(node.parentId, siblings);
 	}
-	const stack = [...(children.get(ROOT) ?? [])].reverse();
-	const result: Subagent[] = [];
-	while (stack.length) {
-		const node = stack.pop();
-		if (!node) break;
-		result.push(node);
-		stack.push(...[...(children.get(node.id) ?? [])].reverse());
-	}
-	return result;
-}
-
-function queuedInput(node: SubagentNode): string[] {
-	return [
-		...(node.session?.getSteeringMessages() ?? []),
-		...(node.session?.getFollowUpMessages() ?? []),
-		...[...node.pendingInput].map((input) => input.text),
-	];
+	const visit = (id: string): Subagent[] =>
+		(children.get(id) ?? []).flatMap((node) => [node, ...visit(node.id)]);
+	return visit(ROOT);
 }
 
 function belongsTo(
@@ -225,46 +199,43 @@ export function createSubagents({
 	rootSessionManager,
 }: SubagentsOptions): Subagents {
 	const rootLedger = rootSessionManager && usageLedger(rootSessionManager);
-	const state: SubagentsState = {
-		nodes: new Map(),
-		completions: new Map(),
-		completionErrors: [],
-		listeners: new Set(),
-		childCounts: new Map(),
-		disposed: false,
-	};
+	const nodes = new Map<string, SubagentNode>();
+	/** Outstanding work by the parent whose settlement includes it. */
+	const completions = new Map<string, Set<Promise<void>>>();
+	/** Failures without a running node to own them, reported at shutdown. */
+	const completionErrors: unknown[] = [];
+	const listeners = new Set<() => void>();
+	/** Set once shutdown begins. */
+	let closing: Promise<void> | undefined;
 
 	function changed(): void {
-		for (const listener of state.listeners) listener();
+		for (const listener of listeners) listener();
 	}
 
 	function assertOpen(): void {
-		if (state.disposed) throw new Error("Subagents have been shut down.");
+		if (closing) throw new Error("Subagents have been shut down.");
 	}
 
 	function start(
 		parentId: string,
 		instructions: string,
 		context: SpawnContext,
-		signal?: AbortSignal,
 	): SubagentStart {
 		assertOpen();
-		signal?.throwIfAborted();
 		if (!instructions.trim())
 			throw new Error("Subagent instructions must not be empty.");
-		const parent = state.nodes.get(parentId);
+		const parent = nodes.get(parentId);
 		if (parentId !== ROOT && !parent)
 			throw new Error(`Unknown parent: ${parentId}`);
 		if (parent?.cancelled) throw new Error(`Parent ${parentId} was aborted.`);
-		const depth = (parent?.depth ?? 0) + 1;
-
-		const count = (state.childCounts.get(parentId) ?? 0) + 1;
-		state.childCounts.set(parentId, count);
+		// Nodes are only removed at shutdown, so sibling counts yield stable IDs.
+		let count = 1;
+		for (const node of nodes.values()) if (node.parentId === parentId) count++;
 		const id = parentId === ROOT ? String(count) : `${parentId}.${count}`;
 		const node: SubagentNode = {
 			id,
 			parentId,
-			depth,
+			depth: (parent?.depth ?? 0) + 1,
 			instructions,
 			context,
 			status: "running",
@@ -273,32 +244,45 @@ export function createSubagents({
 			liveTools: new Map(),
 			pendingInput: new Set(),
 			get queuedInput() {
-				return queuedInput(node);
+				return [
+					...(node.session?.getSteeringMessages() ?? []),
+					...(node.session?.getFollowUpMessages() ?? []),
+					...[...node.pendingInput].map((input) => input.text),
+				];
 			},
 		};
-		state.nodes.set(id, node);
-		const result = run(node, instructions, signal);
+		nodes.set(id, node);
+		const result = run(node, instructions);
 		// Observe even detached results; the original promise remains usable by callers.
 		void result.catch(() => {});
 		return { id, result };
 	}
 
 	function trackCompletion(parentId: string, completion: Promise<void>): void {
-		const pending = state.completions.get(parentId) ?? new Set();
-		state.completions.set(parentId, pending);
+		const pending = completions.get(parentId) ?? new Set();
+		completions.set(parentId, pending);
 		pending.add(completion);
 		const remove = () => {
 			pending.delete(completion);
-			if (!pending.size && state.completions.get(parentId) === pending)
-				state.completions.delete(parentId);
+			if (!pending.size && completions.get(parentId) === pending)
+				completions.delete(parentId);
 		};
 		// Observe detached work, but retain failures even if they settle before drainage.
 		void completion.then(remove, (error: unknown) => {
-			const node = state.nodes.get(parentId);
+			const node = nodes.get(parentId);
 			if (node?.run) recordError(node, error);
-			else state.completionErrors.push(error);
+			else completionErrors.push(error);
 			remove();
 		});
+	}
+
+	async function settled(parentId: string): Promise<void> {
+		for (
+			let pending = completions.get(parentId);
+			pending?.size;
+			pending = completions.get(parentId)
+		)
+			await Promise.allSettled([...pending]);
 	}
 
 	function submit(
@@ -323,7 +307,7 @@ export function createSubagents({
 		};
 		const prompt = previous.then(async () => {
 			try {
-				if (!node.session || node.cancelled || state.disposed) return;
+				if (!node.session || node.cancelled || closing) return;
 				await node.session.prompt(instructions, {
 					streamingBehavior: "steer",
 					preflightResult: accepted,
@@ -333,30 +317,15 @@ export function createSubagents({
 			}
 		});
 		// Input hooks can outlive the current session prompt and even start a new one.
-		// Register before invoking them so cancellation/disposal and billing cover both.
+		// Register before invoking them so cancellation/disposal, billing and the run's
+		// drain cover both; failures become the run's error.
 		trackCompletion(node.id, prompt);
 		return prompt;
 	}
 
-	async function settled(parentId: string): Promise<void> {
-		for (
-			let pending = state.completions.get(parentId);
-			pending?.size;
-			pending = state.completions.get(parentId)
-		)
-			await Promise.allSettled([...pending]);
-	}
-
-	async function drain(node: SubagentNode): Promise<void> {
-		const pending = state.completions.get(node.id);
-		if (pending?.size) await Promise.allSettled([...pending]);
-		// Completion delivery may have started another prompt after the first settled.
-		await node.session?.waitForIdle();
-	}
-
 	async function send(id: string, instructions: string): Promise<void> {
 		assertOpen();
-		const node = state.nodes.get(id);
+		const node = nodes.get(id);
 		if (!node) throw new Error(`Unknown subagent: ${id}`);
 		if (!instructions.trim()) return;
 		if (node.run) {
@@ -365,13 +334,35 @@ export function createSubagents({
 			changed();
 			await prompt;
 			changed();
-		} else await run(node, instructions, undefined, true);
+		} else await run(node, instructions, true);
+	}
+
+	/** Publish a node's session. A published session whose binding failed is not reusable. */
+	async function initialize(node: SubagentNode): Promise<void> {
+		try {
+			await createSession(
+				node.context,
+				{ runtime, id: node.id },
+				(session) => attach(node, session),
+				(error) => {
+					if (node.run) node.error ??= error.error;
+					else completionErrors.push(new Error(error.error));
+					changed();
+				},
+			);
+		} catch (error) {
+			// Record first: disposing the session can report errors of its own.
+			recordError(node, error);
+			const session = node.session;
+			node.session = undefined;
+			if (session) await detach(node, session);
+			throw error;
+		}
 	}
 
 	async function run(
 		node: SubagentNode,
 		instructions: string,
-		signal?: AbortSignal,
 		sent = false,
 	): Promise<SubagentResult> {
 		node.cancelled = false;
@@ -394,9 +385,9 @@ export function createSubagents({
 		// Resumed descendants belong to any active ancestors too, even when their
 		// immediate parent has already completed. Idle ancestors receive billing only.
 		for (
-			let parent = state.nodes.get(node.parentId);
+			let parent = nodes.get(node.parentId);
 			parent;
-			parent = state.nodes.get(parent.parentId)
+			parent = nodes.get(parent.parentId)
 		) {
 			if (parent.session)
 				ledgers.push(usageLedger(parent.session.sessionManager));
@@ -404,75 +395,49 @@ export function createSubagents({
 		}
 		trackCompletion(ROOT, active.settled);
 		// Capture reused history before any initialization listeners can bill this run.
-		let start = node.session?.sessionManager.getEntries().length;
-		// Reserve the original input ahead of sends made by initialization listeners.
-		const prompt = submit(node, active, instructions, sent);
-		const cancel = () => abort(node.id);
+		let firstEntry = node.session?.sessionManager.getEntries().length;
+		// Reserve the original input ahead of sends made by initialization listeners;
+		// the drain below awaits it with the rest of the run's tracked work.
+		void submit(node, active, instructions, sent);
 		const finish = () => {
-			signal?.removeEventListener("abort", cancel);
 			if (node.run === active) node.run = undefined;
 			settle();
 		};
 		try {
-			let creatingSession = false;
-			signal?.addEventListener("abort", cancel, { once: true });
 			changed();
 			try {
 				// Let receipt/tool-result microtasks finish before any child initialization,
 				// including a factory's synchronous pre-await work, can occupy the loop.
 				await new Promise<void>((resolve) => setImmediate(resolve));
-				if (!node.session && !node.cancelled && !state.disposed) {
-					creatingSession = true;
-					await createSession(
-						node.context,
-						{ runtime: operations, id: node.id },
-						(session) => attach(node, session),
-						(error) => {
-							if (node.run) node.error ??= error.error;
-							else state.completionErrors.push(new Error(error.error));
-							changed();
-						},
-					);
-					creatingSession = false;
-				}
-				if (signal?.aborted || node.cancelled || state.disposed) cancel();
+				if (!node.session && !node.cancelled && !closing)
+					await initialize(node);
+				// Earlier cancellation could not stop or clear a session created since.
+				if (node.cancelled || closing) abort(node.id);
 				if (node.session)
-					start ??= node.session.sessionManager.getEntries().length;
+					firstEntry ??= node.session.sessionManager.getEntries().length;
 			} catch (error) {
 				recordError(node, error);
-				if (creatingSession && node.session) {
-					// A published session whose binding failed is not reusable.
-					const session = node.session;
-					node.session = undefined;
-					await detach(node, session);
-				}
 			} finally {
 				initialized();
 			}
 
 			try {
-				await prompt;
+				// Prompts and deliveries can start further prompts and track more work.
+				// Recheck after the await: new completion/input preflight can arrive in
+				// the microtask that resolves it. Finalization below is synchronous.
+				do {
+					await settled(node.id);
+					await node.session?.waitForIdle();
+				} while (
+					completions.get(node.id)?.size ||
+					node.session?.isIdle === false
+				);
 			} catch (error) {
 				recordError(node, error);
 			}
-			for (;;) {
-				try {
-					await drain(node);
-				} catch (error) {
-					recordError(node, error);
-					break;
-				}
-				// Recheck after the await: new completion/input preflight can arrive in
-				// the microtask that resolves drain. Finalization below is synchronous.
-				if (
-					!state.completions.get(node.id)?.size &&
-					node.session?.isIdle !== false
-				)
-					break;
-			}
 
 			const entries =
-				node.session?.sessionManager.getEntries().slice(start ?? 0) ?? [];
+				node.session?.sessionManager.getEntries().slice(firstEntry ?? 0) ?? [];
 			const summary = summarizeRun(entries, node.cancelled, node.error);
 			const usage = summarizeOwnUsage(entries);
 			// Bill before terminal listeners can restart a conversation. Each run's
@@ -533,12 +498,12 @@ export function createSubagents({
 		try {
 			if (session) await disposeSession(session);
 		} catch (error) {
-			state.completionErrors.push(error);
+			completionErrors.push(error);
 		} finally {
 			try {
 				node.unsubscribe();
 			} catch (error) {
-				state.completionErrors.push(error);
+				completionErrors.push(error);
 			}
 			node.unsubscribe = () => {};
 		}
@@ -549,15 +514,14 @@ export function createSubagents({
 			// Cancellation failures are cleanup errors, not an unobserved rejection.
 			trackCompletion(ROOT, session.abort());
 		} catch (error) {
-			state.completionErrors.push(error);
+			completionErrors.push(error);
 		}
 	}
 
 	function abort(id = ROOT): Map<string, string[]> {
 		const discarded = new Map<string, string[]>();
-		for (const node of state.nodes.values()) {
-			if (!belongsTo(state.nodes, node, id) || node.status !== "running")
-				continue;
+		for (const node of nodes.values()) {
+			if (!belongsTo(nodes, node, id) || node.status !== "running") continue;
 			node.cancelled = true;
 			// Pending prompts observe cancellation and are never submitted.
 			const input = [...node.pendingInput].map((entry) => entry.text);
@@ -566,7 +530,7 @@ export function createSubagents({
 				const queued = node.session?.clearQueue();
 				if (queued) input.unshift(...queued.steering, ...queued.followUp);
 			} catch (error) {
-				state.completionErrors.push(error);
+				completionErrors.push(error);
 			}
 			if (input.length) discarded.set(node.id, input);
 			if (node.session) stopSession(node.session);
@@ -576,44 +540,38 @@ export function createSubagents({
 	}
 
 	function dispose(): Promise<void> {
-		if (state.closing) return state.closing;
-		state.disposed = true;
+		if (closing) return closing;
 		// Publish the closing promise before notifying listeners that may request shutdown again.
-		state.closing = Promise.allSettled(
-			[...state.nodes.values()].map((node) => node.run?.settled),
-		).then(async () => {
-			// Result handlers may register billing/delivery after shutdown began.
-			while (state.completions.size) {
+		closing = Promise.resolve().then(async () => {
+			// Every run is tracked under ROOT, and result handlers may register
+			// billing/delivery after shutdown began.
+			while (completions.size)
 				await Promise.allSettled(
-					[...state.completions.values()].flatMap((pending) => [...pending]),
+					[...completions.values()].flatMap((pending) => [...pending]),
 				);
-			}
 			await Promise.all(
-				[...state.nodes.values()].map((node) => detach(node, node.session)),
+				[...nodes.values()].map((node) => detach(node, node.session)),
 			);
-			const errors = [...state.completionErrors];
-			state.listeners.clear();
-			state.nodes.clear();
-			state.childCounts.clear();
-			state.completions.clear();
-			state.completionErrors.length = 0;
-			if (errors.length)
-				throw new AggregateError(errors, "Subagent cleanup failed.");
+			listeners.clear();
+			nodes.clear();
+			completions.clear();
+			if (completionErrors.length)
+				throw new AggregateError(completionErrors, "Subagent cleanup failed.");
 		});
 		abort();
 		changed();
-		return state.closing;
+		return closing;
 	}
 
-	const operations: Subagents = {
+	const runtime: Subagents = {
 		get closed() {
-			return state.disposed;
+			return closing !== undefined;
 		},
-		get: (id) => state.nodes.get(id),
-		tree: () => subagentTree(state.nodes.values()),
+		get: (id) => nodes.get(id),
+		tree: () => subagentTree(nodes.values()),
 		subscribe(listener) {
-			state.listeners.add(listener);
-			return () => state.listeners.delete(listener);
+			listeners.add(listener);
+			return () => listeners.delete(listener);
 		},
 		start,
 		trackCompletion,
@@ -622,5 +580,5 @@ export function createSubagents({
 		abort,
 		dispose,
 	};
-	return operations;
+	return runtime;
 }

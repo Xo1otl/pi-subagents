@@ -101,28 +101,6 @@ test("ledger write failures do not leave completed runs stuck running or prevent
 	}
 });
 
-test("session-creation failures remain plain run data", async () => {
-	const disposeSession = mock(async (_session: AgentSession) => {});
-	const runtime = createSubagents({
-		createSession: async () => {
-			throw new Error("session unavailable");
-		},
-		disposeSession,
-	});
-	try {
-		expect(
-			await runtime.start(ROOT, "task instructions", context).result,
-		).toMatchObject({
-			status: "error",
-			error: "session unavailable",
-			output: "session unavailable",
-		});
-	} finally {
-		await runtime.dispose();
-	}
-	expect(disposeSession).not.toHaveBeenCalled();
-});
-
 test("start reserves a running receipt synchronously, before session initialization", async () => {
 	const initialized = deferred();
 	const finished = deferred();
@@ -189,11 +167,6 @@ test("start validates synchronously without reserving nodes, and shutdown reject
 		createSession,
 		disposeSession: async () => {},
 	});
-	const controller = new AbortController();
-	controller.abort(new Error("already cancelled"));
-	expect(() =>
-		runtime.start(ROOT, "hello", context, controller.signal),
-	).toThrow("already cancelled");
 	expect(() => runtime.start(ROOT, " ", context)).toThrow("must not be empty");
 	expect(() => runtime.start("missing", "hello", context)).toThrow(
 		"Unknown parent",
@@ -227,10 +200,9 @@ test("cancellation during session initialization prevents prompting and disposes
 		},
 		disposeSession,
 	});
-	const controller = new AbortController();
-	const started = runtime.start(ROOT, "hello", context, controller.signal);
+	const started = runtime.start(ROOT, "hello", context);
 	await entered.promise;
-	controller.abort();
+	runtime.abort("1");
 	const closing = runtime.dispose();
 	initialized.resolve();
 	expect((await started.result).status).toBe("aborted");
@@ -239,22 +211,25 @@ test("cancellation during session initialization prevents prompting and disposes
 	expect(disposeSession).toHaveBeenCalledTimes(1);
 });
 
-test("detached initialization failures and rejected completion work are observed without unhandled rejections", async () => {
+test("initialization failures are run data, and orphaned completion failures are reported at shutdown", async () => {
+	const disposeSession = mock(async (_session: AgentSession) => {});
 	const runtime = createSubagents({
 		createSession: async () => {
-			throw new Error("detached initialization failed");
+			throw new Error("session unavailable");
 		},
-		disposeSession: async () => {},
+		disposeSession,
 	});
-	try {
-		// Deliberately do not await the result, as a receipt-only consumer would do.
-		runtime.start(ROOT, "task", context);
-		runtime.trackCompletion(ROOT, Promise.reject(new Error("delivery failed")));
-		await until(() => runtime.get("1")?.status === "error");
-		expect(runtime.get("1")?.error).toBe("detached initialization failed");
-	} finally {
-		await expect(runtime.dispose()).rejects.toBeInstanceOf(AggregateError);
-	}
+	const { result } = runtime.start(ROOT, "task", context);
+	runtime.trackCompletion(ROOT, Promise.reject(new Error("delivery failed")));
+	expect(await result).toMatchObject({
+		status: "error",
+		error: "session unavailable",
+		output: "session unavailable",
+	});
+	await expect(runtime.dispose()).rejects.toMatchObject({
+		errors: [expect.objectContaining({ message: "delivery failed" })],
+	});
+	expect(disposeSession).not.toHaveBeenCalled();
 });
 
 test("rejected completion work remains an error even when it drains before waitForIdle", async () => {
@@ -299,11 +274,10 @@ test("a send arriving after an idle snapshot but before finalization is drained 
 			entries.push({ type: "message", message: response(text) });
 		},
 		waitForIdle: async () => {
+			// Lands in the microtask that resolves the idle wait.
 			if (waits++ === 0)
 				queueMicrotask(() => {
-					queueMicrotask(() => {
-						sent = runtime.send("1", "late input");
-					});
+					sent = runtime.send("1", "late input");
 				});
 		},
 		sessionManager: { getEntries: () => entries },
@@ -492,10 +466,6 @@ test("liveTools retains full raw snapshots, authoritative terminal results, and 
 		content: [{ type: "text", text: "first" }],
 		details: { progress: 1 },
 	};
-	const second: AgentToolResult<unknown> = {
-		content: [{ type: "text", text: "replacement" }],
-		details: { progress: 2 },
-	};
 	const final: AgentToolResult<unknown> = {
 		content: [{ type: "text", text: "\u001b[31mraw tool output\u001b[0m" }],
 		details: { complete: true },
@@ -524,26 +494,10 @@ test("liveTools retains full raw snapshots, authoritative terminal results, and 
 				});
 				expect(runtime.get("1")?.liveTools.get("call")?.result).toBe(first);
 				listener({
-					type: "tool_execution_update",
-					toolCallId: "call",
-					toolName: "outer",
-					args: { value: 1 },
-					partialResult: second,
-				});
-				expect(runtime.get("1")?.liveTools.get("call")?.result).toBe(second);
-				listener({
 					type: "tool_execution_start",
 					toolCallId: "call/1",
 					toolName: "nested",
 					args: { nested: true },
-					parentToolCallId: "call",
-				});
-				listener({
-					type: "tool_execution_update",
-					toolCallId: "call/1",
-					toolName: "nested",
-					args: { nested: true },
-					partialResult: second,
 					parentToolCallId: "call",
 				});
 				listener({
@@ -552,7 +506,6 @@ test("liveTools retains full raw snapshots, authoritative terminal results, and 
 					toolName: "nested",
 					result: first,
 					isError: true,
-					parentToolCallId: "call",
 				});
 				listener({
 					type: "tool_execution_end",

@@ -4,6 +4,6 @@ import { createSubagentUI } from "./ui/index.ts";
 
 export default function subagentsExtension(pi: ExtensionAPI): void {
 	const ui = createSubagentUI(pi);
-	const { tool } = createSubagentIntegration(pi, ui);
+	const tool = createSubagentIntegration(pi, ui);
 	pi.registerTool({ ...tool, ...ui.toolRenderers });
 }

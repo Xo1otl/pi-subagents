@@ -20,7 +20,17 @@ import {
 	SessionManager,
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import {
+	type Component,
+	KeybindingsManager,
+	stripTerminalSequences,
+	type Terminal,
+	Text,
+	TUI_KEYBINDINGS,
+	TuiAltScreen,
+} from "@earendil-works/pi-tui";
 import type { SpawnContext } from "../runtime/index.ts";
+import { SWITCHER_OVERLAY } from "../ui/switcher.ts";
 
 export const model: Model<"openai-responses"> = {
 	id: "test-model",
@@ -401,4 +411,97 @@ export async function until(
 		await Bun.sleep(1);
 	}
 	throw new Error("Timed out waiting for test state");
+}
+
+/** pi's fullscreen renderer on a fake terminal, below a long root transcript.
+ * Input goes through the real dispatcher, including overlay mouse routing.
+ */
+export function fullscreen({ columns = 100, rows = 24 } = {}) {
+	let send = (_data: string) => {};
+	let lastWrite = "";
+	const terminal: Terminal = {
+		columns,
+		rows,
+		kittyProtocolActive: false,
+		start(onInput) {
+			send = onInput;
+		},
+		stop() {},
+		drainInput: async () => {},
+		write(data) {
+			lastWrite = data;
+		},
+		moveBy() {},
+		hideCursor() {},
+		showCursor() {},
+		clearLine() {},
+		clearFromCursor() {},
+		clearScreen() {},
+		setTitle() {},
+		setProgress() {},
+		setProgramStatus() {},
+	};
+	const tui = new TuiAltScreen(terminal);
+	tui.addChild(
+		new Text(
+			Array.from({ length: 100 }, (_, i) => `ROOT_TRANSCRIPT ${i}`).join("\n"),
+			0,
+			0,
+		),
+	);
+	tui.start();
+	const harness = {
+		tui,
+		/** Pi's default bindings that the UI uses, as ctx.ui.custom() passes them. */
+		keybindings: new KeybindingsManager({
+			...TUI_KEYBINDINGS,
+			"app.interrupt": { defaultKeys: "escape" },
+			"app.tools.expand": { defaultKeys: "ctrl+o" },
+			"app.thinking.toggle": { defaultKeys: "ctrl+t" },
+		}),
+		/** Like ctx.ui.custom() with the switcher's overlay options. */
+		mount(component: Component) {
+			const overlay = tui.showOverlay(component, SWITCHER_OVERLAY);
+			tui.renderNow();
+			return overlay;
+		},
+		input(data: string) {
+			send(data);
+			tui.renderNow();
+		},
+		/** SGR mouse report at zero-based cell coordinates. */
+		mouse(button: number, x: number, y: number, release = false) {
+			send(`\x1b[<${button};${x + 1};${y + 1}${release ? "m" : "M"}`);
+			tui.renderNow();
+		},
+		click(x: number, y: number) {
+			harness.mouse(0, x, y);
+			harness.mouse(0, x, y, true);
+		},
+		screen(): string[] {
+			tui.renderNow();
+			return tui
+				.getScreenLines()
+				.map((line) => stripTerminalSequences(line).trimEnd());
+		},
+		text: () => harness.screen().join("\n"),
+		row(text: string): number {
+			const row = harness.screen().findIndex((line) => line.includes(text));
+			if (row < 0) throw new Error(`${text} is not visible`);
+			return row;
+		},
+		/** The hardware cursor that the last frame placed, if any. */
+		cursor(): { row: number; col: number } | undefined {
+			tui.renderNow();
+			// The cursor move just before hiding/showing it and ending the frame.
+			const match =
+				// biome-ignore lint/suspicious/noControlCharactersInRegex: Terminal escape sequences.
+				/\x1b\[(\d+);(\d+)H\x1b\[\?25[hl]\x1b\[\?2026l$/.exec(lastWrite);
+			return match
+				? { row: Number(match[1]) - 1, col: Number(match[2]) - 1 }
+				: undefined;
+		},
+		stop: () => tui.stop(),
+	};
+	return harness;
 }
