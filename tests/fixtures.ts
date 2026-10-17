@@ -1,5 +1,6 @@
-import { afterEach } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { afterAll, afterEach } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -175,19 +176,19 @@ export const hierarchyStream = stream((context) => {
 	return response(text === "nest:0" || text === "say hello" ? "hello" : text);
 });
 
-const directories: string[] = [];
+// Preloaded through bunfig.toml, so these hooks cover every test file.
+// Pi can still write into a test's directory after it ends (e.g. a model
+// catalog refresh), so the whole tree is removed once, after the last file.
+const root = mkdtempSync(join(tmpdir(), "pi-subagents-test-"));
+afterAll(() => rmSync(root, { recursive: true, force: true }));
+
 const sharedKeys: symbol[] = [];
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
-afterEach(async () => {
+afterEach(() => {
 	for (const key of sharedKeys.splice(0))
 		Reflect.deleteProperty(globalThis, key);
 	if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 	else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
-	await Promise.all(
-		directories
-			.splice(0)
-			.map((path) => rm(path, { recursive: true, force: true })),
-	);
 });
 
 export function testProvider(streamFn = hierarchyStream): Provider {
@@ -210,8 +211,9 @@ export function testProvider(streamFn = hierarchyStream): Provider {
 export async function spawnContext(
 	streamFn = hierarchyStream,
 ): Promise<SpawnContext> {
-	const directory = await mkdtemp(join(tmpdir(), "pi-subagents-test-"));
-	directories.push(directory);
+	// Without the preload (e.g. run from another cwd) the first file removes it.
+	await mkdir(root, { recursive: true });
+	const directory = await mkdtemp(join(root, "context-"));
 	const cwd = join(directory, "workspace");
 	const agentDir = join(directory, "agent");
 	await mkdir(cwd);

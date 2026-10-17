@@ -1,0 +1,4 @@
+[test]
+# Bun evaluates a shared module once, binding its hooks to the first test file
+# that imports it; preloading makes the fixtures' cleanup global.
+preload = ["./tests/fixtures.ts"]
