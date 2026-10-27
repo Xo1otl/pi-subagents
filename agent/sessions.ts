@@ -119,6 +119,10 @@ export async function createChildSession(
 		agentDir,
 		settingsManager,
 		eventBus,
+		appendSystemPromptOverride: (base) => [
+			...base,
+			"You are a subagent. SKILL.md possibly parent-handled; read only if instructed.",
+		],
 		extensionFactories: [
 			ownedWarming,
 			backgroundMonitors(owner),
