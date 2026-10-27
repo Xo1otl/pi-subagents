@@ -15,6 +15,7 @@ import { spawnContext } from "../agent/sessions.ts";
 import extension from "../index.ts";
 import { ROOT, type SpawnContext, type Subagents } from "../runtime/index.ts";
 import {
+	hierarchyStream,
 	lastText,
 	model,
 	response,
@@ -156,6 +157,39 @@ test("loads workspace instructions, skills, templates and settings into a fresh 
 	expect(child.thinkingLevel).toBe(parent.thinkingLevel);
 	expect(child.sessionManager.getCwd()).toBe(context.cwd);
 	expect(JSON.stringify(child.messages)).not.toContain("an earlier task");
+});
+
+test("adds budgeted, file-specific skill-read guidance to children and descendants only", async () => {
+	const { parent, tree, context, agentDir } = await setup({
+		streamFn: hierarchyStream,
+	});
+	await mkdir(join(agentDir, "skills", "standard"), { recursive: true });
+	await writeFile(
+		join(agentDir, "skills", "standard", "SKILL.md"),
+		"---\nname: standard\ndescription: STANDARD_SKILL_MARKER\n---\nSkill instructions.",
+	);
+	const guidance =
+		"Skip default skill-file loading for direct `skill://` paths.";
+	const base = parent.resourceLoader.getAppendSystemPrompt();
+	expect(parent.systemPrompt).not.toContain(guidance);
+	expect(base).not.toContain(guidance);
+
+	const result = await tree.start(ROOT, "nest:1", context).result;
+	expect(result.status).toBe("done");
+	expect(tree.tree().map((node) => node.id)).toEqual(["1", "1.1"]);
+	for (const node of tree.tree()) {
+		const appended = node.session?.resourceLoader.getAppendSystemPrompt();
+		expect(appended).toEqual([...base, guidance]);
+		expect(
+			Buffer.byteLength(appended?.at(-1) ?? "", "utf8"),
+		).toBeLessThanOrEqual(60);
+		expect(node.session?.systemPrompt).toContain(guidance);
+		expect(node.session?.systemPrompt).toContain("STANDARD_SKILL_MARKER");
+		expect(node.session?.systemPrompt).toContain(
+			"Use the read tool to load a skill's file when the task matches its description.",
+		);
+	}
+	expect(parent.systemPrompt).not.toContain(guidance);
 });
 
 test("provides machine-facing delegation in children without loading UI registrations", async () => {

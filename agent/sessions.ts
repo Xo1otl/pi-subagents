@@ -121,7 +121,7 @@ export async function createChildSession(
 		eventBus,
 		appendSystemPromptOverride: (base) => [
 			...base,
-			"You are a subagent. SKILL.md possibly parent-handled; read only if instructed.",
+			"Skip default skill-file loading for direct `skill://` paths.",
 		],
 		extensionFactories: [
 			ownedWarming,
