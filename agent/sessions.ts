@@ -1,3 +1,5 @@
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { Api, Model } from "@earendil-works/pi-ai";
 import {
 	type AgentSession,
 	createAgentSession,
@@ -15,6 +17,7 @@ import {
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import type { SessionOwner, SpawnContext } from "../runtime/index.ts";
+import { backgroundCommands } from "./commands.ts";
 
 /** Each delegated session has its own event bus, which answers this request.
  * Unlike module state, the bus reaches every copy of this extension, including
@@ -34,61 +37,40 @@ export function sessionOwner(events: EventBus): SessionOwner | undefined {
 	return request.owner;
 }
 
-/** Children inherit their parent's configuration, then its current selections. */
+/** Children inherit their parent's configuration, then its current selections,
+ * unless the request names a model (`provider/id` or a unique `id`) or an effort.
+ */
 export function spawnContext(
 	ctx: ExtensionContext,
 	owner?: SessionOwner,
+	{ model, effort }: { model?: string; effort?: ThinkingLevel } = {},
 ): SpawnContext {
 	if (!ctx.model) throw new Error("Select a model before spawning a subagent.");
 	return {
 		...owner?.runtime.get(owner.id)?.context,
 		cwd: ctx.cwd,
-		model: ctx.model,
-		thinkingLevel: ctx.thinkingLevel,
+		model: model ? resolveModel(ctx, model) : ctx.model,
+		thinkingLevel: effort ?? ctx.thinkingLevel,
 		projectTrusted: ctx.isProjectTrusted(),
 	};
 }
 
-/** Keep a delegated run open while monitors it started in the background are running,
- * so its final reply reflects their results while the agent stays free to converse.
- * pi-monitor's contract: an interactive monitor_start ends the turn with a monitorId, and
- * its terminal result arrives later as a "monitor-result" message unless monitor_stop
- * ends it silently.
- */
-function backgroundMonitors(owner: SessionOwner): ExtensionFactory {
-	return (pi) => {
-		const running: (() => void)[] = [];
-		const finish = (count: number) => {
-			for (const done of running.splice(0, count)) done();
-		};
-		pi.on("tool_execution_end", ({ toolName, result, isError }) => {
-			if (isError) return;
-			if (
-				toolName === "monitor_start" &&
-				result?.terminate === true &&
-				typeof result.details?.monitorId === "string"
-			)
-				owner.runtime.trackCompletion(
-					owner.id,
-					new Promise<void>((resolve) => running.push(resolve)),
-				);
-			else if (toolName === "monitor_stop")
-				finish(Number(result?.details?.stopped) || 0);
-		});
-		pi.on("message_end", ({ message }) => {
-			if (message.role === "custom" && message.customType === "monitor-result")
-				finish(1);
-		});
-		// Cancellation stops the wait; session shutdown stops the monitors themselves.
-		const unsubscribe = owner.runtime.subscribe(() => {
-			if (running.length && owner.runtime.get(owner.id)?.cancelled)
-				finish(running.length);
-		});
-		pi.on("session_shutdown", () => {
-			unsubscribe();
-			finish(running.length);
-		});
-	};
+function resolveModel(ctx: ExtensionContext, reference: string): Model<Api> {
+	const available = ctx.modelRegistry.getAvailable();
+	const qualified = available.filter(
+		({ provider, id }) => `${provider}/${id}` === reference,
+	);
+	const matches = qualified.length
+		? qualified
+		: available.filter(({ id }) => id === reference);
+	if (matches.length === 1 && matches[0]) return matches[0];
+	const list = (models: Model<Api>[]) =>
+		models.map(({ provider, id }) => `${provider}/${id}`).join(", ");
+	throw new Error(
+		matches.length
+			? `Ambiguous model "${reference}": ${list(matches)}`
+			: `Unknown model "${reference}". Available: ${list(available)}`,
+	);
 }
 
 export async function createChildSession(
@@ -122,10 +104,15 @@ export async function createChildSession(
 		appendSystemPromptOverride: (base) => [
 			...base,
 			"Skip default skill-file loading for direct `skill://` paths.",
+			"Background jobs tracked by PGID (incl. nohup); on group exit ⇒ notify (+ wake if idle).",
 		],
 		extensionFactories: [
 			ownedWarming,
-			backgroundMonitors(owner),
+			{
+				name: "subagent-commands",
+				factory: backgroundCommands(owner, settingsManager),
+				replaceable: true,
+			},
 			// A configured installation takes precedence, without duplicate registrations.
 			// Otherwise children receive only the machine-facing extension, not the UI entrypoint.
 			{
@@ -167,8 +154,8 @@ export async function createChildSession(
 	});
 	// Publication transfers cleanup to the runtime, including failed binding.
 	onCreated(session);
-	// Headless but long-lived, unlike one-shot print mode: background tools return at
-	// once and wake the agent later, as in the main chat.
+	// Headless but long-lived: command groups and descendants may outlive a turn,
+	// and the agent remains available for conversation until the runtime settles.
 	await session.bindExtensions({
 		mode: "rpc",
 		shutdownHandler: () => owner.runtime.abort(owner.id),

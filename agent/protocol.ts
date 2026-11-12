@@ -7,6 +7,7 @@ import type { SubagentResult } from "../runtime/index.ts";
  */
 export const SUBAGENT_RESULT_TYPE = "subagent-result";
 export const SUBAGENT_USAGE_TYPE = "subagent-usage";
+export const COMMAND_EXIT_TYPE = "subagent-command-exit";
 
 export interface SubagentReceipt {
 	id: string;

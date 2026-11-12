@@ -514,20 +514,6 @@ test("liveTools retains full raw snapshots, authoritative terminal results, and 
 					result: final,
 					isError: false,
 				});
-				entries.push({
-					type: "message",
-					message: response("", {
-						stopReason: "toolUse",
-						content: [
-							{
-								type: "toolCall",
-								id: "call",
-								name: "outer",
-								arguments: { value: 1 },
-							},
-						],
-					}),
-				});
 			} else expect(runtime.get("1")?.liveTools.size).toBe(0);
 			entries.push({ type: "message", message: response("done") });
 		},

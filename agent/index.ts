@@ -1,3 +1,4 @@
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import {
 	type BoundaryResult,
 	type BoundaryState,
@@ -31,6 +32,16 @@ import {
 	sessionOwner,
 	spawnContext,
 } from "./sessions.ts";
+
+const EFFORTS = [
+	"off",
+	"minimal",
+	"low",
+	"medium",
+	"high",
+	"xhigh",
+	"max",
+] as const satisfies readonly ThinkingLevel[];
 
 /** Compose execution with Pi's session lifecycle, without loading presentation. */
 export function createSubagentRuntime(
@@ -320,23 +331,31 @@ export function createSubagentIntegration(
 	return defineTool({
 		name: "subagent",
 		label: "Subagent",
-		description: "Replies to the parent when done.",
+		description: "0 active commands/children ∧ idle ⇒ last message → parent.",
 		parameters: Type.Object({
 			instructions: Type.String({ minLength: 1 }),
+			model: Type.Optional(Type.String({ minLength: 1 })),
+			effort: Type.Optional(Type.Enum(EFFORTS)),
 		}),
 		outputSchema: Type.Object({
 			id: Type.String(),
 			status: Type.Literal("running"),
 		}),
 		executionMode: "parallel",
-		async execute(_id, { instructions }, signal, _onUpdate, ctx) {
+		async execute(
+			_id,
+			{ instructions, model, effort },
+			signal,
+			_onUpdate,
+			ctx,
+		) {
 			signal?.throwIfAborted();
 			const source = binding;
 			if (!source || !isCurrent(source, ctx))
 				throw new Error("Subagent parent session is no longer active.");
 			const tree = source.runtime;
 			const epoch = source.abortEpoch;
-			const context = spawnContext(ctx, owner);
+			const context = spawnContext(ctx, owner, { model, effort });
 			// After receipt, this job belongs to the runtime, not the parent's turn signal.
 			const started = tree.start(parentId, instructions, context);
 			const canDeliver = () =>

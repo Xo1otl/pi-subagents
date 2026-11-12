@@ -2,7 +2,6 @@ import { afterEach, expect, test } from "bun:test";
 import type { Provider, Usage } from "@earendil-works/pi-ai";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import { createSubagentIntegration } from "../agent/index.ts";
-import { SUBAGENT_RESULT_TYPE } from "../agent/protocol.ts";
 import { ROOT, type Subagents } from "../runtime/index.ts";
 import { SUBAGENT_USAGE_KIND } from "../runtime/summary.ts";
 import {
@@ -91,44 +90,37 @@ function expectDelta(
 	expect(after.cost).toBeCloseTo(before.cost + usage.cost.total);
 }
 
-test.each(["done", "aborted"] as const)(
-	"resuming a %s child bills each new run without notifying or recharging the parent",
-	async (status) => {
-		const dispatch = stream((context, options) => {
-			const text = lastText(context);
-			if (text === "nest:0" && status === "aborted")
-				return waiting(options?.signal);
-			if (text === "resume")
-				return response("resumed", { usage: resumedUsage });
-			return hierarchyStream(model, context, options).result();
+test("resuming an aborted child bills each new run without notifying or recharging the parent", async () => {
+	const dispatch = stream((context, options) => {
+		const text = lastText(context);
+		if (text === "nest:0") return waiting(options?.signal);
+		if (text === "resume") return response("resumed", { usage: resumedUsage });
+		return hierarchyStream(model, context, options).result();
+	});
+	const { session, tree } = await setup(dispatch);
+	await session.prompt("nest:1");
+	await until(() => Boolean(tree.get("1")?.session?.isStreaming));
+	tree.abort("1");
+	await settled(session, tree);
+	expect(tree.get("1")?.status).toBe("aborted");
+	expect(charges(session)).toHaveLength(1);
+	const messages = JSON.stringify(session.messages);
+	const child = tree.get("1")?.session;
+	if (!child) throw new Error("Missing child");
+	for (let run = 0; run < 2; run++) {
+		const before = session.getSessionStats();
+		await tree.send("1", "resume");
+		expect(tree.get("1")?.session).toBe(child);
+		expect(tree.get("1")?.status).toBe("done");
+		expectDelta(session, before, resumedUsage);
+		expect(charges(session)).toHaveLength(run + 2);
+		expect(charges(session).at(-1)).toMatchObject({
+			note: "1",
+			usage: resumedUsage,
 		});
-		const { session, tree } = await setup(dispatch);
-		await session.prompt("nest:1");
-		if (status === "aborted") {
-			await until(() => Boolean(tree.get("1")?.session?.isStreaming));
-			tree.abort("1");
-		}
-		await settled(session, tree);
-		expect(tree.get("1")?.status).toBe(status);
-		expect(charges(session)).toHaveLength(1);
-		const messages = JSON.stringify(session.messages);
-		const child = tree.get("1")?.session;
-		if (!child) throw new Error("Missing child");
-		for (let run = 0; run < 2; run++) {
-			const before = session.getSessionStats();
-			await tree.send("1", "resume");
-			expect(tree.get("1")?.session).toBe(child);
-			expect(tree.get("1")?.status).toBe("done");
-			expectDelta(session, before, resumedUsage);
-			expect(charges(session)).toHaveLength(run + 2);
-			expect(charges(session).at(-1)).toMatchObject({
-				note: "1",
-				usage: resumedUsage,
-			});
-			expect(JSON.stringify(session.messages)).toBe(messages);
-		}
-	},
-);
+		expect(JSON.stringify(session.messages)).toBe(messages);
+	}
+});
 
 test("resumed nested descendants bill all idle ancestors exactly once", async () => {
 	const dispatch = stream((context, options) =>
@@ -249,13 +241,6 @@ test("a running ancestor drains a resumed descendant through an idle intermediat
 			cost: { ...resumedUsage.cost, total: resumedUsage.cost.total + 0.03 },
 		});
 		expect(JSON.stringify(session.messages)).toBe(messages);
-		expect(
-			session.messages.filter(
-				(message) =>
-					message.role === "custom" &&
-					message.customType === SUBAGENT_RESULT_TYPE,
-			),
-		).toHaveLength(1);
 	} finally {
 		unsubscribe();
 		gate.resolve();

@@ -243,14 +243,12 @@ export async function spawnContext(
 	};
 }
 
-export function deferred<T = void>() {
-	let resolve!: (value: T | PromiseLike<T>) => void;
-	let reject!: (reason?: unknown) => void;
-	const promise = new Promise<T>((yes, no) => {
+export function deferred() {
+	let resolve!: () => void;
+	const promise = new Promise<void>((yes) => {
 		resolve = yes;
-		reject = no;
 	});
-	return { promise, resolve, reject };
+	return { promise, resolve };
 }
 
 /** A root SDK session, with the same deterministic provider available to children.
@@ -313,8 +311,8 @@ export async function parentSession(
 	return session;
 }
 
-/** A child tool that blocks its step, like a monitor waiting in a headless session. */
-export async function blockingTool(context: SpawnContext, name = "blocking") {
+/** A child tool that blocks its step until released or cancelled. */
+export async function blockingTool(context: SpawnContext) {
 	if (!context.agentDir) throw new Error("Missing test agent directory");
 	const release = deferred();
 	const key = Symbol.for(`pi-subagents.blocking.${crypto.randomUUID()}`);
@@ -323,10 +321,10 @@ export async function blockingTool(context: SpawnContext, name = "blocking") {
 	const directory = join(context.agentDir, "extensions");
 	await mkdir(directory, { recursive: true });
 	await writeFile(
-		join(directory, `${name}.js`),
+		join(directory, "blocking.js"),
 		`export default function(pi) {
 			pi.registerTool({
-				name: ${JSON.stringify(name)}, label: "Blocking", description: "Blocks until released",
+				name: "blocking", label: "Blocking", description: "Blocks until released",
 				parameters: { type: "object", properties: {} },
 				async execute(_id, _args, signal) {
 					await Promise.race([
@@ -341,56 +339,18 @@ export async function blockingTool(context: SpawnContext, name = "blocking") {
 	return release;
 }
 
-/** pi-monitor's contract: one-shot modes wait inside the tool; others end the turn and
- * report later as a "monitor-result" message, unless monitor_stop ends it silently.
- */
-export async function fakeMonitor(context: SpawnContext) {
-	if (!context.agentDir) throw new Error("Missing test agent directory");
-	const finished = deferred();
-	const key = Symbol.for(`pi-subagents.monitor.${crypto.randomUUID()}`);
-	sharedKeys.push(key);
-	Reflect.set(globalThis, key, finished.promise);
-	const directory = join(context.agentDir, "extensions");
-	await mkdir(directory, { recursive: true });
-	await writeFile(
-		join(directory, "monitor.js"),
-		`export default function(pi) {
-			const finished = globalThis[Symbol.for(${JSON.stringify(Symbol.keyFor(key))})];
-			const active = new Set();
-			let next = 0;
-			const result = { type: "text", text: "status=success" };
-			pi.registerTool({
-				name: "monitor_start", label: "Monitor", description: "Background monitor",
-				parameters: { type: "object", properties: {} },
-				async execute(_id, _args, _signal, _onUpdate, ctx) {
-					const monitorId = "monitor_" + ++next;
-					if (ctx.mode === "print" || ctx.mode === "json") {
-						await finished;
-						return { content: [result], details: { monitorId } };
-					}
-					active.add(monitorId);
-					finished.then(() => {
-						if (active.delete(monitorId))
-							pi.sendMessage(
-								{ customType: "monitor-result", content: [result], display: true, details: {} },
-								{ deliverAs: "steer", triggerTurn: true },
-							);
-					});
-					return { content: [{ type: "text", text: "Monitor started" }], details: { monitorId }, terminate: true };
-				},
-			});
-			pi.registerTool({
-				name: "monitor_stop", label: "Stop monitors", description: "Stop monitors",
-				parameters: { type: "object", properties: {} },
-				async execute() {
-					const stopped = active.size;
-					active.clear();
-					return { content: [{ type: "text", text: "Stopped " + stopped + " monitor(s)." }], details: { stopped } };
-				},
-			});
-		}`,
-	);
-	return finished;
+/** A reparented shell job whose lifetime is controlled by a file, not timing. */
+export function backgroundJob(cwd: string, name: string, launcher = "nohup") {
+	const gate = join(cwd, `${name}.release`);
+	const group = join(cwd, `${name}.pgid`);
+	const finished = join(cwd, `${name}.finished`);
+	const script = `while [ ! -f "${gate}" ]; do sleep 0.02; done; printf finished > "${finished}"`;
+	return {
+		group,
+		finished,
+		command: `printf '%s\\n' "$$" > "${group}"; ${launcher} bash -c '${script}' </dev/null >/dev/null 2>&1 &`,
+		release: () => writeFile(gate, ""),
+	};
 }
 
 export function waiting(signal?: AbortSignal): Promise<never> {

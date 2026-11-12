@@ -99,17 +99,16 @@ async function configuredExtension(
 	);
 }
 
-test("captures the current workspace, model, thinking level and trust decision", async () => {
-	const context = await testContext();
+test("captures the current workspace, model, thinking level and trust decision", () => {
 	const ctx = {
-		cwd: context.cwd,
-		model: context.model,
+		cwd: "/workspace",
+		model,
 		thinkingLevel: "low",
 		isProjectTrusted: () => false,
 	} as ExtensionContext;
 	expect(spawnContext(ctx)).toEqual({
-		cwd: context.cwd,
-		model: context.model,
+		cwd: "/workspace",
+		model,
 		thinkingLevel: "low",
 		projectTrusted: false,
 	});
@@ -118,8 +117,39 @@ test("captures the current workspace, model, thinking level and trust decision",
 	);
 });
 
-test("loads workspace instructions, skills, templates and settings into a fresh conversation", async () => {
+test("honors requested effort and resolves requested models against available ones", () => {
+	const alternate = { ...model, id: "alternate-model" };
+	const other = { ...model, provider: "other-provider" };
+	const ctx = {
+		cwd: "/workspace",
+		model,
+		thinkingLevel: "low",
+		isProjectTrusted: () => true,
+		modelRegistry: { getAvailable: () => [model, alternate, other] },
+	} as unknown as ExtensionContext;
+	expect(spawnContext(ctx, undefined, { effort: "max" })).toMatchObject({
+		model,
+		thinkingLevel: "max",
+	});
+	for (const reference of ["alternate-model", "test-provider/alternate-model"])
+		expect(spawnContext(ctx, undefined, { model: reference })).toMatchObject({
+			model: alternate,
+			thinkingLevel: "low",
+		});
+	expect(
+		spawnContext(ctx, undefined, { model: "other-provider/test-model" }).model,
+	).toBe(other);
+	expect(() => spawnContext(ctx, undefined, { model: "test-model" })).toThrow(
+		'Ambiguous model "test-model": test-provider/test-model, other-provider/test-model',
+	);
+	expect(() => spawnContext(ctx, undefined, { model: "missing" })).toThrow(
+		'Unknown model "missing". Available: test-provider/test-model, test-provider/alternate-model, other-provider/test-model',
+	);
+});
+
+test("loads workspace resources into a fresh, ephemeral child of a persistent parent", async () => {
 	const { parent, tree, context, agentDir } = await setup({
+		persist: true,
 		settings: {
 			transport: "sse",
 			shellCommandPrefix: "export STANDARD_ENV=on_disk;",
@@ -156,10 +186,12 @@ test("loads workspace instructions, skills, templates and settings into a fresh 
 	expect(child.model).toEqual(parent.model);
 	expect(child.thinkingLevel).toBe(parent.thinkingLevel);
 	expect(child.sessionManager.getCwd()).toBe(context.cwd);
+	expect(parent.sessionFile).toBeDefined();
+	expect(child.sessionFile).toBeUndefined();
 	expect(JSON.stringify(child.messages)).not.toContain("an earlier task");
 });
 
-test("adds budgeted, file-specific skill-read guidance to children and descendants only", async () => {
+test("adds skill-read and background-resumption guidance to children and descendants only", async () => {
 	const { parent, tree, context, agentDir } = await setup({
 		streamFn: hierarchyStream,
 	});
@@ -170,7 +202,10 @@ test("adds budgeted, file-specific skill-read guidance to children and descendan
 	);
 	const guidance =
 		"Skip default skill-file loading for direct `skill://` paths.";
+	const wake =
+		"Background jobs tracked by PGID (incl. nohup); on group exit ⇒ notify (+ wake if idle).";
 	const base = parent.resourceLoader.getAppendSystemPrompt();
+	expect(parent.systemPrompt).not.toContain(wake);
 	expect(parent.systemPrompt).not.toContain(guidance);
 	expect(base).not.toContain(guidance);
 
@@ -179,15 +214,10 @@ test("adds budgeted, file-specific skill-read guidance to children and descendan
 	expect(tree.tree().map((node) => node.id)).toEqual(["1", "1.1"]);
 	for (const node of tree.tree()) {
 		const appended = node.session?.resourceLoader.getAppendSystemPrompt();
-		expect(appended).toEqual([...base, guidance]);
-		expect(
-			Buffer.byteLength(appended?.at(-1) ?? "", "utf8"),
-		).toBeLessThanOrEqual(60);
+		expect(appended).toEqual([...base, guidance, wake]);
+		expect(node.session?.systemPrompt).toContain(wake);
 		expect(node.session?.systemPrompt).toContain(guidance);
 		expect(node.session?.systemPrompt).toContain("STANDARD_SKILL_MARKER");
-		expect(node.session?.systemPrompt).toContain(
-			"Use the read tool to load a skill's file when the task matches its description.",
-		);
 	}
 	expect(parent.systemPrompt).not.toContain(guidance);
 });
@@ -357,7 +387,9 @@ test("runs standard extension permission and result hooks in the child's context
 });
 
 test("a normally installed subagents extension shares the explicit child ownership and hierarchy", async () => {
-	const { tree, context, agentDir } = await setup();
+	const { tree, context, agentDir } = await setup({
+		streamFn: hierarchyStream,
+	});
 	const settings = SettingsManager.create(context.cwd, agentDir).getSettings();
 	await writeFile(
 		join(agentDir, "settings.json"),
@@ -366,11 +398,7 @@ test("a normally installed subagents extension shares the explicit child ownersh
 			extensions: [new URL("../index.ts", import.meta.url).pathname],
 		}),
 	);
-	const recursive = await testContext();
-	const result = await tree.start(ROOT, "nest:2", {
-		...context,
-		modelRuntime: recursive.modelRuntime,
-	}).result;
+	const result = await tree.start(ROOT, "nest:2", context).result;
 	expect(result.status).toBe("done");
 	expect(result.output).toBe("hello");
 	expect(tree.tree().map((node) => node.id)).toEqual(["1", "1.1", "1.1.1"]);
@@ -524,15 +552,4 @@ test("cancellation during async standard input hooks stops the later agent loop"
 		release();
 		delete shared[key];
 	}
-});
-
-test("children are ephemeral even when the parent persists its conversation", async () => {
-	const { parent, tree, context } = await setup({ persist: true });
-	await parent.prompt("ROOT_PERSISTED_HISTORY");
-	await tree.start(ROOT, "child", context).result;
-	expect(parent.sessionFile).toBeDefined();
-	expect(tree.get("1")?.session?.sessionFile).toBeUndefined();
-	expect(JSON.stringify(tree.get("1")?.session?.messages)).not.toContain(
-		"ROOT_PERSISTED_HISTORY",
-	);
 });

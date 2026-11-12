@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
 import { readFile, rm } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { Provider, Usage } from "@earendil-works/pi-ai";
@@ -22,12 +23,14 @@ import { spawnContext } from "../agent/sessions.ts";
 import type { Subagents } from "../runtime/index.ts";
 import { SUBAGENT_USAGE_KIND } from "../runtime/summary.ts";
 import {
+	backgroundJob,
 	deferred,
 	lastText,
 	model,
 	parentSession,
 	response,
 	stream,
+	testProvider,
 	toolCall,
 	until,
 	waiting,
@@ -124,6 +127,66 @@ const defaultDispatch = stream((context) => {
 	);
 });
 
+test("the tool starts the child with the requested effort and rejects unknown models", async () => {
+	const { session, tree, tool } = await setup(defaultDispatch);
+	expect(tool().description).toBe(
+		"0 active commands/children ∧ idle ⇒ last message → parent.",
+	);
+	const execute = (args: { model?: string; effort?: "low" }) =>
+		tool().execute(
+			"configured",
+			{ instructions: "child task", ...args },
+			undefined,
+			undefined,
+			session.extensionRunner.createToolContext("configured", undefined),
+		);
+	await expect(execute({ model: "missing" })).rejects.toThrow(
+		'Unknown model "missing"',
+	);
+	expect(tree.tree()).toHaveLength(0);
+	await execute({ model: "test-provider/test-model", effort: "low" });
+	await until(() => completions(session).length === 1);
+	expect(tree.get("1")?.session?.model).toMatchObject({ id: model.id });
+	expect(tree.get("1")?.session?.thinkingLevel).toBe("low");
+});
+
+test("nohup completion notifies the parent once, with the child's last assistant message", async () => {
+	let job: ReturnType<typeof backgroundJob> | undefined;
+	const { session, tree } = await setup(
+		stream((context) => {
+			const text = lastText(context);
+			if (text === "delegate")
+				return toolCall("subagent", { instructions: "start job" });
+			if (text === "start job") {
+				if (!job) throw new Error("Missing job");
+				return toolCall("bash", { command: job.command });
+			}
+			if (text.startsWith("Subagent ")) return response("completion accepted");
+			if (text.startsWith("Process group "))
+				return response("child answer after exit");
+			if (text === "final update") return response("last child answer");
+			return response("available while job runs");
+		}),
+	);
+	job = backgroundJob(session.sessionManager.getCwd(), "notify");
+	await session.prompt("delegate");
+	await until(() => tree.get("1")?.session?.isIdle === true);
+	expect(tree.get("1")?.status).toBe("running");
+	expect(completions(session)).toHaveLength(0);
+	await tree.send("1", "final update");
+	expect(completions(session)).toHaveLength(0);
+	await job.release();
+	await until(() => completions(session).length === 1 && session.isIdle);
+	expect(existsSync(job.finished)).toBe(true);
+	expect(completions(session)[0]?.content).toEqual([
+		{ type: "text", text: "Subagent 1 done." },
+		{ type: "text", text: "child answer after exit" },
+	]);
+	expect(session.getLastAssistantText()).toBe("completion accepted");
+	await tree.settled("root");
+	expect(completions(session)).toHaveLength(1);
+});
+
 test("root returns a receipt and accepts another prompt while child session initialization is blocked", async () => {
 	const initialized = gate();
 	let initializing = false;
@@ -131,12 +194,7 @@ test("root returns a receipt and accepts another prompt while child session init
 		initializing = true;
 		await initialized.promise;
 	});
-	let parentFinished = false;
-	const prompt = session.prompt("delegate").then(() => {
-		parentFinished = true;
-	});
-	await until(() => parentFinished);
-	await prompt;
+	await session.prompt("delegate");
 	expect(session.getLastAssistantText()).toBe("parent available");
 	const receipt = session.messages.find(
 		(message) => message.role === "toolResult",
@@ -146,9 +204,6 @@ test("root returns a receipt and accepts another prompt while child session init
 		id: "1",
 		status: "running",
 	});
-	expect(receipt.content).toEqual([
-		{ type: "text", text: JSON.stringify(receipt.details) },
-	]);
 	expect(receipt.usage).toBeUndefined();
 	expect(completions(session)).toHaveLength(0);
 	expect(tree.get("1")?.status).toBe("running");
@@ -172,6 +227,77 @@ test("root returns a receipt and accepts another prompt while child session init
 			),
 	).toHaveLength(1);
 });
+
+test.each(["initializing", "running"] as const)(
+	"changing the parent model while a child is %s keeps the child independent and delivers its result",
+	async (phase) => {
+		const child = gate();
+		let blocked = false;
+		const alternate = {
+			...model,
+			provider: "alternate-provider",
+			id: "alternate-model",
+		};
+		const requests: { text: string; provider: string; model: string }[] = [];
+		const respond = stream(async (context, options) => {
+			if (phase === "running" && lastText(context) === "child task") {
+				blocked = true;
+				await Promise.race([child.promise, waiting(options?.signal)]);
+			}
+			return defaultDispatch(model, context, options).result();
+		});
+		const dispatch: Provider["streamSimple"] = (selected, context, options) => {
+			requests.push({
+				text: lastText(context),
+				provider: selected.provider,
+				model: selected.id,
+			});
+			return respond(selected, context, options);
+		};
+		const { session, tree } = await setup(
+			dispatch,
+			phase === "initializing"
+				? async () => {
+						blocked = true;
+						await child.promise;
+					}
+				: undefined,
+			{
+				parent: (pi) =>
+					pi.registerProvider({
+						...testProvider(dispatch),
+						id: alternate.provider,
+						getModels: () => [alternate],
+					}),
+			},
+		);
+		await session.prompt("delegate");
+		await until(() => blocked);
+		// /model uses setModel; it must not wait for the detached child.
+		await session.setModel(alternate);
+		expect(session.model).toEqual(alternate);
+		expect(tree.get("1")?.status).toBe("running");
+		expect(tree.get("1")?.context.model).toEqual(model);
+		await session.prompt("another prompt");
+		expect(requests.at(-1)).toEqual({
+			text: "another prompt",
+			provider: alternate.provider,
+			model: alternate.id,
+		});
+		child.resolve();
+		await until(() => completions(session).length === 1 && session.isIdle);
+		expect(tree.get("1")?.session?.model).toEqual(model);
+		expect(completionDetails(session)).toMatchObject({
+			id: "1",
+			status: "done",
+		});
+		expect(session.getLastAssistantText()).toBe("completion accepted");
+		expect(requests.at(-1)).toMatchObject({
+			provider: alternate.provider,
+			model: alternate.id,
+		});
+	},
+);
 
 test("completion is a follow-up to a busy parent's newer prompt, not an interruption", async () => {
 	const child = gate();

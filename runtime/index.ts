@@ -11,8 +11,8 @@ import type {
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import {
-	appendDelegatedUsage,
 	type RunSummary,
+	SUBAGENT_USAGE_KIND,
 	summarizeOwnUsage,
 	summarizeRun,
 } from "./summary.ts";
@@ -446,10 +446,13 @@ export function createSubagents({
 			try {
 				for (const { manager, sessionId } of ledgers)
 					if (manager.getSessionId() === sessionId)
-						appendDelegatedUsage(manager, node.context.model, {
-							id: node.id,
+						manager.appendUsage(
+							SUBAGENT_USAGE_KIND,
+							node.context.model.provider,
+							node.context.model.id,
 							usage,
-						});
+							node.id,
+						);
 			} finally {
 				// Even a ledger write failure must leave a reusable terminal node.
 				node.status = summary.status;

@@ -1,14 +1,9 @@
 import {
-	type Api,
 	type AssistantMessage,
 	contentText,
-	type Model,
 	type Usage,
 } from "@earendil-works/pi-ai";
-import type {
-	SessionEntry,
-	SessionManager,
-} from "@earendil-works/pi-coding-agent";
+import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 
 /** Attribution for asynchronous delegation, outside a tool result's usage. */
 export const SUBAGENT_USAGE_KIND = "pi-subagents";
@@ -18,21 +13,6 @@ export interface RunSummary {
 	error?: string;
 	output: string;
 	usage: Usage;
-}
-
-/** Bill one run's own usage to an ancestor, independently of result delivery. */
-export function appendDelegatedUsage(
-	manager: SessionManager,
-	model: Model<Api>,
-	child: { id: string; usage: Usage },
-): void {
-	manager.appendUsage(
-		SUBAGENT_USAGE_KIND,
-		model.provider,
-		model.id,
-		child.usage,
-		child.id,
-	);
 }
 
 /** Raw entries are the single source of billing, including descendant charges. */

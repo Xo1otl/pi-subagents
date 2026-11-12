@@ -81,7 +81,6 @@ test.each([
 		expect(isAbsolute(path)).toBe(true);
 		expect(await readFile(path, "utf8")).toBe(output);
 		const text = message.content.at(-1);
-		expect(text?.type).toBe("text");
 		if (text?.type !== "text") throw new Error("Missing completion text");
 		expect(text.text).toContain("Output truncated.");
 		expect(text.text).toContain(path);

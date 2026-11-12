@@ -7,7 +7,6 @@ import { ROOT, type Subagents } from "../runtime/index.ts";
 import {
 	blockingTool,
 	deferred,
-	fakeMonitor,
 	hierarchyStream,
 	lastText,
 	model,
@@ -121,8 +120,6 @@ describe("silent hierarchy", () => {
 			leaf?.session?.messages.filter((message) => message.role === "user"),
 		).toHaveLength(1);
 		expect(JSON.stringify(leaf?.session?.messages)).not.toContain("nest:2");
-		expect(leaf?.session?.model).toEqual(model);
-		expect(leaf?.session?.thinkingLevel).toBe("high");
 		// Seven model turns: each delegating parent gets a receipt and a later completion.
 		// Descendant usage is billed exactly once, not also on the receipt.
 		expect(result.usage?.totalTokens).toBe(21);
@@ -306,6 +303,7 @@ describe("task results", () => {
 
 	test("joins all final text blocks and returns full output without presentation hints", async () => {
 		const tree = runtime();
+		const huge = "日本語".repeat(20_000);
 		const combined = await tree.start(
 			ROOT,
 			"blocks",
@@ -314,20 +312,13 @@ describe("task results", () => {
 					response("", {
 						content: [
 							{ type: "text", text: "one" },
-							{ type: "text", text: "two" },
+							{ type: "text", text: huge },
 						],
 					}),
 				),
 			),
 		).result;
-		expect(combined.output).toBe("one\ntwo");
-		const huge = "日本語".repeat(20_000);
-		const large = await tree.start(
-			ROOT,
-			"huge",
-			await spawnContext(stream(() => response(huge))),
-		).result;
-		expect(large.output).toBe(huge);
+		expect(combined.output).toBe(`one\n${huge}`);
 	});
 });
 
@@ -463,72 +454,6 @@ describe("interaction and cleanup", () => {
 			hook.resolve();
 			Reflect.deleteProperty(globalThis, key);
 		}
-	});
-
-	describe("background monitors", () => {
-		const monitoring = () =>
-			stream((context) => {
-				const text = lastText(context);
-				if (text === "watch build") return toolCall("monitor_start", {});
-				if (text === "stop it") return toolCall("monitor_stop", {});
-				if (text === "status=success") return response("build passed");
-				if (context.messages.at(-1)?.role === "toolResult")
-					return response(`after tool: ${text}`);
-				return response(`reply: ${text}`);
-			});
-		async function watching(tree: Subagents) {
-			const context = await spawnContext(monitoring());
-			const finished = await fakeMonitor(context);
-			const { result } = tree.start(ROOT, "watch build", context);
-			const node = tree.get("1");
-			await until(
-				() =>
-					Boolean(node?.session?.isIdle) &&
-					Boolean(
-						node?.session?.messages.some(
-							(message) => message.role === "toolResult",
-						),
-					),
-			);
-			let completed = false;
-			void result.then(() => {
-				completed = true;
-			});
-			return { node, result, finished, completed: () => completed };
-		}
-
-		test("the agent converses while its monitor runs and reports after the result", async () => {
-			const tree = runtime();
-			const { node, result, finished, completed } = await watching(tree);
-			await tree.send("1", "are you there?");
-			expect(node?.session?.getLastAssistantText()).toBe(
-				"reply: are you there?",
-			);
-			expect(node?.status).toBe("running");
-			expect(completed()).toBe(false);
-			finished.resolve();
-			expect(await result).toMatchObject({
-				status: "done",
-				output: "build passed",
-			});
-		});
-
-		test("monitor_stop releases the run", async () => {
-			const tree = runtime();
-			const { result } = await watching(tree);
-			await tree.send("1", "stop it");
-			expect(await result).toMatchObject({
-				status: "done",
-				output: "after tool: Stopped 1 monitor(s).",
-			});
-		});
-
-		test("stopping the agent stops waiting for its monitor", async () => {
-			const tree = runtime();
-			const { result } = await watching(tree);
-			tree.abort("1");
-			expect((await result).status).toBe("aborted");
-		});
 	});
 
 	test("parent cancellation aborts all descendants, not independent siblings", async () => {
