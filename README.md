@@ -22,6 +22,7 @@ pi -e ./tools/pi-subagents/index.ts   # or: pi install ./tools/pi-subagents
 - Subagents own their jobs: Ctrl+C and shutdown stop them.
 - The root watches its own jobs and your `!` commands (`!!` stays private), never stopping them.
 - Untracked: `setsid`/`setpgid`, bash overrides, and other tools' processes. On Windows, nothing is tracked.
+- To start an untracked daemon, use `setsid -f cmd`. Backgrounding a list (`cd dir && setsid cmd &`) leaves a subshell in the group waiting on the daemon, so the group stays live, and a subagent's run cannot finish, until the daemon exits.
 
 ## Switcher
 
