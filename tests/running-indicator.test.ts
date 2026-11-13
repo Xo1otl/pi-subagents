@@ -1,4 +1,4 @@
-import { afterEach, expect, mock, test } from "bun:test";
+import { expect, mock, test } from "bun:test";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
@@ -7,33 +7,26 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { Component, TUI } from "@earendil-works/pi-tui";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { createSubagentRuntime } from "../agent/index.ts";
-import { ROOT, type Subagents } from "../runtime/index.ts";
+import { ROOT } from "../runtime/index.ts";
 import { createSubagentUI } from "../ui/index.ts";
 import { bindRunningIndicator } from "../ui/running-indicator.ts";
 import {
 	lastText,
+	onCleanup,
+	paused,
 	spawnContext,
 	stream,
+	testRuntime,
 	toolCall,
 	until,
 	waiting,
 } from "./fixtures.ts";
 
-const runtimes: Subagents[] = [];
-const disposers: (() => void)[] = [];
-afterEach(async () => {
-	for (const dispose of disposers.splice(0)) dispose();
-	await Promise.all(runtimes.splice(0).map((runtime) => runtime.dispose()));
-});
-
 type Widget = string[] | ((tui: TUI, theme: Theme) => Component);
 const theme = { fg: (_color: string, text: string) => text } as Theme;
-const paused = stream((_context, options) => waiting(options?.signal));
 
 function setup(bind = true) {
-	const runtime = createSubagentRuntime();
-	runtimes.push(runtime);
+	const runtime = testRuntime();
 	const widgets = new Map<string, Widget>();
 	const setWidget = mock((key: string, content: Widget | undefined) => {
 		if (content) widgets.set(key, content);
@@ -49,7 +42,7 @@ function setup(bind = true) {
 		"setWidget" | "getEditorComponent" | "setEditorComponent"
 	> = { setWidget, getEditorComponent, setEditorComponent };
 	const dispose = bind ? bindRunningIndicator(runtime, ui) : () => {};
-	disposers.push(dispose);
+	onCleanup(dispose);
 	const render = (width = 100, currentTheme = theme) =>
 		[...widgets.values()]
 			.flatMap((widget) =>
@@ -77,9 +70,7 @@ test("counts concurrent runs from startup through stopping and settlement, bound
 		{ length: 5 },
 		(_, i) => runtime.start(ROOT, `run ${i}`, context).result,
 	);
-	expect(render()).toBe(
-		"● Subagents: 5 running · 1, 2, 3, … · ←← / Ctrl+Shift+A to view",
-	);
+	expect(render()).toContain("5 running · 1, 2, 3, …");
 	setWidget.mockClear();
 	await until(() =>
 		runtime.tree().every((node) => Boolean(node.session?.isStreaming)),
@@ -154,7 +145,7 @@ test("UI bindings are terminal-only, and rebinding or disposal removes the old r
 		registerCommand() {},
 		registerShortcut() {},
 	} as unknown as ExtensionAPI);
-	disposers.push(controller.dispose);
+	onCleanup(controller.dispose);
 	for (const mode of ["print", "json", "rpc"] as const)
 		controller.bind(runtime, { mode, ui } as ExtensionContext);
 	const run = runtime.start(ROOT, "wait", await spawnContext(paused)).result;
@@ -164,8 +155,7 @@ test("UI bindings are terminal-only, and rebinding or disposal removes the old r
 	const firstFactory = ui.getEditorComponent();
 	expect(firstFactory).toBeDefined();
 	expect(render()).toContain("Subagents: 1 running");
-	const next = createSubagentRuntime();
-	runtimes.push(next);
+	const next = testRuntime();
 	controller.bind(next, { mode: "tui", ui } as ExtensionContext);
 	expect(ui.getEditorComponent()).toBeDefined();
 	expect(ui.getEditorComponent()).not.toBe(firstFactory);

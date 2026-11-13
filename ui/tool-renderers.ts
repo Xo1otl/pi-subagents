@@ -5,6 +5,11 @@ import { Text } from "@earendil-works/pi-tui";
 import { isSubagentReceipt, subagentId } from "../agent/protocol.ts";
 import { plain, singleLine, type UITheme } from "./text.ts";
 
+/** Collapsed results show this many lines, each cut to PREVIEW_COLUMNS. */
+const PREVIEW_LINES = 8;
+const PREVIEW_COLUMNS = 240;
+const CALL_PREVIEW_COLUMNS = 160;
+
 export function renderSubagentCall(args: unknown, theme: UITheme): Text {
 	const instructions =
 		args && typeof args === "object" && "instructions" in args
@@ -12,7 +17,7 @@ export function renderSubagentCall(args: unknown, theme: UITheme): Text {
 			: undefined;
 	return new Text(
 		theme.fg("toolTitle", "Subagent ") +
-			singleLine(String(instructions ?? "…")).slice(0, 160),
+			singleLine(String(instructions ?? "…")).slice(0, CALL_PREVIEW_COLUMNS),
 		0,
 		0,
 	);
@@ -42,13 +47,14 @@ export function renderSubagentResult(
 	const preview = expanded
 		? text
 		: lines
-				.slice(0, 8)
-				.map((line) => line.slice(0, 240))
+				.slice(0, PREVIEW_LINES)
+				.map((line) => line.slice(0, PREVIEW_COLUMNS))
 				.join("\n");
 	const hint = id ? `\n/subagents ${id} · view conversation` : "";
+	const hidden = expanded ? 0 : lines.length - PREVIEW_LINES;
 	const more =
-		!expanded && lines.length > 8
-			? theme.fg("dim", `\n… ${lines.length - 8} more lines · Ctrl+O to expand`)
+		hidden > 0
+			? theme.fg("dim", `\n… ${hidden} more lines · Ctrl+O to expand`)
 			: "";
 	return new Text(preview + more + theme.fg("dim", hint), 0, 0);
 }

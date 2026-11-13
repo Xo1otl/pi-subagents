@@ -5,6 +5,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { isViewportTUI } from "@earendil-works/pi-tui";
 import { SUBAGENT_RESULT_TYPE } from "../agent/protocol.ts";
+import { errorMessage } from "../runtime/errors.ts";
 import type { Subagents } from "../runtime/index.ts";
 import { bindDoubleLeftNavigation } from "./navigation.ts";
 import { bindRunningIndicator } from "./running-indicator.ts";
@@ -102,10 +103,7 @@ export function createSubagentUI(pi: ExtensionAPI) {
 				() => !switcherOpen && !next.closed && next.tree().length > 0,
 				() => {
 					void showSwitcher(ctx).catch((error: unknown) => {
-						ctx.ui.notify(
-							error instanceof Error ? error.message : String(error),
-							"error",
-						);
+						ctx.ui.notify(errorMessage(error), "error");
 					});
 				},
 			);

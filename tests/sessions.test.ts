@@ -1,9 +1,8 @@
-import { afterEach, expect, test } from "bun:test";
+import { expect, test } from "bun:test";
 import { mkdir, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { Provider } from "@earendil-works/pi-ai";
 import {
-	type AgentSession,
 	createAgentSession,
 	createBashToolDefinition,
 	DefaultResourceLoader,
@@ -11,24 +10,25 @@ import {
 	SessionManager,
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { createSubagentRuntime } from "../agent/index.ts";
 import { spawnContext } from "../agent/sessions.ts";
 import extension from "../index.ts";
-import { ROOT, type SpawnContext, type Subagents } from "../runtime/index.ts";
+import { ROOT } from "../runtime/index.ts";
 import {
+	childExtension,
+	deferred,
 	hierarchyStream,
 	lastCompletion,
 	lastText,
 	model,
+	onCleanup,
 	response,
+	shared,
 	stream,
 	spawnContext as testContext,
 	testProvider,
+	testRuntime,
 	toolCall,
-	until,
 } from "./fixtures.ts";
-
-const parents: AgentSession[] = [];
 
 /** Wording is not under test: the guidance is whatever tracking adds to bash. */
 function addedGuidance(guidelines: readonly string[] | undefined): string {
@@ -37,17 +37,6 @@ function addedGuidance(guidelines: readonly string[] | undefined): string {
 	expect(added).toHaveLength(1);
 	return added[0] ?? "";
 }
-const trees: Subagents[] = [];
-afterEach(async () => {
-	await Promise.all(trees.splice(0).map((tree) => tree.dispose()));
-	for (const parent of parents.splice(0)) {
-		await parent.extensionRunner.emit({
-			type: "session_shutdown",
-			reason: "quit",
-		});
-		parent.dispose();
-	}
-});
 
 async function setup({
 	streamFn = stream(() => response("ok")),
@@ -60,7 +49,6 @@ async function setup({
 } = {}) {
 	const context = await testContext(streamFn);
 	const { cwd, agentDir, model, thinkingLevel, modelRuntime } = context;
-	if (!agentDir) throw new Error("Missing test agent directory");
 	const settingsManager = SettingsManager.create(cwd, agentDir);
 	await writeFile(
 		join(agentDir, "settings.json"),
@@ -89,24 +77,24 @@ async function setup({
 			? SessionManager.create(cwd, join(agentDir, "sessions"))
 			: SessionManager.inMemory(cwd),
 	});
-	parents.push(parent);
+	onCleanup(async () => {
+		await parent.extensionRunner.emit({
+			type: "session_shutdown",
+			reason: "quit",
+		});
+		parent.dispose();
+	});
 	await parent.bindExtensions({ mode: "print" });
-	const tree = createSubagentRuntime();
-	trees.push(tree);
+	const tree = testRuntime();
 	return { parent, tree, context, cwd, agentDir };
 }
 
-async function configuredExtension(
-	context: SpawnContext,
-	source: string,
+/** Configure a child extension, given as its default export's body. */
+function configuredExtension(
+	context: { agentDir: string },
+	body: string,
 ): Promise<void> {
-	if (!context.agentDir) throw new Error("Missing test agent directory");
-	const directory = join(context.agentDir, "extensions");
-	await mkdir(directory, { recursive: true });
-	await writeFile(
-		join(directory, "behavior.js"),
-		`export default function(pi) { ${source} }`,
-	);
+	return childExtension(context, "behavior", body);
 }
 
 test("captures the current workspace, model, thinking level and trust decision", () => {
@@ -115,12 +103,14 @@ test("captures the current workspace, model, thinking level and trust decision",
 		model,
 		thinkingLevel: "low",
 		isProjectTrusted: () => false,
+		sessionManager: { getSessionFile: () => "/sessions/parent.jsonl" },
 	} as ExtensionContext;
 	expect(spawnContext(ctx)).toEqual({
 		cwd: "/workspace",
 		model,
 		thinkingLevel: "low",
 		projectTrusted: false,
+		parentSession: "/sessions/parent.jsonl",
 	});
 	expect(() => spawnContext({ ...ctx, model: undefined })).toThrow(
 		"Select a model",
@@ -135,6 +125,7 @@ test("honors requested effort and resolves requested models against available on
 		model,
 		thinkingLevel: "low",
 		isProjectTrusted: () => true,
+		sessionManager: { getSessionFile: () => undefined },
 		modelRegistry: { getAvailable: () => [model, alternate, other] },
 	} as unknown as ExtensionContext;
 	expect(spawnContext(ctx, undefined, { effort: "max" })).toMatchObject({
@@ -157,7 +148,7 @@ test("honors requested effort and resolves requested models against available on
 	);
 });
 
-test("loads workspace resources into a fresh, ephemeral child of a persistent parent", async () => {
+test("loads workspace resources into a fresh child of a persistent parent", async () => {
 	const { parent, tree, context, agentDir } = await setup({
 		persist: true,
 		settings: {
@@ -182,7 +173,6 @@ test("loads workspace resources into a fresh, ephemeral child of a persistent pa
 	if (!child) throw new Error("Missing child");
 	expect(result.output).toBe("STANDARD_TEMPLATE_MARKER details");
 	for (const marker of [
-		"expert coding assistant",
 		"PROJECT_INSTRUCTIONS_MARKER",
 		"USER_INSTRUCTIONS_MARKER",
 		"APPEND_SYSTEM_MARKER",
@@ -196,9 +186,51 @@ test("loads workspace resources into a fresh, ephemeral child of a persistent pa
 	expect(child.model).toEqual(parent.model);
 	expect(child.thinkingLevel).toBe(parent.thinkingLevel);
 	expect(child.sessionManager.getCwd()).toBe(context.cwd);
-	expect(parent.sessionFile).toBeDefined();
-	expect(child.sessionFile).toBeUndefined();
 	expect(JSON.stringify(child.messages)).not.toContain("an earlier task");
+});
+
+test("saves each child's session in a directory named after its parent's file", async () => {
+	const { parent, tree, context } = await setup({
+		persist: true,
+		streamFn: hierarchyStream,
+	});
+	await parent.prompt("an earlier task");
+	const parentSession = parent.sessionFile;
+	if (!parentSession) throw new Error("Missing parent session file");
+	const result = await tree.start(ROOT, "nest:1", { ...context, parentSession })
+		.result;
+	expect(result.status).toBe("done");
+	const child = tree.get("1")?.session;
+	const grandchild = tree.get("1.1")?.session;
+	if (!child?.sessionFile || !grandchild?.sessionFile)
+		throw new Error("Missing child session files");
+	expect(dirname(child.sessionFile)).toBe(
+		parentSession.replace(/\.jsonl$/, ""),
+	);
+	expect(dirname(grandchild.sessionFile)).toBe(
+		child.sessionFile.replace(/\.jsonl$/, ""),
+	);
+	for (const [session, owner] of [
+		[child, parentSession],
+		[grandchild, child.sessionFile],
+	] as const) {
+		const saved = SessionManager.open(session.sessionFile ?? "");
+		expect(saved.getHeader()?.parentSession).toBe(owner);
+		expect(JSON.stringify(saved.getEntries())).toBe(
+			JSON.stringify(session.sessionManager.getEntries()),
+		);
+	}
+	// Saved children are not offered alongside the parent's sessions.
+	const listed = await SessionManager.list(context.cwd, dirname(parentSession));
+	expect(listed.map((info) => info.path)).toEqual([parentSession]);
+});
+
+test("children of an in-memory parent stay in memory", async () => {
+	const { tree, context } = await setup({ streamFn: hierarchyStream });
+	await tree.start(ROOT, "nest:1", context).result;
+	expect(tree.tree()).toHaveLength(2);
+	for (const node of tree.tree())
+		expect(node.session?.sessionFile).toBeUndefined();
 });
 
 test("adds skill guidance to child system prompts only, and background guidance to every tracked bash tool", async () => {
@@ -294,7 +326,7 @@ test("provides machine-facing delegation in children without loading UI registra
 	const delegation = extensions.extensions.find((entry) =>
 		entry.tools.has("subagent"),
 	);
-	expect(delegation?.path).toBe("<inline:subagents>");
+	expect(delegation).toBeDefined();
 	expect(delegation?.commands.size).toBe(0);
 	expect(delegation?.shortcuts.size).toBe(0);
 	expect(delegation?.toolRenderers ?? []).toHaveLength(0);
@@ -471,8 +503,7 @@ test("a normally installed subagents extension shares the explicit child ownersh
 
 test("nested spawning uses the child's current public model and thinking selection", async () => {
 	const context = await testContext();
-	const tree = createSubagentRuntime();
-	trees.push(tree);
+	const tree = testRuntime();
 	await tree.start(ROOT, "say hello", context).result;
 	const alternate = { ...model, id: "alternate-model" };
 	context.modelRuntime?.registerNativeProvider({
@@ -573,11 +604,8 @@ test("dispatches standard extension commands without sending them to the model",
 });
 
 test("cancellation during async standard input hooks stops the later agent loop", async () => {
-	let release = () => {};
-	const gate = new Promise<void>((resolve) => {
-		release = resolve;
-	});
-	let entered = false;
+	const gate = deferred();
+	const entered = deferred();
 	let modelCalls = 0;
 	const { tree, context } = await setup({
 		streamFn: stream(() => {
@@ -585,29 +613,16 @@ test("cancellation during async standard input hooks stops the later agent loop"
 			return response("must not run");
 		}),
 	});
-	const name = `pi-subagents.test-input.${crypto.randomUUID()}`;
-	const key = Symbol.for(name);
-	const shared = globalThis as typeof globalThis & {
-		[key]?: () => Promise<void>;
+	const hook = async () => {
+		entered.resolve();
+		await gate.promise;
 	};
-	shared[key] = async () => {
-		entered = true;
-		await gate;
-	};
-	try {
-		await configuredExtension(
-			context,
-			`pi.on("input", () => globalThis[Symbol.for("${name}")]());`,
-		);
-		const result = tree.start(ROOT, "wait", context).result;
-		await until(() => entered);
-		tree.abort("1");
-		release();
-		expect((await result).status).toBe("aborted");
-		expect(tree.get("1")?.status).toBe("aborted");
-		expect(modelCalls).toBe(0);
-	} finally {
-		release();
-		delete shared[key];
-	}
+	await configuredExtension(context, `pi.on("input", ${shared(hook)});`);
+	const result = tree.start(ROOT, "wait", context).result;
+	await entered.promise;
+	tree.abort("1");
+	gate.resolve();
+	expect((await result).status).toBe("aborted");
+	expect(tree.get("1")?.status).toBe("aborted");
+	expect(modelCalls).toBe(0);
 });

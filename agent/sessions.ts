@@ -53,7 +53,22 @@ export function spawnContext(
 		model: model ? resolveModel(ctx, model) : ctx.model,
 		thinkingLevel: effort ?? ctx.thinkingLevel,
 		projectTrusted: ctx.isProjectTrusted(),
+		parentSession: ctx.sessionManager.getSessionFile(),
 	};
+}
+
+/** Children are saved beside their parent's file, in a directory named after it,
+ * so the hierarchy mirrors delegation and stays out of Pi's session lists.
+ * Saved transcripts are records only: delegated runs do not survive a restart.
+ */
+function childSessionManager({
+	cwd,
+	parentSession,
+}: SpawnContext): SessionManager {
+	if (!parentSession) return SessionManager.inMemory(cwd);
+	const stem = parentSession.replace(/\.jsonl$/, "");
+	const directory = stem === parentSession ? `${stem}.subagents` : stem;
+	return SessionManager.create(cwd, directory, { parentSession });
 }
 
 function resolveModel(ctx: ExtensionContext, reference: string): Model<Api> {
@@ -137,7 +152,7 @@ export async function createChildSession(
 		],
 	});
 	await resourceLoader.reload();
-	const sessionManager = SessionManager.inMemory(context.cwd);
+	const sessionManager = childSessionManager(context);
 	const { session } = await createAgentSession({
 		cwd: context.cwd,
 		agentDir,

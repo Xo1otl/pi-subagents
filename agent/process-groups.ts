@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { setTimeout } from "node:timers/promises";
 import { promisify } from "node:util";
+import { hasErrorCode } from "../runtime/errors.ts";
 
 const exec = promisify(execFile);
 
@@ -38,7 +39,7 @@ export async function isProcessGroupActive(
 	try {
 		process.kill(-pgid, 0);
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+		if (hasErrorCode(error, "ESRCH")) return false;
 		throw error;
 	}
 	const { stdout } = await exec("ps", ["-A", "-o", "pgid=,stat="], {

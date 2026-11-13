@@ -1,8 +1,8 @@
-import { afterEach, expect, test } from "bun:test";
+import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { readFile, rm } from "node:fs/promises";
 import { dirname } from "node:path";
-import type { Provider, Usage } from "@earendil-works/pi-ai";
+import { contentText, type Provider, type Usage } from "@earendil-works/pi-ai";
 import {
 	type AgentSession,
 	DEFAULT_MAX_BYTES,
@@ -26,12 +26,16 @@ import { ROOT, type Subagents } from "../runtime/index.ts";
 import { SUBAGENT_USAGE_KIND } from "../runtime/summary.ts";
 import {
 	backgroundJob,
+	completionOutput,
 	deferred,
 	lastCustomMessage,
 	lastText,
 	model,
+	onCleanup,
 	parentSession,
+	replies,
 	response,
+	rootSession,
 	stream,
 	testProvider,
 	toolCall,
@@ -39,72 +43,25 @@ import {
 	waiting,
 } from "./fixtures.ts";
 
-const parents: { session: AgentSession; tree: Subagents }[] = [];
-const releaseGates: (() => void)[] = [];
-const outputDirectories: string[] = [];
-function gate() {
-	const result = deferred();
-	releaseGates.push(() => result.resolve());
-	return result;
-}
-
-afterEach(async () => {
-	for (const release of releaseGates.splice(0)) release();
-	for (const { session, tree } of parents.splice(0)) {
-		try {
-			await session.extensionRunner.emit({
-				type: "session_shutdown",
-				reason: "quit",
-			});
-		} catch {
-			/* A test may have deliberately invalidated the runner. */
-		}
-		await tree.dispose();
-		session.dispose();
-	}
-	await Promise.all(
-		outputDirectories
-			.splice(0)
-			.map((path) => rm(path, { recursive: true, force: true })),
-	);
-});
-
-/** A root integration whose view exposes the runtime bound to the current session. */
-function rootIntegration(view: Partial<SubagentView> = {}) {
-	let tool!: ReturnType<typeof createSubagentIntegration>;
-	let bound: Subagents | undefined;
-	const factory: ExtensionFactory = (pi) => {
-		tool = createSubagentIntegration(pi, {
-			bind(runtime, ctx) {
-				bound = runtime;
-				view.bind?.(runtime, ctx);
-			},
-			dispose: () => view.dispose?.(),
-		});
-		pi.registerTool(tool);
-	};
-	const runtime = () => {
-		if (!bound) throw new Error("Missing runtime");
-		return bound;
-	};
-	return { factory, tool: () => tool, runtime };
-}
-
 async function setup(
-	dispatch: Provider["streamSimple"],
+	streamFn: Provider["streamSimple"],
 	onChildStart?: (ctx: ExtensionContext) => Promise<void>,
 	hooks: { parent?: ExtensionFactory; child?: ExtensionFactory } = {},
 ) {
-	const root = rootIntegration();
-	const session = await parentSession(
-		dispatch,
-		[...(hooks.parent ? [hooks.parent] : []), root.factory],
+	return rootSession({
+		streamFn,
 		onChildStart,
-		hooks.child,
-	);
-	const tree = root.runtime();
-	parents.push({ session, tree });
-	return { session, tree, tool: root.tool, runtime: root.runtime };
+		onChildLoad: hooks.child,
+		extensions: hooks.parent ? [hooks.parent] : [],
+	});
+}
+
+function charges(session: AgentSession) {
+	return session.sessionManager
+		.getEntries()
+		.filter(
+			(entry) => entry.type === "usage" && entry.kind === SUBAGENT_USAGE_KIND,
+		);
 }
 
 function completions(session: AgentSession) {
@@ -132,15 +89,9 @@ const defaultDispatch = stream((context) => {
 });
 
 test("the tool starts the child with the requested effort and rejects unknown models", async () => {
-	const { session, tree, tool } = await setup(defaultDispatch);
+	const { session, tree, execute: call } = await setup(defaultDispatch);
 	const execute = (args: { model?: string; effort?: "low" }) =>
-		tool().execute(
-			"configured",
-			{ instructions: "child task", ...args },
-			undefined,
-			undefined,
-			session.extensionRunner.createToolContext("configured", undefined),
-		);
+		call("configured", { instructions: "child task", ...args });
 	await expect(execute({ model: "missing" })).rejects.toThrow(
 		'Unknown model "missing"',
 	);
@@ -183,17 +134,16 @@ test("nohup completion notifies the parent once, with the child's last assistant
 	await job.release();
 	await until(() => completions(session).length === 1 && session.isIdle);
 	expect(existsSync(job.finished)).toBe(true);
-	expect(completions(session)[0]?.content).toEqual([
-		{ type: "text", text: "Subagent 1 done." },
-		{ type: "text", text: "child result restated" },
-	]);
+	const [completion] = completions(session);
+	if (!completion) throw new Error("Missing completion");
+	expect(completionOutput(completion)).toBe("child result restated");
 	expect(session.getLastAssistantText()).toBe("completion accepted");
 	await tree.settled(ROOT);
 	expect(completions(session)).toHaveLength(1);
 });
 
 test("root returns a receipt and accepts another prompt while child session initialization is blocked", async () => {
-	const initialized = gate();
+	const initialized = deferred();
 	let initializing = false;
 	const { session, tree } = await setup(defaultDispatch, async () => {
 		initializing = true;
@@ -224,19 +174,13 @@ test("root returns a receipt and accepts another prompt while child session init
 	});
 	expect(session.getLastAssistantText()).toBe("completion accepted");
 	expect(session.getSessionStats().tokens.total).toBe(15);
-	expect(
-		session.sessionManager
-			.getEntries()
-			.filter(
-				(entry) => entry.type === "usage" && entry.kind === SUBAGENT_USAGE_KIND,
-			),
-	).toHaveLength(1);
+	expect(charges(session)).toHaveLength(1);
 });
 
 test.each(["initializing", "running"] as const)(
 	"changing the parent model while a child is %s keeps the child independent and delivers its result",
 	async (phase) => {
-		const child = gate();
+		const child = deferred();
 		let blocked = false;
 		const alternate = {
 			...model,
@@ -305,8 +249,8 @@ test.each(["initializing", "running"] as const)(
 );
 
 test("completion is a follow-up to a busy parent's newer prompt, not an interruption", async () => {
-	const child = gate();
-	const parent = gate();
+	const child = deferred();
+	const parent = deferred();
 	let childRunning = false;
 	let parentRunning = false;
 	let completionRequests = 0;
@@ -343,14 +287,7 @@ test("completion is a follow-up to a busy parent's newer prompt, not an interrup
 	await busy;
 	await session.waitForIdle();
 	expect(completions(session)).toHaveLength(1);
-	const texts = session.messages.flatMap((message) =>
-		message.role === "assistant"
-			? message.content.flatMap((part) =>
-					part.type === "text" ? [part.text] : [],
-				)
-			: [],
-	);
-	expect(texts.slice(-2)).toEqual([
+	expect(replies(session.messages).slice(-2)).toEqual([
 		"newer prompt finished",
 		"completion accepted",
 	]);
@@ -378,7 +315,7 @@ test("provider errors are delivered after the receipt with usage and a terminal 
 });
 
 test("an already-aborted tool call rejects, but aborting its signal after receipt does not cancel the detached job", async () => {
-	const child = gate();
+	const child = deferred();
 	let running = false;
 	let aborted = false;
 	const dispatch = stream(async (context, options) => {
@@ -392,26 +329,20 @@ test("an already-aborted tool call rejects, but aborting its signal after receip
 		}
 		return defaultDispatch(model, context, options).result();
 	});
-	const { session, tree, tool } = await setup(dispatch);
-	const cancelled = new AbortController();
-	cancelled.abort(new Error("already cancelled"));
+	const { session, tree, execute } = await setup(dispatch);
 	await expect(
-		tool().execute(
+		execute(
 			"rejected",
 			{ instructions: "child task" },
-			cancelled.signal,
-			undefined,
-			session.extensionRunner.createToolContext("rejected", cancelled.signal),
+			AbortSignal.abort(new Error("already cancelled")),
 		),
 	).rejects.toThrow("already cancelled");
 	expect(tree.tree()).toHaveLength(0);
 	const controller = new AbortController();
-	const receipt = await tool().execute(
+	const receipt = await execute(
 		"detached",
 		{ instructions: "child task" },
 		controller.signal,
-		undefined,
-		session.extensionRunner.createToolContext("detached", controller.signal),
 	);
 	expect(receipt.details).toMatchObject({ id: "1", status: "running" });
 	controller.abort();
@@ -429,7 +360,7 @@ test("an already-aborted tool call rejects, but aborting its signal after receip
 });
 
 test("interrupting the originating parent leaves the child running and still delivers its result", async () => {
-	const child = gate();
+	const child = deferred();
 	let childRunning = false;
 	const dispatch = stream(async (context, options) => {
 		const text = lastText(context);
@@ -460,18 +391,12 @@ test("interrupting the originating parent leaves the child running and still del
 	await until(() => completions(session).length === 1 && session.isIdle);
 	expect(completionDetails(session)).toMatchObject({ id: "1", status: "done" });
 	expect(session.getLastAssistantText()).toBe("completion accepted");
-	expect(
-		session.sessionManager
-			.getEntries()
-			.filter(
-				(entry) => entry.type === "usage" && entry.kind === SUBAGENT_USAGE_KIND,
-			),
-	).toHaveLength(1);
+	expect(charges(session)).toHaveLength(1);
 });
 
 test("a result arriving during an interrupt is kept without restarting the turn", async () => {
-	const child = gate();
-	const agentEnd = gate();
+	const child = deferred();
+	const agentEnd = deferred();
 	const ending = deferred();
 	let childRunning = false;
 	let parentRunning = false;
@@ -535,7 +460,7 @@ test("a result arriving during an interrupt is kept without restarting the turn"
 });
 
 test("a result waiting for a busy parent survives an interrupt", async () => {
-	const child = gate();
+	const child = deferred();
 	let childRunning = false;
 	let parentRunning = false;
 	let completionRequests = 0;
@@ -570,7 +495,7 @@ test("a result waiting for a busy parent survives an interrupt", async () => {
 });
 
 test("results held by a busy parent are released together, starting one turn", async () => {
-	const parent = gate();
+	const parent = deferred();
 	let parentRunning = false;
 	let completionRequests = 0;
 	let children = 0;
@@ -620,7 +545,7 @@ test("results held by a busy parent are released together, starting one turn", a
 });
 
 test("a one-shot root settles only after delegated results are delivered and answered", async () => {
-	const child = gate();
+	const child = deferred();
 	const dispatch = stream(async (context, options) => {
 		if (lastText(context) === "child task") {
 			await Promise.race([child.promise, waiting(options?.signal)]);
@@ -628,16 +553,10 @@ test("a one-shot root settles only after delegated results are delivered and ans
 		}
 		return defaultDispatch(model, context, options).result();
 	});
-	const root = rootIntegration();
-	const session = await parentSession(
-		dispatch,
-		[root.factory],
-		undefined,
-		undefined,
-		"print",
-	);
-	const tree = root.runtime();
-	parents.push({ session, tree });
+	const { session, tree } = await rootSession({
+		streamFn: dispatch,
+		mode: "print",
+	});
 	let finished = false;
 	const prompt = session.prompt("delegate").then(() => {
 		finished = true;
@@ -654,7 +573,7 @@ test("a one-shot root settles only after delegated results are delivered and ans
 });
 
 test("accounting preserves other extensions' boundary drafts both with and without completion metadata", async () => {
-	const child = gate();
+	const child = deferred();
 	const { session } = await setup(defaultDispatch, async () => child.promise, {
 		parent: (pi) => {
 			pi.on("turn_end", (event) => ({
@@ -688,8 +607,8 @@ test("accounting preserves other extensions' boundary drafts both with and witho
 test.each([false, true])(
 	"an accepted steering input hook is included in settlement (disposal: %s)",
 	async (dispose) => {
-		const original = gate();
-		const input = gate();
+		const original = deferred();
+		const input = deferred();
 		const entered = deferred();
 		let running = false;
 		const dispatch = stream(async (context, options) => {
@@ -766,7 +685,7 @@ test.each([false, true])(
 );
 
 test("headless extension command failures become run errors rather than successful empty results", async () => {
-	const { session, tree, tool } = await setup(defaultDispatch, undefined, {
+	const { session, tree, execute } = await setup(defaultDispatch, undefined, {
 		child: (pi) => {
 			pi.registerCommand("fail", {
 				description: "Fail deterministically",
@@ -776,13 +695,7 @@ test("headless extension command failures become run errors rather than successf
 			});
 		},
 	});
-	await tool().execute(
-		"command",
-		{ instructions: "/fail" },
-		undefined,
-		undefined,
-		session.extensionRunner.createToolContext("command", undefined),
-	);
+	await execute("command", { instructions: "/fail" });
 	await until(() => completions(session).length === 1 && session.isIdle);
 	expect(completionDetails(session)).toMatchObject({
 		status: "error",
@@ -792,7 +705,7 @@ test("headless extension command failures become run errors rather than successf
 });
 
 test("disposing a parent without session_shutdown suppresses delivery through its stale extension context", async () => {
-	const child = gate();
+	const child = deferred();
 	const { session, tree } = await setup(defaultDispatch, async () => {
 		await child.promise;
 	});
@@ -802,13 +715,7 @@ test("disposing a parent without session_shutdown suppresses delivery through it
 	await until(() => tree.get("1")?.status === "done");
 	await tree.dispose();
 	expect(completions(session)).toHaveLength(0);
-	expect(
-		session.sessionManager
-			.getEntries()
-			.filter(
-				(entry) => entry.type === "usage" && entry.kind === SUBAGENT_USAGE_KIND,
-			),
-	).toHaveLength(1);
+	expect(charges(session)).toHaveLength(1);
 });
 
 test("shutdown preserves billed child usage in the old parent's ledger without triggering a late turn", async () => {
@@ -841,7 +748,7 @@ test("shutdown preserves billed child usage in the old parent's ledger without t
 });
 
 test("session_start replacement without prior shutdown also fences pending results", async () => {
-	const child = gate();
+	const child = deferred();
 	const { session, tree, runtime } = await setup(defaultDispatch, async () => {
 		await child.promise;
 	});
@@ -856,11 +763,10 @@ test("session_start replacement without prior shutdown also fences pending resul
 	expect(runtime()).not.toBe(tree);
 	await session.prompt("another prompt");
 	expect(completions(session)).toHaveLength(0);
-	await runtime().dispose();
 });
 
 test("reload cancels and fences old results while the reloaded integration can spawn again", async () => {
-	const child = gate();
+	const child = deferred();
 	const { session, tree, runtime } = await setup(defaultDispatch, async () => {
 		await child.promise;
 	});
@@ -874,7 +780,6 @@ test("reload cancels and fences old results while the reloaded integration can s
 	await until(() => completions(session).length === 1 && session.isIdle);
 	expect(completionDetails(session)).toMatchObject({ id: "1", status: "done" });
 	expect(runtime()).not.toBe(tree);
-	await runtime().dispose();
 });
 
 test("completion output is bounded with full output saved, and rich usage is billed once outside the receipt", async () => {
@@ -899,15 +804,13 @@ test("completion output is bounded with full output saved, and rich usage is bil
 	const completion = completions(session)[0];
 	const details = completionDetails(session);
 	if (!details.fullOutputPath) throw new Error("Missing full output file");
-	outputDirectories.push(dirname(details.fullOutputPath));
+	const { fullOutputPath } = details;
+	onCleanup(() =>
+		rm(dirname(fullOutputPath), { recursive: true, force: true }),
+	);
 	expect(await readFile(details.fullOutputPath, "utf8")).toBe(huge);
-	const content = completion?.content;
-	const text =
-		typeof content === "string"
-			? content
-			: (content
-					?.flatMap((part) => (part.type === "text" ? [part.text] : []))
-					.join("\n") ?? "");
+	if (!completion) throw new Error("Missing completion");
+	const text = contentText(completion.content);
 	expect(Buffer.byteLength(text)).toBeLessThanOrEqual(DEFAULT_MAX_BYTES);
 	expect(text.split("\n").length).toBeLessThanOrEqual(DEFAULT_MAX_LINES);
 	expect(text).toContain(details.fullOutputPath);
@@ -960,16 +863,16 @@ test("the view binds only to root sessions and is released before runtime teardo
 			calls.push(`${label} dispose${closed ? " after teardown" : ""}`);
 		},
 	});
-	const session = await parentSession(
-		defaultDispatch,
-		[(pi) => pi.registerTool(createSubagentIntegration(pi, view("root")))],
-		undefined,
+	const session = await parentSession({
+		streamFn: defaultDispatch,
+		extensions: [
+			(pi) => pi.registerTool(createSubagentIntegration(pi, view("root"))),
+		],
 		// A configured installation of the full extension also loads in children.
-		(pi) => void createSubagentIntegration(pi, view("child")),
-	);
+		onChildLoad: (pi) => void createSubagentIntegration(pi, view("child")),
+	});
 	const tree = bound.get("root");
 	if (!tree) throw new Error("Missing root runtime");
-	parents.push({ session, tree });
 	expect(calls).toEqual(["root dispose", "root bind"]);
 	await session.prompt("delegate");
 	await until(() => completions(session).length === 1 && session.isIdle);
@@ -989,53 +892,43 @@ test.each(["session_start", "session_shutdown"] as const)(
 	"%s cleans up the runtime even when view disposal throws",
 	async (event) => {
 		let failDispose = false;
-		const root = rootIntegration({
-			dispose() {
-				if (failDispose) throw new Error("view cleanup failed");
+		const { session, tree, runtime, execute } = await rootSession({
+			streamFn: stream((context, options) =>
+				lastText(context) === "child task"
+					? waiting(options?.signal)
+					: defaultDispatch(model, context, options).result(),
+			),
+			view: {
+				dispose() {
+					if (failDispose) throw new Error("view cleanup failed");
+				},
 			},
 		});
-		const dispatch = stream((context, options) =>
-			lastText(context) === "child task"
-				? waiting(options?.signal)
-				: defaultDispatch(model, context, options).result(),
-		);
-		const session = await parentSession(dispatch, [root.factory]);
-		const tree = root.runtime();
-		parents.push({ session, tree });
 		const errors: string[] = [];
 		const unsubscribe = session.extensionRunner.onError((error) => {
 			errors.push(error.error);
 		});
-		try {
-			await session.prompt("delegate");
-			await until(() => Boolean(tree.get("1")?.session?.isStreaming));
-			const child = tree.get("1");
-			failDispose = true;
-			if (event === "session_start")
-				await session.extensionRunner.emit({ type: event, reason: "new" });
-			else await session.extensionRunner.emit({ type: event, reason: "quit" });
-			expect(tree.closed).toBe(true);
-			expect(tree.tree()).toHaveLength(0);
-			expect(child?.status).toBe("aborted");
-			expect(child?.session?.isStreaming).toBe(false);
-			// The binding is gone: no rebind, and the tool refuses new work.
-			expect(root.runtime()).toBe(tree);
-			await expect(
-				root
-					.tool()
-					.execute(
-						"late",
-						{ instructions: "child task" },
-						undefined,
-						undefined,
-						session.extensionRunner.createToolContext("late", undefined),
-					),
-			).rejects.toThrow("no longer active");
-			expect(completions(session)).toHaveLength(0);
-			expect(errors).toEqual(["view cleanup failed"]);
-		} finally {
+		onCleanup(() => {
 			failDispose = false;
 			unsubscribe();
-		}
+		});
+		await session.prompt("delegate");
+		await until(() => Boolean(tree.get("1")?.session?.isStreaming));
+		const child = tree.get("1");
+		failDispose = true;
+		if (event === "session_start")
+			await session.extensionRunner.emit({ type: event, reason: "new" });
+		else await session.extensionRunner.emit({ type: event, reason: "quit" });
+		expect(tree.closed).toBe(true);
+		expect(tree.tree()).toHaveLength(0);
+		expect(child?.status).toBe("aborted");
+		expect(child?.session?.isStreaming).toBe(false);
+		// The binding is gone: no rebind, and the tool refuses new work.
+		expect(runtime()).toBe(tree);
+		await expect(
+			execute("late", { instructions: "child task" }),
+		).rejects.toThrow("no longer active");
+		expect(completions(session)).toHaveLength(0);
+		expect(errors).toEqual(["view cleanup failed"]);
 	},
 );

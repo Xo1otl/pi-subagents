@@ -15,6 +15,32 @@ export interface RunSummary {
 	usage: Usage;
 }
 
+const TOKEN_KEYS = [
+	"input",
+	"output",
+	"cacheRead",
+	"cacheWrite",
+	"totalTokens",
+] as const;
+const OPTIONAL_TOKEN_KEYS = ["reasoning", "cacheWrite1h"] as const;
+const COST_KEYS = [
+	"input",
+	"output",
+	"cacheRead",
+	"cacheWrite",
+	"total",
+] as const;
+
+/** The charge an entry records: a model response, a tool's own, or a usage entry. */
+function entryUsage(entry: SessionEntry): Usage | undefined {
+	if (entry.type !== "message")
+		return "usage" in entry ? entry.usage : undefined;
+	const { message } = entry;
+	return message.role === "assistant" || message.role === "toolResult"
+		? message.usage
+		: undefined;
+}
+
 /** Raw entries are the single source of billing, including descendant charges. */
 function summarizeUsage(
 	entries: readonly SessionEntry[],
@@ -31,31 +57,12 @@ function summarizeUsage(
 	for (const entry of entries) {
 		if (ownOnly && entry.type === "usage" && entry.kind === SUBAGENT_USAGE_KIND)
 			continue;
-		const used =
-			entry.type === "message"
-				? (entry.message.role === "assistant" ||
-						entry.message.role === "toolResult") &&
-					entry.message.usage
-				: "usage" in entry && entry.usage;
+		const used = entryUsage(entry);
 		if (!used) continue;
-		usage.input += used.input;
-		usage.output += used.output;
-		usage.cacheRead += used.cacheRead;
-		usage.cacheWrite += used.cacheWrite;
-		usage.totalTokens += used.totalTokens;
-		if (used.reasoning !== undefined)
-			usage.reasoning = (usage.reasoning ?? 0) + used.reasoning;
-		if (used.cacheWrite1h !== undefined)
-			usage.cacheWrite1h = (usage.cacheWrite1h ?? 0) + used.cacheWrite1h;
-		for (const key of [
-			"input",
-			"output",
-			"cacheRead",
-			"cacheWrite",
-			"total",
-		] as const) {
-			usage.cost[key] += used.cost[key];
-		}
+		for (const key of TOKEN_KEYS) usage[key] += used[key];
+		for (const key of OPTIONAL_TOKEN_KEYS)
+			if (used[key] !== undefined) usage[key] = (usage[key] ?? 0) + used[key];
+		for (const key of COST_KEYS) usage.cost[key] += used.cost[key];
 	}
 	return usage;
 }

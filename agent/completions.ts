@@ -6,6 +6,7 @@ import {
 	DEFAULT_MAX_LINES,
 	truncateHead,
 } from "@earendil-works/pi-coding-agent";
+import { errorMessage } from "../runtime/errors.ts";
 import type { SubagentResult } from "../runtime/index.ts";
 import {
 	SUBAGENT_RESULT_TYPE,
@@ -40,7 +41,7 @@ async function boundedOutput(
 		};
 	} catch (error) {
 		// A failed temp-file write must not lose completion or usage accounting.
-		const reason = error instanceof Error ? error.message : String(error);
+		const reason = errorMessage(error);
 		return {
 			text: `${truncated.content}\n[Could not save full output: ${truncateHead(reason, { maxBytes: 256, maxLines: 1 }).content}]`,
 		};

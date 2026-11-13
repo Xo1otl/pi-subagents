@@ -1,3 +1,4 @@
+import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import {
 	getMarkdownTheme,
 	sessionEntryToContextMessages,
@@ -29,15 +30,15 @@ interface Block {
 	nested?: boolean;
 }
 
-function contentText(content: unknown): string {
+/** Like pi-ai's contentText, but images leave a visible placeholder. */
+function displayText(
+	content: string | readonly (TextContent | ImageContent)[] | undefined,
+): string {
 	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-	return content
-		.map((part) => {
-			if (part.type === "text") return part.text;
-			if (part.type === "image") return `[image: ${part.mimeType}]`;
-			return "";
-		})
+	return (content ?? [])
+		.map((part) =>
+			part.type === "text" ? part.text : `[image: ${part.mimeType}]`,
+		)
 		.filter(Boolean)
 		.join("\n");
 }
@@ -84,7 +85,7 @@ function transcriptBlocks(node: Subagent): Block[] {
 			kind: "tool",
 			label: name,
 			args: args ?? live?.args,
-			text: contentText(result?.content ?? live?.result?.content),
+			text: displayText(result?.content ?? live?.result?.content),
 			status: result
 				? result.isError
 					? "error"
@@ -143,7 +144,7 @@ function transcriptBlocks(node: Subagent): Block[] {
 				kind: "message",
 				label: message.role === "custom" ? message.customType : message.role,
 				text:
-					"content" in message ? contentText(message.content) : message.summary,
+					"content" in message ? displayText(message.content) : message.summary,
 			});
 		}
 	}
@@ -157,26 +158,28 @@ function transcriptBlocks(node: Subagent): Block[] {
 			Boolean(live.parentToolCallId),
 		);
 	// Sent input stays visible while it waits, e.g. for a long-running tool.
-	node.queuedInput.forEach((text, index) => {
+	for (const [index, text] of node.queuedInput.entries())
 		blocks.push({
 			id: `queued:${index}`,
 			kind: "queued",
 			label: "queued · delivered after the current step",
 			text,
 		});
-	});
 	return blocks;
 }
 
+/** The argument that identifies a call at a glance, e.g. a command or path. */
 function argumentPreview(args: unknown): string {
 	if (!args || typeof args !== "object") return "";
-	for (const key of ["command", "path", "instructions", "pattern"] as const)
-		if (key in args)
-			return String((args as Record<string, unknown>)[key]).replace(
-				/\s+/g,
-				" ",
-			);
+	for (const key of ["command", "path", "instructions", "pattern"])
+		if (key in args) return String((args as Record<string, unknown>)[key]);
 	return "";
+}
+
+const BLOCK_FIELDS = ["text", "label", "status", "args", "nested"] as const;
+
+function sameBlock(a: Block, b: Block): boolean {
+	return BLOCK_FIELDS.every((field) => a[field] === b[field]);
 }
 
 function renderBlock(
@@ -266,25 +269,19 @@ export function createTranscriptRenderer(theme: UITheme) {
 					preferences.toolExpanded.get(block.id) ?? preferences.expandTools;
 				const cached = cache.get(block.id);
 				const lines =
-					cached &&
-					cached.width === width &&
+					cached?.width === width &&
 					cached.expanded === expanded &&
-					cached.block.text === block.text &&
-					cached.block.label === block.label &&
-					cached.block.status === block.status &&
-					cached.block.args === block.args &&
-					cached.block.nested === block.nested
+					sameBlock(cached.block, block)
 						? cached.lines
 						: renderBlock(block, width, theme, expanded);
 				next.set(block.id, { block, width, expanded, lines });
 				if (rows.length) rows.push({ text: "" });
-				lines.forEach((text, offset) => {
+				for (const [offset, text] of lines.entries())
 					rows.push({
 						text: truncateToWidth(text, width, ""),
 						toolId:
 							block.kind === "tool" && offset === 0 ? block.id : undefined,
 					});
-				});
 			}
 			cache = next;
 			if (!rows.length)

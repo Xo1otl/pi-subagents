@@ -6,6 +6,7 @@ import type {
 	TuiMouseEvent,
 	TuiMouseEventResult,
 } from "@earendil-works/pi-tui";
+import { errorMessage } from "../runtime/errors.ts";
 import type { Subagent, Subagents } from "../runtime/index.ts";
 import { ChatEditor } from "./composer.ts";
 import { readContextUsage, renderContextUsage } from "./context-usage.ts";
@@ -124,7 +125,7 @@ export function createChat({
 		error = "";
 		void runtime.send(id, text).catch((cause: unknown) => {
 			if (disposed) return;
-			error = cause instanceof Error ? cause.message : String(cause);
+			error = errorMessage(cause);
 			// Preserve failed input, without replacing a newer draft.
 			if (!editor.getText()) editor.setText(text);
 			tui.requestRender();

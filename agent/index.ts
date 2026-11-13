@@ -9,6 +9,7 @@ import {
 	type SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { errorMessage } from "../runtime/errors.ts";
 import {
 	createSubagents,
 	ROOT,
@@ -53,13 +54,7 @@ export function createSubagentRuntime(
 	return createSubagents({
 		rootSessionManager,
 		createSession: (context, owner, onCreated, onError) =>
-			createChildSession(
-				context,
-				owner,
-				onCreated,
-				onError,
-				subagentsExtension,
-			),
+			createChildSession(context, owner, onCreated, onError, headlessExtension),
 		resumeSession: resumeChildSession,
 		disposeSession: disposeChildSession,
 	});
@@ -91,10 +86,6 @@ interface SessionBinding {
 	held: Notice[];
 	/** A one-shot root holds notices until all of its background work has finished. */
 	awaitingResults: boolean;
-}
-
-function errorMessage(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
 }
 
 /** Wire Pi's lifecycle and return the undecorated, machine-facing tool. */
@@ -158,7 +149,7 @@ export function createSubagentIntegration(
 	/** Persist held root notices in order; only the last may start a turn. */
 	function release(source: SessionBinding, triggerTurn: boolean): void {
 		const messages = source.held.splice(0);
-		messages.forEach((message, index) => {
+		for (const [index, message] of messages.entries()) {
 			const trigger = triggerTurn && index === messages.length - 1;
 			pi.sendMessage<Notice["details"]>(message, {
 				deliverAs: "followUp",
@@ -167,7 +158,7 @@ export function createSubagentIntegration(
 			// An idle session appends an untriggered message at once, without message_end.
 			if (!trigger && message.customType === SUBAGENT_RESULT_TYPE)
 				source.pendingCompletions.delete(message);
-		});
+		}
 	}
 
 	function releaseIfIdle(source: SessionBinding, ctx: ExtensionContext): void {
@@ -439,7 +430,7 @@ export function createSubagentIntegration(
 	});
 }
 
-/** Headless entrypoint for delegated sessions. */
-export default function subagentsExtension(pi: ExtensionAPI): void {
+/** What delegated sessions load: the machine-facing tool, without presentation. */
+function headlessExtension(pi: ExtensionAPI): void {
 	pi.registerTool(createSubagentIntegration(pi));
 }

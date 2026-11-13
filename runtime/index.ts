@@ -1,3 +1,4 @@
+import { setImmediate } from "node:timers/promises";
 import type {
 	AgentToolResult,
 	ThinkingLevel,
@@ -11,6 +12,7 @@ import type {
 	SessionEntry,
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
+import { errorMessage } from "./errors.ts";
 import {
 	type RunSummary,
 	SUBAGENT_USAGE_KIND,
@@ -24,6 +26,8 @@ export interface SpawnContext
 	model: Model<Api>;
 	thinkingLevel?: ThinkingLevel;
 	projectTrusted: boolean;
+	/** The spawning session's file; children of an ephemeral parent stay in memory. */
+	parentSession?: string;
 }
 
 export interface SessionOwner {
@@ -178,7 +182,7 @@ function belongsTo(
 }
 
 function recordError(node: SubagentNode, error: unknown): void {
-	node.error ??= error instanceof Error ? error.message : String(error);
+	node.error ??= errorMessage(error);
 }
 
 /** Merge one execution event into the call's raw snapshot. */
@@ -305,10 +309,8 @@ export function createSubagents({
 		sent: boolean,
 	): Promise<void> {
 		const previous = active.preflight;
-		let resolvePreflight = () => {};
-		active.preflight = new Promise<void>((resolve) => {
-			resolvePreflight = resolve;
-		});
+		const preflight = Promise.withResolvers<void>();
+		active.preflight = preflight.promise;
 		// Sent input is queued until the session queues, starts or handles it.
 		const input = { text: instructions };
 		// Only a user-led run's own input is sent; anything else the user sends
@@ -323,7 +325,7 @@ export function createSubagents({
 			// may still prompt the agent), the user's input interrupted the task.
 			else if (interrupts && disposition && !withdrawn)
 				active.interrupted = true;
-			resolvePreflight();
+			preflight.resolve();
 		};
 		const prompt = previous.then(async () => {
 			try {
@@ -389,18 +391,14 @@ export function createSubagents({
 		node.status = "running";
 		node.error = undefined;
 		node.liveTools.clear();
-		let initialized = () => {};
-		let settle = () => {};
+		const initialization = Promise.withResolvers<void>();
+		const settlement = Promise.withResolvers<void>();
 		// Track the whole delegated run before any lifecycle callback can request shutdown.
 		const active: ActiveRun = {
 			userLed: sent,
 			interrupted: false,
-			preflight: new Promise<void>((resolve) => {
-				initialized = resolve;
-			}),
-			settled: new Promise<void>((resolve) => {
-				settle = resolve;
-			}),
+			preflight: initialization.promise,
+			settled: settlement.promise,
 		};
 		node.run = active;
 		const ledgers: UsageLedger[] = rootLedger ? [rootLedger] : [];
@@ -423,14 +421,14 @@ export function createSubagents({
 		void submit(node, active, instructions, sent);
 		const finish = () => {
 			if (node.run === active) node.run = undefined;
-			settle();
+			settlement.resolve();
 		};
 		try {
 			changed();
 			try {
 				// Let receipt/tool-result microtasks finish before any child initialization,
 				// including a factory's synchronous pre-await work, can occupy the loop.
-				await new Promise<void>((resolve) => setImmediate(resolve));
+				await setImmediate();
 				if (!node.session && !node.cancelled && !closing)
 					await initialize(node);
 				// Earlier cancellation could not stop or clear a session created since.
@@ -440,7 +438,7 @@ export function createSubagents({
 			} catch (error) {
 				recordError(node, error);
 			} finally {
-				initialized();
+				initialization.resolve();
 			}
 
 			let entries: SessionEntry[];
@@ -501,12 +499,9 @@ export function createSubagents({
 				finish();
 				changed();
 			}
-			return {
-				id: node.id,
-				...summary,
-			};
+			return { id: node.id, ...summary };
 		} finally {
-			initialized();
+			initialization.resolve();
 			finish();
 		}
 	}

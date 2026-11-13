@@ -1,7 +1,6 @@
-import { afterEach, expect, test } from "bun:test";
-import type { Provider, Usage } from "@earendil-works/pi-ai";
+import { expect, test } from "bun:test";
+import type { Usage } from "@earendil-works/pi-ai";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
-import { createSubagentIntegration } from "../agent/index.ts";
 import { ROOT, type Subagents } from "../runtime/index.ts";
 import { SUBAGENT_USAGE_KIND } from "../runtime/summary.ts";
 import {
@@ -9,40 +8,12 @@ import {
 	hierarchyStream,
 	lastText,
 	model,
-	parentSession,
 	response,
+	rootSession,
 	stream,
 	until,
 	waiting,
 } from "./fixtures.ts";
-
-const parents: { session: AgentSession; tree: Subagents }[] = [];
-afterEach(async () => {
-	for (const { session, tree } of parents.splice(0)) {
-		await session.extensionRunner.emit({
-			type: "session_shutdown",
-			reason: "quit",
-		});
-		await tree.dispose();
-		session.dispose();
-	}
-});
-
-async function setup(dispatch: Provider["streamSimple"]) {
-	let tree: Subagents | undefined;
-	const view = {
-		bind(runtime: Subagents) {
-			tree = runtime;
-		},
-		dispose() {},
-	};
-	const session = await parentSession(dispatch, [
-		(pi) => pi.registerTool(createSubagentIntegration(pi, view)),
-	]);
-	if (!tree) throw new Error("Missing root runtime");
-	parents.push({ session, tree });
-	return { session, tree };
-}
 
 function charges(session: AgentSession) {
 	return session.sessionManager
@@ -97,7 +68,7 @@ test("resuming an aborted child bills each new run without notifying or rechargi
 		if (text === "resume") return response("resumed", { usage: resumedUsage });
 		return hierarchyStream(model, context, options).result();
 	});
-	const { session, tree } = await setup(dispatch);
+	const { session, tree } = await rootSession({ streamFn: dispatch });
 	await session.prompt("nest:1");
 	await until(() => Boolean(tree.get("1")?.session?.isStreaming));
 	tree.abort("1");
@@ -128,7 +99,7 @@ test("resumed nested descendants bill all idle ancestors exactly once", async ()
 			? response("resumed", { usage: resumedUsage })
 			: hierarchyStream(model, context, options).result(),
 	);
-	const { session, tree } = await setup(dispatch);
+	const { session, tree } = await rootSession({ streamFn: dispatch });
 	await session.prompt("nest:3");
 	await settled(session, tree);
 	const ancestors = [session, tree.get("1")?.session, tree.get("1.1")?.session];
@@ -157,7 +128,7 @@ test("resumed nested descendants bill all idle ancestors exactly once", async ()
 });
 
 test("a resumed parent that delegates again bills only new local and descendant work", async () => {
-	const { session, tree } = await setup(hierarchyStream);
+	const { session, tree } = await rootSession();
 	await session.prompt("nest:2");
 	await settled(session, tree);
 	const parent = tree.get("1")?.session;
@@ -207,46 +178,40 @@ test("a running ancestor drains a resumed descendant through an idle intermediat
 		}
 		return hierarchyStream(model, context, options).result();
 	});
-	const { session, tree } = await setup(dispatch);
+	const { session, tree } = await rootSession({ streamFn: dispatch });
 	await session.prompt("nest:3");
 	await settled(session, tree);
 	let resumed: Promise<void> | undefined;
-	let ancestor: Promise<void> | undefined;
-	let completed = false;
 	let requested = false;
+	let completed = false;
 	const rootBefore = session.getSessionStats();
 	const messages = JSON.stringify(session.messages);
+	// Resume the descendant once its ancestor is running again. Sending notifies
+	// listeners synchronously, so the request is marked before it is made.
 	const unsubscribe = tree.subscribe(() => {
-		if (tree.get("1")?.status === "running" && !requested) {
-			requested = true;
-			resumed = tree.send("1.1.1", "slow resume");
-		}
+		if (tree.get("1")?.status !== "running" || requested) return;
+		requested = true;
+		resumed = tree.send("1.1.1", "slow resume");
 	});
-	try {
-		ancestor = tree.send("1", "continue ancestor").then(() => {
-			completed = true;
-		});
-		await entered.promise;
-		await until(() => Boolean(tree.get("1")?.session?.isIdle));
-		await Bun.sleep(10);
-		expect(completed).toBe(false);
-		gate.resolve();
-		await resumed;
-		await ancestor;
-		expectDelta(session, rootBefore, {
-			...resumedUsage,
-			input: resumedUsage.input + 1,
-			output: resumedUsage.output + 2,
-			totalTokens: resumedUsage.totalTokens + 3,
-			cost: { ...resumedUsage.cost, total: resumedUsage.cost.total + 0.03 },
-		});
-		expect(JSON.stringify(session.messages)).toBe(messages);
-	} finally {
-		unsubscribe();
-		gate.resolve();
-		await resumed;
-		await ancestor;
-	}
+	const ancestor = tree.send("1", "continue ancestor").then(() => {
+		completed = true;
+	});
+	await entered.promise;
+	unsubscribe();
+	await until(() => Boolean(tree.get("1")?.session?.isIdle));
+	await Bun.sleep(10);
+	expect(completed).toBe(false);
+	gate.resolve();
+	await resumed;
+	await ancestor;
+	expectDelta(session, rootBefore, {
+		...resumedUsage,
+		input: resumedUsage.input + 1,
+		output: resumedUsage.output + 2,
+		totalTokens: resumedUsage.totalTokens + 3,
+		cost: { ...resumedUsage.cost, total: resumedUsage.cost.total + 0.03 },
+	});
+	expect(JSON.stringify(session.messages)).toBe(messages);
 });
 
 test("stopping a resumed run preserves its charges without a late parent notification", async () => {
@@ -255,7 +220,7 @@ test("stopping a resumed run preserves its charges without a late parent notific
 			? waiting(options?.signal)
 			: hierarchyStream(model, context, options).result(),
 	);
-	const { session, tree } = await setup(dispatch);
+	const { session, tree } = await rootSession({ streamFn: dispatch });
 	await session.prompt("nest:1");
 	await settled(session, tree);
 	const before = session.getSessionStats();
@@ -270,7 +235,7 @@ test("stopping a resumed run preserves its charges without a late parent notific
 });
 
 test("resumed billing remains fenced from a replacement root ledger", async () => {
-	const { session, tree } = await setup(hierarchyStream);
+	const { session, tree } = await rootSession();
 	await session.prompt("nest:1");
 	await settled(session, tree);
 	const oldId = session.sessionManager.getSessionId();

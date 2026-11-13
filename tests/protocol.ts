@@ -46,17 +46,20 @@ export function lastCustomMessage(
 	return message.customType === customType ? message : undefined;
 }
 
+/** A completion's body follows its attribution block, independently of the
+ * heading's wording or how the model-facing text joins the blocks.
+ */
+export function completionOutput({
+	content,
+}: Pick<CustomMessage, "content">): string {
+	return contentText(typeof content === "string" ? content : content.slice(1));
+}
+
 export function lastCompletion(context: TranscriptContext) {
 	const message = lastCustomMessage(context, SUBAGENT_RESULT_TYPE);
 	if (!message) return undefined;
 	return {
 		...(message.details as SubagentCompletionDetails),
-		// The completion body follows its attribution block, independently of
-		// the heading's wording or how the model-facing text joins the blocks.
-		output: contentText(
-			typeof message.content === "string"
-				? message.content
-				: message.content.slice(1),
-		),
+		output: completionOutput(message),
 	};
 }

@@ -11,6 +11,7 @@ import {
 	SettingsManager,
 	truncateHead,
 } from "@earendil-works/pi-coding-agent";
+import { hasErrorCode } from "../runtime/errors.ts";
 import type { SessionOwner } from "../runtime/index.ts";
 import {
 	isProcessGroupActive,
@@ -71,7 +72,7 @@ async function recordedGroup(path: string): Promise<number | undefined> {
 	try {
 		pid = await readFile(path, "utf8");
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		if (hasErrorCode(error, "ENOENT")) return undefined;
 		throw error;
 	}
 	const pgid = Number(pid.trim());
@@ -100,8 +101,7 @@ export function trackCommands(
 		try {
 			process.kill(-pgid, "SIGKILL");
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ESRCH")
-				host.track(Promise.reject(error), ctx);
+			if (!hasErrorCode(error, "ESRCH")) host.track(Promise.reject(error), ctx);
 		}
 	}
 

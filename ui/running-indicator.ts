@@ -3,6 +3,8 @@ import { truncateToWidth } from "@earendil-works/pi-tui";
 import type { Subagents } from "../runtime/index.ts";
 
 const WIDGET_KEY = "pi-subagents.running";
+/** IDs listed before eliding the rest. */
+const LISTED_IDS = 3;
 
 /** A root-session widget independent of the switcher and the root's own run. */
 export function bindRunningIndicator(
@@ -31,16 +33,17 @@ export function bindRunningIndicator(
 		const stopping = active.filter((node) => node.cancelled).length;
 		const running = active.length - stopping;
 		const counts = [
-			...(running ? [`${running} running`] : []),
-			...(stopping ? [`${stopping} stopping`] : []),
-		].join(" · ");
+			running && `${running} running`,
+			stopping && `${stopping} stopping`,
+		]
+			.filter(Boolean)
+			.join(" · ");
 		const ids = active
-			.slice(0, 3)
+			.slice(0, LISTED_IDS)
 			.map((node) => node.id)
 			.join(", ");
-		const next = active.length
-			? `● Subagents: ${counts} · ${ids}${active.length > 3 ? ", …" : ""}`
-			: "";
+		const more = active.length > LISTED_IDS ? ", …" : "";
+		const next = active.length ? `● Subagents: ${counts} · ${ids}${more}` : "";
 		// Token streaming should not reinstall or redraw an unchanged widget.
 		if (next === summary) return;
 		summary = next;

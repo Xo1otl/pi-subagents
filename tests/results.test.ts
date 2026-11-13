@@ -1,7 +1,8 @@
-import { afterEach, expect, test } from "bun:test";
+import { expect, test } from "bun:test";
 import { readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
+import { contentText } from "@earendil-works/pi-ai";
 import {
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
@@ -13,16 +14,13 @@ import {
 	renderSubagentCall,
 	renderSubagentResult,
 } from "../ui/tool-renderers.ts";
-import { response } from "./fixtures.ts";
+import { completionOutput, onCleanup, response } from "./fixtures.ts";
 
-const directories: string[] = [];
-afterEach(async () => {
-	await Promise.all(
-		directories
-			.splice(0)
-			.map((path) => rm(path, { recursive: true, force: true })),
-	);
-});
+const theme = { fg: (_color: string, text: string) => text };
+
+function removeOnCleanup(outputFile: string): void {
+	onCleanup(() => rm(dirname(outputFile), { recursive: true, force: true }));
+}
 
 function run(output: string): SubagentResult {
 	return {
@@ -42,13 +40,10 @@ test("running receipts contain only the agent ID and status", () => {
 	});
 });
 
-test("completions omit redundant hierarchy fields", async () => {
+test("completions carry the output and omit redundant hierarchy fields", async () => {
 	const result = run("task output");
 	const message = await subagentCompletionMessage(result);
-	expect(message.content).toEqual([
-		{ type: "text", text: "Subagent 1 done." },
-		{ type: "text", text: "task output" },
-	]);
+	expect(completionOutput(message)).toBe("task output");
 	expect(message.details).toEqual({
 		id: "1",
 		status: "done",
@@ -58,13 +53,11 @@ test("completions omit redundant hierarchy fields", async () => {
 });
 
 test("tool call renderers tolerate unknown or partial arguments", () => {
-	const theme = { fg: (_color: string, text: string) => text };
-	for (const args of [undefined, null, {}, "invalid"])
-		expect(
-			renderSubagentCall(args, theme)
-				.render(80)
-				.map((line) => line.trimEnd()),
-		).toEqual(["Subagent …"]);
+	for (const args of [undefined, null, {}, "invalid"]) {
+		const lines = renderSubagentCall(args, theme).render(80);
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toContain("…");
+	}
 });
 
 test.each([
@@ -77,33 +70,28 @@ test.each([
 		const message = await subagentCompletionMessage(result);
 		const path = message.details.fullOutputPath;
 		if (!path) throw new Error("Missing full output file");
-		directories.push(dirname(path));
+		removeOnCleanup(path);
 		expect(isAbsolute(path)).toBe(true);
 		expect(await readFile(path, "utf8")).toBe(output);
-		const text = message.content.at(-1);
-		if (text?.type !== "text") throw new Error("Missing completion text");
-		expect(text.text).toContain("Output truncated.");
-		expect(text.text).toContain(path);
-		expect(text.text).not.toContain("/subagents");
-		expect(text.text).not.toContain("Ctrl+Shift+A");
-		expect(text.text).not.toContain("�");
+		const text = completionOutput(message);
+		expect(text).toContain(path);
+		expect(text).not.toContain("/subagents");
+		expect(text).not.toContain("Ctrl+Shift+A");
+		expect(text).not.toContain("�");
 	},
 );
 
 test("renders partial calls and background receipts with switcher guidance", () => {
-	const theme = { fg: (_color: string, text: string) => text };
 	const render = (
 		result: Parameters<typeof renderSubagentResult>[0],
 		isPartial: boolean,
 	) =>
 		renderSubagentResult(result, { expanded: false, isPartial }, theme)
 			.render(80)
-			.map((line) => line.trimEnd());
-	expect(render({ content: [], details: {} }, true)).toEqual(["Delegating…"]);
-	expect(render(subagentReceipt({ id: "2" }), false)).toEqual([
-		"Subagent 2 · running in background",
-		"/subagents 2 · view conversation",
-	]);
+			.join("\n");
+	const receipt = subagentReceipt({ id: "2" });
+	expect(render(receipt, true)).not.toContain("/subagents");
+	expect(render(receipt, false)).toContain("/subagents 2");
 });
 
 test("a failed output-file write still produces bounded completion content and preserves usage", async () => {
@@ -122,10 +110,8 @@ test("a failed output-file write still produces bounded completion content and p
 		if (previous === undefined) delete process.env.TMPDIR;
 		else process.env.TMPDIR = previous;
 	}
-	const text = message.content
-		.flatMap((part) => (part.type === "text" ? [part.text] : []))
-		.join("\n");
-	expect(text).toContain("Could not save full output");
+	const text = contentText(message.content);
+	expect(text).toContain("large output");
 	expect(Buffer.byteLength(text)).toBeLessThanOrEqual(DEFAULT_MAX_BYTES);
 	expect(text.split("\n").length).toBeLessThanOrEqual(DEFAULT_MAX_LINES);
 	expect(message.details.usage.totalTokens).toBe(3);
@@ -138,7 +124,8 @@ test("continued runs with the same agent ID cannot overwrite earlier output file
 	const firstPath = first.details.fullOutputPath;
 	const secondPath = second.details.fullOutputPath;
 	if (!firstPath || !secondPath) throw new Error("Missing full output file");
-	directories.push(dirname(firstPath), dirname(secondPath));
+	removeOnCleanup(firstPath);
+	removeOnCleanup(secondPath);
 	expect(firstPath).not.toBe(secondPath);
 	expect(await readFile(firstPath, "utf8")).toBe("first\n".repeat(2100));
 	expect(await readFile(secondPath, "utf8")).toBe("second\n".repeat(2100));

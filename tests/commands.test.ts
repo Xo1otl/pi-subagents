@@ -1,11 +1,13 @@
-import { afterEach, expect, spyOn, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { createSubagentRuntime } from "../agent/index.ts";
-import { waitForGroupToFinish } from "../agent/process-groups.ts";
+import {
+	isProcessGroupActive,
+	waitForGroupToFinish,
+} from "../agent/process-groups.ts";
 import {
 	COMMAND_EXIT_TYPE,
 	SUBAGENT_RESULT_TYPE,
@@ -14,26 +16,19 @@ import {
 import { ROOT, type Subagents } from "../runtime/index.ts";
 import {
 	backgroundJob,
+	childExtension,
 	deferred,
 	lastCustomMessage,
 	lastText,
+	onCleanup,
 	response,
+	testRuntime as runtime,
 	spawnContext,
 	stream,
 	toolCall,
 	until,
 	waiting,
 } from "./fixtures.ts";
-
-const runtimes: Subagents[] = [];
-function runtime() {
-	const tree = createSubagentRuntime();
-	runtimes.push(tree);
-	return tree;
-}
-afterEach(async () => {
-	await Promise.all(runtimes.splice(0).map((tree) => tree.dispose()));
-});
 
 const idle = (tree: Subagents) =>
 	tree.get("1")?.session?.isIdle === true &&
@@ -50,8 +45,12 @@ function exits(tree: Subagents) {
 	);
 }
 
-async function group(path: string) {
-	return Number((await readFile(path, "utf8")).trim());
+function kill(pgid: number): void {
+	try {
+		process.kill(-pgid, "SIGKILL");
+	} catch {
+		// Already gone.
+	}
 }
 
 test.each([0, 1, -123, Number.NaN, 1.5, Number.MAX_SAFE_INTEGER + 1])(
@@ -73,24 +72,19 @@ test("waits past shell exit for nohup and resolves when only zombies remain", as
 	const exited = once(child, "exit");
 	const pgid = child.pid;
 	if (!pgid) throw new Error("Missing child pid");
-	try {
-		await exited;
-		let completed = false;
-		const waiting = waitForGroupToFinish(pgid).then(() => {
-			completed = true;
-		});
-		await Bun.sleep(150);
-		expect(completed).toBe(false);
-		await job.release();
-		await waiting;
-		expect(existsSync(job.finished)).toBe(true);
-	} finally {
-		try {
-			process.kill(-pgid, "SIGKILL");
-		} catch {
-			/* Already gone. */
-		}
-	}
+	onCleanup(() => kill(pgid));
+	await exited;
+	expect(await isProcessGroupActive(pgid)).toBe(true);
+	let completed = false;
+	const waiting = waitForGroupToFinish(pgid).then(() => {
+		completed = true;
+	});
+	// Several polls, while the job outlives its shell.
+	await Bun.sleep(150);
+	expect(completed).toBe(false);
+	await job.release();
+	await waiting;
+	expect(existsSync(job.finished)).toBe(true);
 });
 
 test("group waiting can be cancelled", async () => {
@@ -98,15 +92,14 @@ test("group waiting can be cancelled", async () => {
 	const exited = once(child, "exit");
 	const pgid = child.pid;
 	if (!pgid) throw new Error("Missing child pid");
-	const controller = new AbortController();
-	try {
-		const waiting = waitForGroupToFinish(pgid, controller.signal);
-		controller.abort();
-		await expect(waiting).rejects.toThrow();
-	} finally {
-		process.kill(-pgid, "SIGKILL");
+	onCleanup(async () => {
+		kill(pgid);
 		await exited;
-	}
+	});
+	const controller = new AbortController();
+	const waiting = waitForGroupToFinish(pgid, controller.signal);
+	controller.abort();
+	await expect(waiting).rejects.toThrow();
 });
 
 test.each(["nohup", ""])(
@@ -137,7 +130,7 @@ test.each(["nohup", ""])(
 		await tree.send("1", "second");
 		expect(tree.get("1")?.status).toBe("running");
 		await first.release();
-		await waitForGroupToFinish(await group(first.group));
+		await waitForGroupToFinish(await first.pgid());
 		await until(() => exits(tree).length === 1 && idle(tree));
 		expect(tree.get("1")?.status).toBe("running");
 		await tree.send("1", "last assistant reply");
@@ -174,7 +167,7 @@ test("command completion does not report a busy session's previous reply", async
 	const sent = tree.send("1", "still thinking");
 	await until(() => tree.get("1")?.session?.isIdle === false);
 	await job.release();
-	await waitForGroupToFinish(await group(job.group));
+	await waitForGroupToFinish(await job.pgid());
 	await until(() => tree.get("1")?.session?.agent.hasQueuedMessages() === true);
 	expect(tree.get("1")?.status).toBe("running");
 	reply.resolve();
@@ -199,7 +192,7 @@ test.each(["abort", "dispose"] as const)(
 		const job = backgroundJob(context.cwd, "stop");
 		const started = tree.start(ROOT, "start", context);
 		await until(() => idle(tree));
-		const pgid = await group(job.group);
+		const pgid = await job.pgid();
 		if (action === "abort") tree.abort("1");
 		else await tree.dispose();
 		expect((await started.result).status).toBe("aborted");
@@ -245,7 +238,7 @@ test.each(["command", "child"] as const)(
 		await until(() => idle(tree) && tree.get("1.1")?.session?.isIdle === false);
 		if (first === "command") {
 			await job.release();
-			await waitForGroupToFinish(await group(job.group));
+			await waitForGroupToFinish(await job.pgid());
 			await until(() => exits(tree).length === 1 && idle(tree));
 		} else {
 			child.resolve();
@@ -331,18 +324,14 @@ test("notification startup failures fail the run instead of delivering a stale f
 	await until(() => idle(tree));
 	const session = tree.get("1")?.session;
 	if (!session) throw new Error("Missing child session");
-	const send = spyOn(session, "sendCustomMessage").mockRejectedValue(
+	spyOn(session, "sendCustomMessage").mockRejectedValue(
 		new Error("wake failed"),
 	);
-	try {
-		await job.release();
-		expect(await started.result).toMatchObject({
-			status: "error",
-			error: "wake failed",
-		});
-	} finally {
-		send.mockRestore();
-	}
+	await job.release();
+	expect(await started.result).toMatchObject({
+		status: "error",
+		error: "wake failed",
+	});
 });
 
 test("configured bash overrides are not silently replaced with local execution", async () => {
@@ -354,18 +343,14 @@ test("configured bash overrides are not silently replaced with local execution",
 				: response(lastText(ctx)),
 		),
 	);
-	if (!context.agentDir) throw new Error("Missing agent directory");
-	const directory = join(context.agentDir, "extensions");
-	await mkdir(directory, { recursive: true });
-	await writeFile(
-		join(directory, "remote.js"),
-		`export default function(pi) {
-		pi.registerTool({
+	await childExtension(
+		context,
+		"remote",
+		`pi.registerTool({
 			name: "bash", label: "Remote bash", description: "Remote execution",
 			parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] },
 			async execute() { return { content: [{ type: "text", text: "remote result" }], details: undefined }; }
-		});
-	}`,
+		});`,
 	);
 	expect(await tree.start(ROOT, "start", context).result).toMatchObject({
 		status: "done",
@@ -389,7 +374,6 @@ test("failed commands still wait for jobs they already started and retain shell 
 		),
 	);
 	const job = backgroundJob(context.cwd, "failed");
-	if (!context.agentDir) throw new Error("Missing agent directory");
 	await writeFile(
 		join(context.agentDir, "settings.json"),
 		JSON.stringify({

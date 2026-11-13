@@ -3,8 +3,10 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
+	contentText,
 	createAssistantMessageEventStream,
 	type JsonObject,
 	type Model,
@@ -30,15 +32,85 @@ import {
 	TUI_KEYBINDINGS,
 	TuiAltScreen,
 } from "@earendil-works/pi-tui";
+import {
+	createSubagentIntegration,
+	createSubagentRuntime,
+	type SubagentView,
+} from "../agent/index.ts";
 import { SUBAGENT_RESUME_TYPE } from "../agent/protocol.ts";
-import type { SpawnContext } from "../runtime/index.ts";
+import { errorMessage } from "../runtime/errors.ts";
+import type { SpawnContext, Subagents } from "../runtime/index.ts";
 import { SWITCHER_OVERLAY } from "../ui/switcher.ts";
 import protocolFixture, {
 	lastCompletion,
 	lastCustomMessage,
 } from "./protocol.ts";
 
-export { lastCompletion, lastCustomMessage } from "./protocol.ts";
+export {
+	completionOutput,
+	lastCompletion,
+	lastCustomMessage,
+} from "./protocol.ts";
+
+// Preloaded through bunfig.toml, so these hooks cover every test file.
+// Pi can still write into a test's directory after it ends (e.g. a model
+// catalog refresh), so the whole tree is removed once, after the last file.
+const root = mkdtempSync(join(tmpdir(), "pi-subagents-test-"));
+afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+/** Gates left closed by a test, opened first so that no cleanup waits on them. */
+const gates: (() => void)[] = [];
+/** Resources, released in reverse order of acquisition. */
+const cleanups: (() => unknown)[] = [];
+/** Globals read by generated extensions, which may run until their session ends. */
+const sharedKeys: symbol[] = [];
+const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+
+afterEach(async () => {
+	for (const open of gates.splice(0)) open();
+	const errors: unknown[] = [];
+	for (const cleanup of cleanups.splice(0).reverse()) {
+		try {
+			await cleanup();
+		} catch (error) {
+			errors.push(error);
+		}
+	}
+	for (const key of sharedKeys.splice(0))
+		Reflect.deleteProperty(globalThis, key);
+	if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+	else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+	if (errors.length) throw new AggregateError(errors, "Test cleanup failed.");
+});
+
+/** Release a resource after the current test, before those acquired earlier. */
+export function onCleanup(cleanup: () => unknown): void {
+	cleanups.push(cleanup);
+}
+
+/** A gate the test opens; one left closed opens after the test. */
+export function deferred() {
+	const gate = Promise.withResolvers<void>();
+	gates.push(() => gate.resolve());
+	return gate;
+}
+
+/** Expose a value to generated extension sources, which Pi loads as separate
+ * modules, for the current test. Returns the source expression that reads it.
+ */
+export function shared(value: unknown): string {
+	const key = Symbol.for(`pi-subagents.test.${crypto.randomUUID()}`);
+	sharedKeys.push(key);
+	Reflect.set(globalThis, key, value);
+	return `globalThis[Symbol.for(${JSON.stringify(Symbol.keyFor(key))})]`;
+}
+
+/** A runtime with Pi's session lifecycle, shut down after the test. */
+export function testRuntime(): Subagents {
+	const runtime = createSubagentRuntime();
+	onCleanup(() => runtime.dispose());
+	return runtime;
+}
 
 export const model: Model<"openai-responses"> = {
 	id: "test-model",
@@ -53,6 +125,7 @@ export const model: Model<"openai-responses"> = {
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 };
 
+/** A complete response; each costs 3 tokens unless `overrides` says otherwise. */
 export function response(
 	text: string,
 	overrides: Partial<AssistantMessage> = {},
@@ -94,12 +167,18 @@ export function toolCall(name: string, args: JsonObject): AssistantMessage {
 
 export function lastText(context: TranscriptContext): string {
 	const message = context.messages.at(-1);
-	if (!message) return "";
-	if (typeof message.content === "string") return message.content;
-	return message.content
-		.filter((part) => part.type === "text")
-		.map((part) => part.text)
-		.join("\n");
+	return message ? contentText(message.content) : "";
+}
+
+/** Every text block that the assistant wrote, in order. */
+export function replies(messages: readonly AgentMessage[] = []): string[] {
+	return messages.flatMap((message) =>
+		message.role === "assistant"
+			? message.content.flatMap((part) =>
+					part.type === "text" ? [part.text] : [],
+				)
+			: [],
+	);
 }
 
 export function stream(
@@ -117,7 +196,7 @@ export function stream(
 			} catch (error) {
 				message = response("", {
 					stopReason: options?.signal?.aborted ? "aborted" : "error",
-					errorMessage: error instanceof Error ? error.message : String(error),
+					errorMessage: errorMessage(error),
 				});
 			}
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
@@ -128,23 +207,22 @@ export function stream(
 				});
 			} else {
 				output.push({ type: "start", partial: message });
-				message.content.forEach((part, contentIndex) => {
-					if (part.type === "text") {
-						output.push({ type: "text_start", contentIndex, partial: message });
-						output.push({
-							type: "text_delta",
-							contentIndex,
-							delta: part.text,
-							partial: message,
-						});
-						output.push({
-							type: "text_end",
-							contentIndex,
-							content: part.text,
-							partial: message,
-						});
-					}
-				});
+				for (const [contentIndex, part] of message.content.entries()) {
+					if (part.type !== "text") continue;
+					output.push({ type: "text_start", contentIndex, partial: message });
+					output.push({
+						type: "text_delta",
+						contentIndex,
+						delta: part.text,
+						partial: message,
+					});
+					output.push({
+						type: "text_end",
+						contentIndex,
+						content: part.text,
+						partial: message,
+					});
+				}
 				output.push({
 					type: "done",
 					reason: message.stopReason as "stop" | "length" | "toolUse",
@@ -180,13 +258,7 @@ export const hierarchyStream = stream((context) => {
 		const previous = context.messages.findLast(
 			(message) => message.role === "assistant",
 		);
-		return response(
-			previous?.role === "assistant"
-				? previous.content
-						.flatMap((part) => (part.type === "text" ? [part.text] : []))
-						.join("\n")
-				: "",
-		);
+		return response(previous ? contentText(previous.content) : "");
 	}
 	const match = /^nest:(\d+)$/.exec(text);
 	if (match && Number(match[1]) > 0) {
@@ -197,20 +269,8 @@ export const hierarchyStream = stream((context) => {
 	return response(text === "nest:0" || text === "say hello" ? "hello" : text);
 });
 
-// Preloaded through bunfig.toml, so these hooks cover every test file.
-// Pi can still write into a test's directory after it ends (e.g. a model
-// catalog refresh), so the whole tree is removed once, after the last file.
-const root = mkdtempSync(join(tmpdir(), "pi-subagents-test-"));
-afterAll(() => rmSync(root, { recursive: true, force: true }));
-
-const sharedKeys: symbol[] = [];
-const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
-afterEach(() => {
-	for (const key of sharedKeys.splice(0))
-		Reflect.deleteProperty(globalThis, key);
-	if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-	else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
-});
+/** A stream that runs until aborted. */
+export const paused = stream((_context, options) => waiting(options?.signal));
 
 export function testProvider(streamFn = hierarchyStream): Provider {
 	return {
@@ -229,17 +289,23 @@ export function testProvider(streamFn = hierarchyStream): Provider {
 	};
 }
 
+const QUIET_SETTINGS = {
+	cacheWarming: "off",
+	compaction: { enabled: false },
+	retry: { enabled: false },
+} as const;
+
+/** A fresh workspace and agent directory whose model answers with `streamFn`. */
 export async function spawnContext(
 	streamFn = hierarchyStream,
-): Promise<SpawnContext> {
+): Promise<SpawnContext & { agentDir: string }> {
 	// Without the preload (e.g. run from another cwd) the first file removes it.
 	await mkdir(root, { recursive: true });
 	const directory = await mkdtemp(join(root, "context-"));
 	const cwd = join(directory, "workspace");
 	const agentDir = join(directory, "agent");
 	await mkdir(cwd);
-	await mkdir(agentDir);
-	await mkdir(join(agentDir, "extensions"));
+	await mkdir(join(agentDir, "extensions"), { recursive: true });
 	await writeFile(
 		join(agentDir, "extensions", "protocol.js"),
 		`export { default } from ${JSON.stringify(new URL("./protocol.ts", import.meta.url).pathname)};`,
@@ -247,11 +313,7 @@ export async function spawnContext(
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 	await writeFile(
 		join(agentDir, "settings.json"),
-		JSON.stringify({
-			cacheWarming: "off",
-			compaction: { enabled: false },
-			retry: { enabled: false },
-		}),
+		JSON.stringify(QUIET_SETTINGS),
 	);
 	const modelRuntime = await ModelRuntime.create({
 		authPath: join(agentDir, "auth.json"),
@@ -269,48 +331,55 @@ export async function spawnContext(
 	};
 }
 
-export function deferred() {
-	let resolve!: () => void;
-	const promise = new Promise<void>((yes) => {
-		resolve = yes;
-	});
-	return { promise, resolve };
+/** Install an extension, given as its default export's body, for children. */
+export async function childExtension(
+	{ agentDir }: { agentDir: string },
+	name: string,
+	body: string,
+): Promise<void> {
+	await writeFile(
+		join(agentDir, "extensions", `${name}.js`),
+		`export default function(pi) {\n${body}\n}`,
+	);
 }
 
-/** A root SDK session, with the same deterministic provider available to children.
- * Long-lived by default; one-shot modes wait for delegated results before settling.
+export interface ParentOptions {
+	streamFn?: Provider["streamSimple"];
+	/** The root's own extensions. */
+	extensions?: ExtensionFactory[];
+	/** Runs on each child's session_start, which delays its initialization. */
+	onChildStart?: (ctx: ExtensionContext) => Promise<void>;
+	/** Loads into each child session. */
+	onChildLoad?: ExtensionFactory;
+	/** Long-lived by default; one-shot modes wait for delegated results before settling. */
+	mode?: ExtensionContext["mode"];
+}
+
+/** A root SDK session, with the same deterministic provider available to
+ * children, shut down after the test.
  */
-export async function parentSession(
-	streamFn: Provider["streamSimple"],
-	extensionFactories: ExtensionFactory[],
-	onChildStart?: (ctx: ExtensionContext) => Promise<void>,
-	onChildLoad?: ExtensionFactory,
-	mode: ExtensionContext["mode"] = "rpc",
-) {
+export async function parentSession({
+	streamFn = hierarchyStream,
+	extensions = [],
+	onChildStart,
+	onChildLoad,
+	mode = "rpc",
+}: ParentOptions = {}) {
 	const context = await spawnContext(streamFn);
-	if (!context.agentDir) throw new Error("Missing test agent directory");
-	const key = Symbol.for(`pi-subagents.fixture.${crypto.randomUUID()}`);
-	sharedKeys.push(key);
-	Reflect.set(globalThis, key, {
+	const child = shared({
 		provider: testProvider(streamFn),
 		onChildStart,
 		onChildLoad,
 	});
-	await mkdir(join(context.agentDir, "extensions"), { recursive: true });
-	await writeFile(
-		join(context.agentDir, "extensions", "provider.js"),
-		`export default function(pi) {
-			const shared = globalThis[Symbol.for(${JSON.stringify(Symbol.keyFor(key))})];
-			pi.registerProvider(shared.provider);
-			shared.onChildLoad?.(pi);
-			if (shared.onChildStart) pi.on("session_start", (_event, ctx) => shared.onChildStart(ctx));
-		}`,
+	await childExtension(
+		context,
+		"provider",
+		`const shared = ${child};
+		pi.registerProvider(shared.provider);
+		shared.onChildLoad?.(pi);
+		if (shared.onChildStart) pi.on("session_start", (_event, ctx) => shared.onChildStart(ctx));`,
 	);
-	const settingsManager = SettingsManager.inMemory({
-		cacheWarming: "off",
-		compaction: { enabled: false },
-		retry: { enabled: false },
-	});
+	const settingsManager = SettingsManager.inMemory(QUIET_SETTINGS);
 	const resourceLoader = new DefaultResourceLoader({
 		cwd: context.cwd,
 		agentDir: context.agentDir,
@@ -324,7 +393,7 @@ export async function parentSession(
 			protocolFixture,
 			// reload() resets API registrations; restore the root's deterministic provider too.
 			(pi) => pi.registerProvider(testProvider(streamFn)),
-			...extensionFactories,
+			...extensions,
 		],
 	});
 	await resourceLoader.reload();
@@ -334,34 +403,92 @@ export async function parentSession(
 		resourceLoader,
 		sessionManager: SessionManager.inMemory(context.cwd),
 	});
+	onCleanup(async () => {
+		try {
+			await session.extensionRunner.emit({
+				type: "session_shutdown",
+				reason: "quit",
+			});
+		} catch {
+			// A test may have deliberately invalidated the runner.
+		}
+		session.dispose();
+	});
 	await session.bindExtensions({ mode, shutdownHandler: () => {} });
 	return session;
 }
 
+/** A root session running the integration, after its other extensions.
+ * `runtime()` is the one bound to the current session; `tree` the first.
+ */
+export async function rootSession({
+	view,
+	...options
+}: ParentOptions & { view?: Partial<SubagentView> } = {}) {
+	let tool: ReturnType<typeof createSubagentIntegration> | undefined;
+	const bound: Subagents[] = [];
+	// Shutdown disposes the bound runtime, unless the test invalidated it first.
+	onCleanup(() => Promise.all(bound.map((runtime) => runtime.dispose())));
+	const session = await parentSession({
+		...options,
+		extensions: [
+			...(options.extensions ?? []),
+			(pi) => {
+				tool = createSubagentIntegration(pi, {
+					bind(runtime, ctx) {
+						bound.push(runtime);
+						view?.bind?.(runtime, ctx);
+					},
+					dispose: () => view?.dispose?.(),
+				});
+				pi.registerTool(tool);
+			},
+		],
+	});
+	const runtime = () => {
+		const current = bound.at(-1);
+		if (!current) throw new Error("Missing root runtime");
+		return current;
+	};
+	return {
+		session,
+		tree: runtime(),
+		runtime,
+		/** Call the tool as the root's model would, with its own tool context. */
+		execute(
+			toolCallId: string,
+			args: Parameters<NonNullable<typeof tool>["execute"]>[1],
+			signal?: AbortSignal,
+		) {
+			if (!tool) throw new Error("Missing subagent tool");
+			return tool.execute(
+				toolCallId,
+				args,
+				signal,
+				undefined,
+				session.extensionRunner.createToolContext(toolCallId, signal),
+			);
+		},
+	};
+}
+
 /** A child tool that blocks its step until released or cancelled. */
-export async function blockingTool(context: SpawnContext) {
-	if (!context.agentDir) throw new Error("Missing test agent directory");
+export async function blockingTool(context: { agentDir: string }) {
 	const release = deferred();
-	const key = Symbol.for(`pi-subagents.blocking.${crypto.randomUUID()}`);
-	sharedKeys.push(key);
-	Reflect.set(globalThis, key, release.promise);
-	const directory = join(context.agentDir, "extensions");
-	await mkdir(directory, { recursive: true });
-	await writeFile(
-		join(directory, "blocking.js"),
-		`export default function(pi) {
-			pi.registerTool({
-				name: "blocking", label: "Blocking", description: "Blocks until released",
-				parameters: { type: "object", properties: {} },
-				async execute(_id, _args, signal) {
-					await Promise.race([
-						globalThis[Symbol.for(${JSON.stringify(Symbol.keyFor(key))})],
-						new Promise((_resolve, reject) => signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true })),
-					]);
-					return { content: [{ type: "text", text: "tool done" }], details: undefined };
-				},
-			});
-		}`,
+	await childExtension(
+		context,
+		"blocking",
+		`pi.registerTool({
+			name: "blocking", label: "Blocking", description: "Blocks until released",
+			parameters: { type: "object", properties: {} },
+			async execute(_id, _args, signal) {
+				await Promise.race([
+					${shared(release.promise)},
+					new Promise((_resolve, reject) => signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true })),
+				]);
+				return { content: [{ type: "text", text: "tool done" }], details: undefined };
+			},
+		});`,
 	);
 	return release;
 }
@@ -377,6 +504,8 @@ export function backgroundJob(cwd: string, name: string, launcher = "nohup") {
 		finished,
 		command: `printf '%s\\n' "$$" > "${group}"; ${launcher} bash -c '${script}' </dev/null >/dev/null 2>&1 &`,
 		release: () => writeFile(gate, ""),
+		/** The process group that the job's shell recorded. */
+		pgid: async () => Number((await Bun.file(group).text()).trim()),
 	};
 }
 
@@ -439,6 +568,7 @@ export function fullscreen({ columns = 100, rows = 24 } = {}) {
 		),
 	);
 	tui.start();
+	onCleanup(() => tui.stop());
 	const harness = {
 		tui,
 		/** Pi's default bindings that the UI uses, as ctx.ui.custom() passes them. */
@@ -490,7 +620,6 @@ export function fullscreen({ columns = 100, rows = 24 } = {}) {
 				? { row: Number(match[1]) - 1, col: Number(match[2]) - 1 }
 				: undefined;
 		},
-		stop: () => tui.stop(),
 	};
 	return harness;
 }

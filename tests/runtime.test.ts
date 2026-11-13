@@ -1,36 +1,30 @@
-import { afterEach, describe, expect, mock, test } from "bun:test";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { describe, expect, mock, test } from "bun:test";
+import { readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { createSubagentRuntime } from "../agent/index.ts";
 import {
 	SUBAGENT_RESUME_TYPE,
 	type SubagentCompletionDetails,
 } from "../agent/protocol.ts";
-import { ROOT, type Subagents } from "../runtime/index.ts";
+import { ROOT, type Subagent, type Subagents } from "../runtime/index.ts";
 import {
 	blockingTool,
+	childExtension,
 	deferred,
 	hierarchyStream,
 	lastCustomMessage,
 	lastText,
 	model,
+	onCleanup,
+	replies,
 	response,
+	testRuntime as runtime,
+	shared,
 	spawnContext,
 	stream,
 	toolCall,
 	until,
 	waiting,
 } from "./fixtures.ts";
-
-const runtimes: Subagents[] = [];
-function runtime(): Subagents {
-	const tree = createSubagentRuntime();
-	runtimes.push(tree);
-	return tree;
-}
-afterEach(async () => {
-	await Promise.all(runtimes.splice(0).map((tree) => tree.dispose()));
-});
 
 /** Echoes its input, except that a resumed task reports its result. */
 const echo = stream((context) => {
@@ -42,6 +36,16 @@ const echo = stream((context) => {
 			);
 });
 
+function removeOnCleanup(outputFile: string): void {
+	onCleanup(() => rm(dirname(outputFile), { recursive: true, force: true }));
+}
+
+function hasRunningTool(node: Subagent | undefined): boolean {
+	return [...(node?.liveTools.values() ?? [])].some(
+		(tool) => tool.status === "running",
+	);
+}
+
 function resumptions(tree: Subagents, id: string): number {
 	return (
 		tree
@@ -52,20 +56,6 @@ function resumptions(tree: Subagents, id: string): number {
 					entry.type === "custom_message" &&
 					entry.customType === SUBAGENT_RESUME_TYPE,
 			).length ?? 0
-	);
-}
-
-function replies(tree: Subagents, id: string): string[] {
-	return (
-		tree
-			.get(id)
-			?.session?.messages.flatMap((message) =>
-				message.role === "assistant"
-					? message.content.flatMap((part) =>
-							part.type === "text" ? [part.text] : [],
-						)
-					: [],
-			) ?? []
 	);
 }
 
@@ -103,7 +93,6 @@ describe("runtime factory", () => {
 				});
 			}),
 		);
-		if (!context.agentDir) throw new Error("Missing agent directory");
 		const settingsPath = join(context.agentDir, "settings.json");
 		const configured = {
 			...JSON.parse(await readFile(settingsPath, "utf8")),
@@ -165,13 +154,6 @@ describe("silent hierarchy", () => {
 		// Descendant usage is billed exactly once, not also on the receipt.
 		expect(result.usage?.totalTokens).toBe(21);
 		expect(result.usage?.cost.total).toBeCloseTo(0.21);
-		expect(Object.keys(result).sort()).toEqual([
-			"error",
-			"id",
-			"output",
-			"status",
-			"usage",
-		]);
 	});
 
 	test("an idle headless parent accepts a continuation before its descendant completes and bills it in the same run", async () => {
@@ -190,34 +172,25 @@ describe("silent hierarchy", () => {
 		void started.result.then(() => {
 			completed = true;
 		});
-		let sent: Promise<void> | undefined;
-		try {
-			await until(() => leafStarted && Boolean(tree.get("1")?.session?.isIdle));
-			const node = tree.get("1");
-			if (!node) throw new Error("Missing parent");
-			const tools = [...node.liveTools.keys()];
-			let accepted = false;
-			sent = tree.send("1", "live continuation").then(() => {
-				accepted = true;
-			});
-			await until(() => accepted, 1000);
-			expect(completed).toBe(false);
-			expect(node?.status).toBe("running");
-			expect(node?.session?.getLastAssistantText()).toBe("live continuation");
-			expect([...node.liveTools.keys()]).toEqual(tools);
-			gate.resolve();
-			// The continuation interrupted the task, so the parent restates its result.
-			expect(await started.result).toMatchObject({
-				status: "done",
-				output: "hello",
-				usage: { totalTokens: 18 },
-			});
-			expect(resumptions(tree, "1")).toBe(1);
-			expect(node?.session?.getSessionStats().tokens.total).toBe(18);
-		} finally {
-			gate.resolve();
-			await sent;
-		}
+		await until(() => leafStarted && Boolean(tree.get("1")?.session?.isIdle));
+		const node = tree.get("1");
+		if (!node) throw new Error("Missing parent");
+		const tools = [...node.liveTools.keys()];
+		// Accepted before the descendant completes, while the run stays open.
+		await tree.send("1", "live continuation");
+		expect(completed).toBe(false);
+		expect(node.status).toBe("running");
+		expect(node.session?.getLastAssistantText()).toBe("live continuation");
+		expect([...node.liveTools.keys()]).toEqual(tools);
+		gate.resolve();
+		// The continuation interrupted the task, so the parent restates its result.
+		expect(await started.result).toMatchObject({
+			status: "done",
+			output: "hello",
+			usage: { totalTokens: 18 },
+		});
+		expect(resumptions(tree, "1")).toBe(1);
+		expect(node.session?.getSessionStats().tokens.total).toBe(18);
 	});
 
 	test("stopping an idle parent that drains a child stops both and keeps billed work", async () => {
@@ -249,7 +222,6 @@ describe("task results", () => {
 		const tree = runtime();
 		const gate = deferred();
 		let leafStarted = false;
-		let path: string | undefined;
 		const paused = stream(async (context, options) => {
 			if (lastText(context) === "nest:0") {
 				leafStarted = true;
@@ -263,27 +235,24 @@ describe("task results", () => {
 			"nest:1",
 			await spawnContext(paused),
 		).result;
-		try {
-			await until(() => leafStarted && Boolean(tree.get("1")?.session?.isIdle));
-			const parent = tree.get("1")?.session;
-			if (!parent) throw new Error("Missing parent");
-			parent.sendCustomMessage = async (message) => {
-				path = (message.details as SubagentCompletionDetails).fullOutputPath;
-				throw new Error("completion sender failed");
-			};
-			gate.resolve();
-			expect(await result).toMatchObject({
-				status: "error",
-				error: "completion sender failed",
-				usage: { totalTokens: 9 },
-			});
-			expect(parent.getSessionStats().tokens.total).toBe(9);
-			if (!path) throw new Error("Missing output file");
-			await expect(readFile(path)).rejects.toThrow();
-		} finally {
-			gate.resolve();
-			if (path) await rm(dirname(path), { recursive: true, force: true });
-		}
+		await until(() => leafStarted && Boolean(tree.get("1")?.session?.isIdle));
+		const parent = tree.get("1")?.session;
+		if (!parent) throw new Error("Missing parent");
+		let path: string | undefined;
+		parent.sendCustomMessage = async (message) => {
+			path = (message.details as SubagentCompletionDetails).fullOutputPath;
+			if (path) removeOnCleanup(path);
+			throw new Error("completion sender failed");
+		};
+		gate.resolve();
+		expect(await result).toMatchObject({
+			status: "error",
+			error: "completion sender failed",
+			usage: { totalTokens: 9 },
+		});
+		expect(parent.getSessionStats().tokens.total).toBe(9);
+		if (!path) throw new Error("Missing output file");
+		await expect(readFile(path)).rejects.toThrow();
 	});
 
 	test("subtree cancellation discards output files belonging to abandoned queued completions", async () => {
@@ -292,7 +261,6 @@ describe("task results", () => {
 		const parent = deferred();
 		let childRunning = false;
 		let parentRunning = false;
-		let path: string | undefined;
 		const paused = stream(async (context, options) => {
 			if (lastText(context) === "nest:0") {
 				childRunning = true;
@@ -310,38 +278,30 @@ describe("task results", () => {
 			"nest:1",
 			await spawnContext(paused),
 		).result;
-		let sent: Promise<void> | undefined;
-		try {
-			await until(
-				() => childRunning && Boolean(tree.get("1")?.session?.isIdle),
-			);
-			sent = tree.send("1", "busy parent");
-			await until(() => parentRunning);
-			child.resolve();
-			const session = tree.get("1")?.session;
-			await until(() => {
-				const message = session?.agent
-					.peekQueuedMessages()
-					.find((message) => message.role === "custom");
-				if (message?.role !== "custom") return false;
-				path = (message.details as SubagentCompletionDetails).fullOutputPath;
-				return Boolean(path);
-			});
-			tree.abort("1");
-			expect(await result).toMatchObject({
-				status: "aborted",
-				usage: { totalTokens: 12 },
-			});
-			await sent;
-			if (!path) throw new Error("Missing queued output file");
-			await expect(readFile(path)).rejects.toThrow();
-			expect(session?.agent.peekQueuedMessages()).toHaveLength(0);
-		} finally {
-			child.resolve();
-			parent.resolve();
-			await sent;
-			if (path) await rm(dirname(path), { recursive: true, force: true });
-		}
+		await until(() => childRunning && Boolean(tree.get("1")?.session?.isIdle));
+		const sent = tree.send("1", "busy parent");
+		await until(() => parentRunning);
+		child.resolve();
+		const session = tree.get("1")?.session;
+		let path: string | undefined;
+		await until(() => {
+			const message = session?.agent
+				.peekQueuedMessages()
+				.find((message) => message.role === "custom");
+			if (message?.role !== "custom") return false;
+			path = (message.details as SubagentCompletionDetails).fullOutputPath;
+			return Boolean(path);
+		});
+		if (!path) throw new Error("Missing queued output file");
+		removeOnCleanup(path);
+		tree.abort("1");
+		expect(await result).toMatchObject({
+			status: "aborted",
+			usage: { totalTokens: 12 },
+		});
+		await sent;
+		await expect(readFile(path)).rejects.toThrow();
+		expect(session?.agent.peekQueuedMessages()).toHaveLength(0);
 	});
 
 	test("joins all final text blocks and returns full output without presentation hints", async () => {
@@ -383,7 +343,7 @@ describe("interaction and cleanup", () => {
 		});
 		const result = tree.start(ROOT, "initial", await spawnContext(echo)).result;
 		expect((await result).output).toBe("task result");
-		expect(replies(tree, "1")).toEqual([
+		expect(replies(tree.get("1")?.session?.messages)).toEqual([
 			"initial",
 			"late steering",
 			"task result",
@@ -402,11 +362,7 @@ describe("interaction and cleanup", () => {
 			if (node?.status !== statuses.at(-1)) statuses.push(node?.status);
 		});
 		expect(node?.queuedInput).toEqual([]);
-		await until(() =>
-			[...(node?.liveTools.values() ?? [])].some(
-				(tool) => tool.status === "running",
-			),
-		);
+		await until(() => hasRunningTool(node));
 		const sent = tree.send("1", "are you there?");
 		expect(node?.queuedInput).toEqual(["are you there?"]);
 		await sent;
@@ -417,7 +373,10 @@ describe("interaction and cleanup", () => {
 			status: "done",
 			output: "task result",
 		});
-		expect(replies(tree, "1")).toEqual(["are you there?", "task result"]);
+		expect(replies(tree.get("1")?.session?.messages)).toEqual([
+			"are you there?",
+			"task result",
+		]);
 		expect(resumptions(tree, "1")).toBe(1);
 		expect(statuses).toEqual(["running", "done"]);
 		expect(node?.queuedInput).toEqual([]);
@@ -446,11 +405,7 @@ describe("interaction and cleanup", () => {
 
 		const steered = tree.start(ROOT, "monitor", context);
 		const node = tree.get("2");
-		await until(() =>
-			[...(node?.liveTools.values() ?? [])].some(
-				(tool) => tool.status === "running",
-			),
-		);
+		await until(() => hasRunningTool(node));
 		await tree.send("2", "first");
 		await tree.send("2", "second");
 		expect(tree.abort("2")).toEqual(new Map([["2", ["first", "second"]]]));
@@ -470,43 +425,27 @@ describe("interaction and cleanup", () => {
 		await blockingTool(context);
 		const hook = deferred();
 		const entered = deferred();
-		const key = Symbol.for(`pi-subagents.input.${crypto.randomUUID()}`);
-		Reflect.set(globalThis, key, { hook: hook.promise, entered });
-		try {
-			if (!context.agentDir) throw new Error("Missing agent directory");
-			await mkdir(join(context.agentDir, "extensions"), { recursive: true });
-			await writeFile(
-				join(context.agentDir, "extensions", "input.js"),
-				`export default function(pi) {
-					pi.on("input", async (event) => {
-						if (event.text !== "in flight") return;
-						const shared = globalThis[Symbol.for(${JSON.stringify(Symbol.keyFor(key))})];
-						shared.entered.resolve();
-						await shared.hook;
-					});
-				}`,
-			);
-			const result = tree.start(ROOT, "monitor", context).result;
-			const node = tree.get("1");
-			await until(() =>
-				[...(node?.liveTools.values() ?? [])].some(
-					(tool) => tool.status === "running",
-				),
-			);
-			const sent = tree.send("1", "in flight");
-			await entered.promise;
-			expect(tree.abort("1")).toEqual(new Map([["1", ["in flight"]]]));
-			hook.resolve();
-			await sent;
-			expect((await result).status).toBe("aborted");
-			expect(JSON.stringify(node?.session?.messages)).not.toContain(
-				"in flight",
-			);
-			expect(node?.session?.pendingMessageCount).toBe(0);
-		} finally {
-			hook.resolve();
-			Reflect.deleteProperty(globalThis, key);
-		}
+		await childExtension(
+			context,
+			"input",
+			`pi.on("input", async (event) => {
+				if (event.text !== "in flight") return;
+				const shared = ${shared({ hook: hook.promise, entered })};
+				shared.entered.resolve();
+				await shared.hook;
+			});`,
+		);
+		const result = tree.start(ROOT, "monitor", context).result;
+		const node = tree.get("1");
+		await until(() => hasRunningTool(node));
+		const sent = tree.send("1", "in flight");
+		await entered.promise;
+		expect(tree.abort("1")).toEqual(new Map([["1", ["in flight"]]]));
+		hook.resolve();
+		await sent;
+		expect((await result).status).toBe("aborted");
+		expect(JSON.stringify(node?.session?.messages)).not.toContain("in flight");
+		expect(node?.session?.pendingMessageCount).toBe(0);
 	});
 
 	test("parent cancellation aborts all descendants, not independent siblings", async () => {

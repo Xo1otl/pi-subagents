@@ -19,6 +19,7 @@ import {
 	fullscreen,
 	lastCustomMessage,
 	lastText,
+	onCleanup,
 	parentSession,
 	response,
 	stream,
@@ -52,7 +53,10 @@ test("a real root extension opens the switcher overlay from commands and the roo
 			return toolCall("subagent", { instructions: "wait" });
 		return waiting(options?.signal);
 	});
-	const session = await parentSession(dispatch, [extension]);
+	const session = await parentSession({
+		streamFn: dispatch,
+		extensions: [extension],
+	});
 	const theme = { fg: (_color: string, text: string) => text } as Theme;
 	const terminal = fullscreen({ columns: 80 });
 	const tui = terminal.tui;
@@ -121,74 +125,69 @@ test("a real root extension opens the switcher overlay from commands and the roo
 	const header = () =>
 		terminal.screen().find((line) => line.startsWith("Subagent")) ?? "";
 	const left = "\x1b[D";
-	try {
-		const rootEditor = editor;
-		await session.bindExtensions({ mode: "tui", uiContext: ui });
-		expect(editor).toBe(rootEditor);
-		expect(getEditorComponent()).toBeDefined();
-		terminal.input(left);
-		terminal.input(left);
-		expect(custom).not.toHaveBeenCalled();
-		const run = session.prompt("delegate");
-		await until(() => indicator().includes("2 running"));
-		expect(indicator()).toContain("1, 1.1");
-		const open = session.prompt("/subagents 1.1");
-		await until(() => Boolean(switcher));
-		expect(custom.mock.calls[0]?.[1]).toEqual({
-			overlay: true,
-			overlayOptions: SWITCHER_OVERLAY,
-		});
-		expect(header()).toContain("Subagent 1.1");
-		terminal.input("\x1b");
-		await open;
-		expect(terminal.text()).toContain("ROOT_TRANSCRIPT");
-		expect(indicator()).toContain("2 running");
-		// The root chord opens the picker during a run without losing its draft.
-		editor.setText("root draft");
-		terminal.input("\x01");
-		terminal.input(left);
-		terminal.input(left);
-		await until(() => Boolean(switcher));
-		expect(editor.getText()).toBe("root draft");
-		expect(header()).toContain("Subagents · 2");
-		expect(custom).toHaveBeenCalledTimes(2);
-		terminal.input("\x1b");
-		await until(() => !switcher);
-		expect(tui.getFocusedComponent()).toBe(editor);
-		await session.abort();
-		await run;
-		// Background jobs outlive the root turn. Stop them explicitly in the switcher.
-		expect(indicator()).toContain("2 running");
-		const stopping = session.prompt("/subagents 1");
-		await until(() => Boolean(switcher));
-		terminal.input("\x03");
-		await until(() => widgets.size === 0);
-		terminal.input("\x1b");
-		await stopping;
+	onCleanup(() => session.abort());
+	const rootEditor = editor;
+	await session.bindExtensions({ mode: "tui", uiContext: ui });
+	expect(editor).toBe(rootEditor);
+	expect(getEditorComponent()).toBeDefined();
+	terminal.input(left);
+	terminal.input(left);
+	expect(custom).not.toHaveBeenCalled();
+	const run = session.prompt("delegate");
+	await until(() => indicator().includes("2 running"));
+	expect(indicator()).toContain("1, 1.1");
+	const open = session.prompt("/subagents 1.1");
+	await until(() => Boolean(switcher));
+	expect(custom.mock.calls[0]?.[1]).toEqual({
+		overlay: true,
+		overlayOptions: SWITCHER_OVERLAY,
+	});
+	expect(header()).toContain("Subagent 1.1");
+	terminal.input("\x1b");
+	await open;
+	expect(terminal.text()).toContain("ROOT_TRANSCRIPT");
+	expect(indicator()).toContain("2 running");
+	// The root chord opens the picker during a run without losing its draft.
+	editor.setText("root draft");
+	terminal.input("\x01");
+	terminal.input(left);
+	terminal.input(left);
+	await until(() => Boolean(switcher));
+	expect(editor.getText()).toBe("root draft");
+	expect(header()).toContain("Subagents · 2");
+	expect(custom).toHaveBeenCalledTimes(2);
+	terminal.input("\x1b");
+	await until(() => !switcher);
+	expect(tui.getFocusedComponent()).toBe(editor);
+	await session.abort();
+	await run;
+	// Background jobs outlive the root turn. Stop them explicitly in the switcher.
+	expect(indicator()).toContain("2 running");
+	const stopping = session.prompt("/subagents 1");
+	await until(() => Boolean(switcher));
+	terminal.input("\x03");
+	await until(() => widgets.size === 0);
+	terminal.input("\x1b");
+	await stopping;
 
-		await session.extensionRunner.emit({
-			type: "session_shutdown",
-			reason: "reload",
-		});
-		expect(widgets.size).toBe(0);
-		expect(getEditorComponent()).toBeUndefined();
-		setWidget.mockClear();
-		await session.bindExtensions({ mode: "tui", uiContext: ui });
-		expect(getEditorComponent()).toBeDefined();
-		expect(setWidget).not.toHaveBeenCalled();
-		custom.mockClear();
-		editor.setText("");
-		terminal.input(left);
-		terminal.input(left);
-		expect(custom).not.toHaveBeenCalled();
-	} finally {
-		await session.abort();
-		await session.extensionRunner.emit({
-			type: "session_shutdown",
-			reason: "quit",
-		});
-		expect(getEditorComponent()).toBeUndefined();
-		session.dispose();
-		terminal.stop();
-	}
+	await session.extensionRunner.emit({
+		type: "session_shutdown",
+		reason: "reload",
+	});
+	expect(widgets.size).toBe(0);
+	expect(getEditorComponent()).toBeUndefined();
+	setWidget.mockClear();
+	await session.bindExtensions({ mode: "tui", uiContext: ui });
+	expect(getEditorComponent()).toBeDefined();
+	expect(setWidget).not.toHaveBeenCalled();
+	custom.mockClear();
+	editor.setText("");
+	terminal.input(left);
+	terminal.input(left);
+	expect(custom).not.toHaveBeenCalled();
+	await session.extensionRunner.emit({
+		type: "session_shutdown",
+		reason: "quit",
+	});
+	expect(getEditorComponent()).toBeUndefined();
 });

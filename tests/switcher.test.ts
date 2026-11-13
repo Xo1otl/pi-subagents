@@ -1,33 +1,23 @@
-import { afterEach, expect, mock, test } from "bun:test";
+import { expect, mock, test } from "bun:test";
 import type { OverlayHandle, TUI } from "@earendil-works/pi-tui";
-import { createSubagentRuntime } from "../agent/index.ts";
-import { ROOT, type Subagents } from "../runtime/index.ts";
-import {
-	createSubagentSwitcher,
-	type SubagentSwitcher,
-} from "../ui/switcher.ts";
+import { ROOT } from "../runtime/index.ts";
+import { createSubagentSwitcher } from "../ui/switcher.ts";
 import {
 	blockingTool,
 	fullscreen,
 	lastText,
+	onCleanup,
+	paused,
 	response,
 	spawnContext,
 	stream,
+	testRuntime,
 	toolCall,
 	until,
-	waiting,
 } from "./fixtures.ts";
 
 const theme = { fg: (_color: string, text: string) => text };
 const left = "\x1b[D";
-const trees: Subagents[] = [];
-const switchers: SubagentSwitcher[] = [];
-const terminals: ReturnType<typeof fullscreen>[] = [];
-afterEach(async () => {
-	for (const switcher of switchers.splice(0)) switcher.dispose();
-	for (const terminal of terminals.splice(0)) terminal.stop();
-	await Promise.all(trees.splice(0).map((tree) => tree.dispose()));
-});
 
 /** Open the switcher the way ctx.ui.custom() does with an overlay. */
 async function setup({
@@ -39,14 +29,12 @@ async function setup({
 	initialId?: string;
 	columns?: number;
 } = {}) {
-	const tree = createSubagentRuntime();
-	trees.push(tree);
+	const tree = testRuntime();
 	if (agents) {
 		await tree.start(ROOT, "nest:1", await spawnContext()).result;
 		await tree.start(ROOT, "other", await spawnContext()).result;
 	}
 	const terminal = fullscreen({ columns });
-	terminals.push(terminal);
 	let overlay: OverlayHandle | undefined;
 	const done = mock(() => overlay?.hide());
 	const switcher = createSubagentSwitcher({
@@ -57,7 +45,7 @@ async function setup({
 		onClose: done,
 		initialId,
 	});
-	switchers.push(switcher);
+	onCleanup(() => switcher.dispose());
 	overlay = terminal.mount(switcher);
 	/** The picker's or the chat's first line, wherever the overlay sits. */
 	const header = () =>
@@ -203,9 +191,7 @@ test("Left twice at the text start returns to the picker; nothing inside a brack
 
 test("Ctrl+C stops the selected subtree, and runtime shutdown closes the switcher once", async () => {
 	const { tree, terminal, done } = await setup();
-	const context = await spawnContext(
-		stream((_context, options) => waiting(options?.signal)),
-	);
+	const context = await spawnContext(paused);
 	const child = tree.start("1.1", "wait", context).result;
 	await until(() => Boolean(tree.get("1.1.1")?.session?.isStreaming));
 	expect(terminal.text()).toContain("1.1.1 [running]");
