@@ -27,7 +27,7 @@ import {
 } from "./fixtures.ts";
 
 const backgroundGuidance =
-	"BG jobs (e.g., `nohup`) tracked via PGID; PGID exit → notify + resume(if idle).";
+	"BG jobs (e.g., `nohup`) tracked via PGID; exit → notify + resume if idle. Output/exit code not included; capture to file.";
 
 const parents: AgentSession[] = [];
 const trees: Subagents[] = [];

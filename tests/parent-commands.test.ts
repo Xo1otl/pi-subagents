@@ -109,7 +109,7 @@ const checked = (text: string) =>
 test("a parent's background job resumes it when idle, and private user commands stay untracked", async () => {
 	const { session, tree, job } = await setup(checked);
 	expect(session.getToolDefinition("bash")?.promptGuidelines).toContain(
-		"BG jobs (e.g., `nohup`) tracked via PGID; PGID exit → notify + resume(if idle).",
+		"BG jobs (e.g., `nohup`) tracked via PGID; exit → notify + resume if idle. Output/exit code not included; capture to file.",
 	);
 	const userBash = (excludeFromContext: boolean) =>
 		session.extensionRunner.emitUserBash({

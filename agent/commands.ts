@@ -9,7 +9,6 @@ import {
 	type ExtensionContext,
 	type ExtensionFactory,
 	SettingsManager,
-	truncateHead,
 } from "@earendil-works/pi-coding-agent";
 import type { SessionOwner } from "../runtime/index.ts";
 import {
@@ -54,10 +53,16 @@ function commandExit(
 	command: string,
 	cwd: string,
 ): CommandExitMessage {
-	const preview = truncateHead(command, { maxLines: 20, maxBytes: 4096 });
+	// The agent already holds the full command; one line identifies the job.
+	const [first = ""] = command.trim().split("\n");
+	const chars = [...first];
+	const preview =
+		chars.length > 100 || command.trim().includes("\n")
+			? `${chars.slice(0, 100).join("")}…`
+			: first;
 	return {
 		customType: COMMAND_EXIT_TYPE,
-		content: `Process group ${pgid} exited; background exit status unknown.\ncwd: ${cwd}\ncommand:\n${preview.content}${preview.truncated ? "\n[command truncated]" : ""}`,
+		content: `Process group ${pgid} exited: ${preview}`,
 		display: true,
 		details: { pgid, command, cwd, exitCode: null },
 	};
@@ -219,7 +224,7 @@ export function trackCommands(
 			...bash,
 			promptGuidelines: [
 				...(bash.promptGuidelines ?? []),
-				"BG jobs (e.g., `nohup`) tracked via PGID; PGID exit → notify + resume(if idle).",
+				"BG jobs (e.g., `nohup`) tracked via PGID; exit → notify + resume if idle. Output/exit code not included; capture to file.",
 			],
 			// Replace execution without enabling a tool excluded by defaultTools.
 			defaultActive: false,
