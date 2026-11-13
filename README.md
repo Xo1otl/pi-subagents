@@ -1,82 +1,42 @@
 # pi-subagents
 
-Delegate tasks to pi sessions and follow them in an interactive switcher.
-
-## Load
-
-From the meta-repo root:
+Delegate tasks to pi sessions; follow them in a switcher.
 
 ```sh
-pi -e ./tools/pi-subagents/index.ts
+pi -e ./tools/pi-subagents/index.ts   # or: pi install ./tools/pi-subagents
 ```
 
-Or install the local package:
+## Delegation
 
-```sh
-pi install ./tools/pi-subagents
-```
+- `subagent` starts a headless session in the same workspace (current model/effort unless `model`/`effort` given) and returns a receipt at once.
+- Result arrives later as `subagent-result`; while the parent is busy, results wait and arrive together. Interrupts never drop them.
+- A run finishes when it is idle with no running children or command groups; its last message goes to the parent. Long output is truncated, with a path to the full text.
+- If you talk to a running agent, it answers, then `subagent-resume` returns it to its task. A finished conversation you continue is yours: no resume, no new result; usage still bills ancestors.
+- One-shot modes (`pi -p`, `--mode json`) wait for all results.
+- Changing sessions, reloading, or exiting cancels delegated runs.
 
-## Use
+## Background jobs (POSIX)
 
-Ask pi to delegate a task:
-
-```text
-spawn subagent with: "say hello"
-```
-
-The `subagent` tool starts a fresh conversation in the same workspace, using the current model and thinking level unless `model` (`provider/id`, or a unique `id`) or `effort` is given, and immediately returns a running receipt with the agent ID. The parent can continue working or accept messages while the child starts and runs. Completion arrives separately as a `subagent-result` message, without interrupting an active parent response: results that finish while the parent is busy wait until it settles, then arrive together in one turn. Include task context in the instructions. Agents can delegate further, and siblings can run concurrently. Long results are truncated with a path to the complete output, accessible through file tools; switcher guidance appears only in the UI.
-
-Background jobs outlive the parent turn. Interrupting the parent (for example, to correct a prompt) neither stops them nor drops their results: later results wake the parent as usual, and results already waiting when you interrupt are added to the conversation without restarting the turn. Use **Ctrl+C** in the switcher to stop an agent and its descendants. Changing sessions, reloading, or exiting cancels and cleans up the old jobs. In one-shot modes (`pi -p`, `--mode json`), the root waits for its delegated results before it finishes.
-
-Subagents run as headless, long-lived sessions. On POSIX systems, local bash command process groups are tracked, including background jobs launched with `&` or `nohup`, even after their shell exits. When a background group exits, a `subagent-command-exit` message resumes its agent (or is steered into its next turn if busy), so it can check results and continue working. The notification identifies the group and command; background exit status is unknown, not implicitly successful. Foreground-only commands do not trigger extra turns. Only after these notifications are handled, all command groups and child agents have finished, and the session is idle does its last assistant message reach the parent. You can keep talking to an agent while it waits. **Ctrl+C** stops its command groups as well as its descendants; shutdown cleans them up too. Finished zombie processes do not delay completion. Processes that deliberately leave their group (`setsid`/`setpgid`), configured bash overrides (for example remote execution), and custom tools that spawn processes outside local bash are not tracked. Command tracking requires POSIX process groups; on Windows, commands run untracked.
-
-The parent's own background jobs are tracked the same way, including those of your `!` commands (`!!` commands stay private). When a group exits, the `subagent-command-exit` message wakes the idle parent; while it is busy, the notice waits like a subagent result, surviving an interrupt, and arrives once it settles. These jobs are yours, not a delegated run's: interrupting, changing sessions, reloading, or exiting only ends the watching, never the processes, and a new session does not hear of an old one's jobs. In one-shot modes, the root also waits for its background jobs and answers their exits before it finishes.
-
-While any subagent is active, the main screen shows a live indicator above the editor with running/stopping counts, agent IDs, and the switcher shortcuts. It includes nested and restarted agents, works with the switcher closed, and disappears when all runs settle.
+- Bash process groups are tracked, including `&`/`nohup` jobs that outlive their shell. On exit, `bg-exit` wakes the agent if idle, or queues for its next turn. It holds no output or exit code.
+- Subagents own their jobs: Ctrl+C and shutdown stop them.
+- The root watches its own jobs and your `!` commands (`!!` stays private), never stopping them.
+- Untracked: `setsid`/`setpgid`, bash overrides, and other tools' processes. On Windows, nothing is tracked.
 
 ## Switcher
 
-The switcher has two screens: a compact **picker** listing every subagent over the editor, with the root conversation still visible above it, and a full-terminal **chat** with one of them, so text selection copies only that conversation. Run `/subagents`, press **Ctrl+Shift+A**, or press **Left Arrow twice quickly** (within 500 ms) at the beginning of the text, even during a run, to open the picker. `/subagents 1.2` opens that agent's chat directly. The switcher is an overlay that requires Pi's fullscreen mode (the default `tuiMode`).
+Open with `/subagents [id]`, **Ctrl+Shift+A**, or **Left Left** at the start of the editor. Requires fullscreen `tuiMode`. A live indicator above the editor shows active agents.
 
-The picker shows the subagent tree with each child's status, task, and current context percentage. The chat header shows the selected child's position, status, estimated tokens, context limit, and percentage. Usage follows Pi's context estimate, including cache tokens, context edits, compaction, and the current model—not cumulative billing or descendant charges. Above 70% it turns yellow, above 90% red (using the active theme). `?` means usage is not yet available, such as during startup or just after compaction, before the next response.
-
-The chat shows a Markdown conversation above a Pi-style multiline editor. Tool calls and results are grouped into compact, individually collapsible blocks. Command logs stream while tools are running, including nested tools. The root transcript shows background receipts and compact completion previews; expand tools for more output or open the switcher for the conversation.
-
-Incoming output follows the bottom only while viewing live output; scrolled history stays in place as new text arrives. The chat header shows `live` while following, or `↓N` for the rows below the view. Each agent retains its scroll position, tool expansion state, editor cursor, undo/history, and unsent draft while the switcher is open, including when you return to the picker.
-
-Picker:
-
-- **Up / Down**: select the previous/next agent. **Left** selects its parent; **Right** selects its first child, or opens a leaf's chat.
-- **Enter** or **click an agent**: open its chat.
-
-Chat:
-
-- **Left Arrow twice quickly** at the beginning of the message text: return to the picker. Elsewhere, Left only moves the text cursor.
-- **Enter**: send a message; steer an active run or continue a completed conversation, including a parent waiting for descendants. Steering waits for the current step, such as a long-running tool, and stays visible as *queued* until it is delivered. An agent that answers you during its delegated run has not finished it: if nothing else would wake it, a `subagent-resume` message returns it to the task, so your exchange neither stops the run nor becomes its result. Continuing a stopped/completed conversation bills its new usage to all ancestors without sending another result to its parent; that conversation is yours to lead, without resumption.
-- **Shift+Enter / Ctrl+J**: insert a newline; backslash followed by Enter also works in terminals without Shift+Enter support. Multiline paste, editing, undo, and prompt history use Pi's standard editor.
-- **PageUp / PageDown** or the **mouse wheel**: scroll the transcript (Pi's half-page and line scroll bindings work too); **Ctrl+Home** jumps to the beginning; **Ctrl+End** returns to live output.
-- **Click a tool header**: collapse/expand that tool's arguments and output, keeping the header in place. **Ctrl+O** expands/collapses all tools in the conversation.
-- **Click the editor**: move the text cursor.
-- **Ctrl+T**: show/hide thinking, independently of tool expansion.
-
-Both screens:
-
-- **Tab / Shift+Tab**: switch to the next/previous agent.
-- **Ctrl+C**: stop the selected agent and its descendants. Queued messages that were never delivered return to each agent's draft.
-- **Esc**: close the switcher.
+- **Picker**: tree with status, task, context %. **Up/Down** select, **Left** parent, **Right** child/open, **Enter**/click open.
+- **Chat**: **Enter** sends (steers a running agent or continues a finished one), **Shift+Enter**/**Ctrl+J** newline, **Left Left** back to the picker, **PgUp/PgDn**/wheel scroll, **Ctrl+Home/End** start/live, click a tool header to toggle, **Ctrl+O** toggle all, **Ctrl+T** thinking.
+- **Both**: **Tab/Shift+Tab** next/previous agent, **Ctrl+C** stop agent and descendants (undelivered input returns to the draft), **Esc** close.
 
 ## Development
 
-- `index.ts`: composition of the agent and UI integrations.
-- `runtime/`: non-blocking start, execution, hierarchy, cancellation, queued input, resumption after interruptions, delegated-usage billing, and raw live tool snapshots (`index.ts`); run results, usage summaries, and answered interruptions from raw entries (`summary.ts`). Every run bills its local usage delta to captured ancestor ledgers; summaries include descendant charges without rebilling them. Session creation, resumption, disposal, and the root ledger are injected, with no imports from `agent/` or `ui/`. Consumers get read-only `Subagent` views; run bookkeeping stays private.
-- `agent/`: Pi session creation/ownership (`sessions.ts`), local command tracking (`commands.ts`, `process-groups.ts`), lifecycle and the model-facing tool (`index.ts`), completion formatting and full-output files (`completions.ts`), and the message/receipt protocol shared with the UI (`protocol.ts`, pure data). One tracker serves both kinds of session through a `CommandHost`: a delegated run owns its jobs, which gate and end with it; the root only watches the user's and queues their exits with its results. The lifecycle binds an optional `SubagentView` to root sessions only. Children use a UI-free inline extension unless a configured installation replaces it.
-- `ui/`: commands, shortcuts, the running indicator and root Left-Left binding (`index.ts`, `running-indicator.ts`, `navigation.ts`), and the switcher: a content-sized overlay (`switcher.ts`) that owns view state, global keys and focus, and renders a controlled picker (`picker.ts`) or one chat per agent (`chat.ts`: header, follow-end transcript window, composer). Transcripts render through a per-block cache (`transcript.ts`); `context-usage.ts`, `composer.ts`, `tool-renderers.ts` and `text.ts` are leaves. Receives the runtime only through `SubagentView.bind` and reaches `agent/` only through `protocol.ts`. Human-facing guidance stays here, never in generated tool content.
-- `tests/`: runtime, session, and UI tests; UI tests drive real Pi sessions through the fullscreen renderer's input dispatcher, with the switcher mounted as an overlay (`fullscreen()` in `fixtures.ts`). `architecture.test.ts` enforces the layering and the absence of import cycles.
+- `runtime/`: execution, hierarchy, cancellation, input, resume, billing. Session lifecycle is injected; no imports from `agent/` or `ui/`.
+- `agent/`: Pi sessions, command tracking, the `subagent` tool, and `protocol.ts` (shared with the UI).
+- `ui/`: switcher, indicator, shortcuts. Reaches `agent/` only via `protocol.ts`.
+- `tests/`: `architecture.test.ts` enforces layering.
 
 ```sh
-cd tools/pi-subagents
-bun install
-bun run test
-bun run typecheck
-bunx biome check .
+bun install && bun run test && bun run typecheck && bun run lint
 ```

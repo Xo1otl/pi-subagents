@@ -5,6 +5,7 @@ import type { Provider } from "@earendil-works/pi-ai";
 import {
 	type AgentSession,
 	createAgentSession,
+	createBashToolDefinition,
 	DefaultResourceLoader,
 	type ExtensionContext,
 	SessionManager,
@@ -26,10 +27,15 @@ import {
 	until,
 } from "./fixtures.ts";
 
-const backgroundGuidance =
-	"BG jobs (e.g., `nohup`) tracked via PGID; exit → notify + resume if idle. Output/exit code not included; capture to file.";
-
 const parents: AgentSession[] = [];
+
+/** Wording is not under test: the guidance is whatever tracking adds to bash. */
+function addedGuidance(guidelines: readonly string[] | undefined): string {
+	const stock = createBashToolDefinition(".").promptGuidelines ?? [];
+	const added = (guidelines ?? []).filter((line) => !stock.includes(line));
+	expect(added).toHaveLength(1);
+	return added[0] ?? "";
+}
 const trees: Subagents[] = [];
 afterEach(async () => {
 	await Promise.all(trees.splice(0).map((tree) => tree.dispose()));
@@ -203,18 +209,22 @@ test("adds skill guidance to child system prompts only, and background guidance 
 		join(agentDir, "skills", "standard", "SKILL.md"),
 		"---\nname: standard\ndescription: STANDARD_SKILL_MARKER\n---\nSkill instructions.",
 	);
-	const guidance =
-		"Skip default skill-file loading for direct `skill://` paths.";
 	const base = parent.resourceLoader.getAppendSystemPrompt();
 	const guidelines = parent.getToolDefinition("bash")?.promptGuidelines;
-	expect(guidelines?.at(-1)).toBe(backgroundGuidance);
+	const backgroundGuidance = addedGuidance(guidelines);
 	expect(parent.systemPrompt).toContain(backgroundGuidance);
-	expect(parent.systemPrompt).not.toContain(guidance);
-	expect(base).not.toContain(guidance);
 
 	const result = await tree.start(ROOT, "nest:1", context).result;
 	expect(result.status).toBe("done");
 	expect(tree.tree().map((node) => node.id)).toEqual(["1", "1.1"]);
+	const [guidance = "", ...extra] =
+		tree
+			.get("1")
+			?.session?.resourceLoader.getAppendSystemPrompt()
+			.slice(base.length) ?? [];
+	expect(guidance).not.toBe("");
+	expect(extra).toEqual([]);
+	expect(base).not.toContain(guidance);
 	for (const node of tree.tree()) {
 		const appended = node.session?.resourceLoader.getAppendSystemPrompt();
 		expect(appended).toEqual([...base, guidance]);
@@ -231,9 +241,11 @@ test("adds skill guidance to child system prompts only, and background guidance 
 test.each(["inactive", "overridden"] as const)(
 	"does not advertise background tracking when bash is %s",
 	async (mode) => {
-		const { tree, context } = await setup({
+		const { parent, tree, context } = await setup({
 			settings: mode === "inactive" ? { defaultTools: ["read"] } : {},
 		});
+		const guidelines = parent.getToolDefinition("bash")?.promptGuidelines;
+		const backgroundGuidance = addedGuidance(guidelines);
 		if (mode === "overridden")
 			await configuredExtension(
 				context,
@@ -251,8 +263,8 @@ test.each(["inactive", "overridden"] as const)(
 		if (!child) throw new Error("Missing child");
 		if (mode === "inactive") {
 			expect(child.getActiveToolNames()).not.toContain("bash");
-			expect(child.getToolDefinition("bash")?.promptGuidelines).toContain(
-				backgroundGuidance,
+			expect(child.getToolDefinition("bash")?.promptGuidelines).toEqual(
+				guidelines,
 			);
 		} else {
 			expect(child.getToolDefinition("bash")?.promptGuidelines).toEqual([
