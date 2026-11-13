@@ -2,7 +2,10 @@ import { afterEach, describe, expect, mock, test } from "bun:test";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { createSubagentRuntime } from "../agent/index.ts";
-import type { SubagentCompletionDetails } from "../agent/protocol.ts";
+import {
+	SUBAGENT_RESUME_TYPE,
+	type SubagentCompletionDetails,
+} from "../agent/protocol.ts";
 import { ROOT, type Subagents } from "../runtime/index.ts";
 import {
 	blockingTool,
@@ -27,6 +30,41 @@ function runtime(): Subagents {
 afterEach(async () => {
 	await Promise.all(runtimes.splice(0).map((tree) => tree.dispose()));
 });
+
+/** Echoes its input, except that a resumed task reports its result. */
+const echo = stream((context) => {
+	const text = lastText(context);
+	return text === "monitor"
+		? toolCall("blocking", {})
+		: response(text.startsWith("Interruption handled") ? "task result" : text);
+});
+
+function resumptions(tree: Subagents, id: string): number {
+	return (
+		tree
+			.get(id)
+			?.session?.sessionManager.getEntries()
+			.filter(
+				(entry) =>
+					entry.type === "custom_message" &&
+					entry.customType === SUBAGENT_RESUME_TYPE,
+			).length ?? 0
+	);
+}
+
+function replies(tree: Subagents, id: string): string[] {
+	return (
+		tree
+			.get(id)
+			?.session?.messages.flatMap((message) =>
+				message.role === "assistant"
+					? message.content.flatMap((part) =>
+							part.type === "text" ? [part.text] : [],
+						)
+					: [],
+			) ?? []
+	);
+}
 
 describe("runtime factory", () => {
 	test("keeps IDs, subscriptions, and shutdown local to each instance", async () => {
@@ -323,7 +361,7 @@ describe("task results", () => {
 });
 
 describe("interaction and cleanup", () => {
-	test("steering at settlement is drained before reporting a final result", async () => {
+	test("steering at settlement is drained and answered, then the task reports the final result", async () => {
 		const tree = runtime();
 		let sent = false;
 		let subscribed = false;
@@ -338,23 +376,26 @@ describe("interaction and cleanup", () => {
 				}
 			});
 		});
-		const result = tree.start(ROOT, "initial", await spawnContext()).result;
-		expect((await result).output).toBe("late steering");
+		const result = tree.start(ROOT, "initial", await spawnContext(echo)).result;
+		expect((await result).output).toBe("task result");
+		expect(replies(tree, "1")).toEqual([
+			"initial",
+			"late steering",
+			"task result",
+		]);
 		expect(tree.get("1")?.session?.pendingMessageCount).toBe(0);
 	});
 
-	test("input sent during a long-running tool stays queued and visible, then steers", async () => {
+	test("input sent during a long-running tool stays queued and visible, then steers; its answer resumes the task instead of ending the run", async () => {
 		const tree = runtime();
-		const context = await spawnContext(
-			stream((context) =>
-				lastText(context) === "monitor"
-					? toolCall("blocking", {})
-					: response(lastText(context)),
-			),
-		);
+		const context = await spawnContext(echo);
 		const release = await blockingTool(context);
 		const result = tree.start(ROOT, "monitor", context).result;
 		const node = tree.get("1");
+		const statuses: (string | undefined)[] = [];
+		tree.subscribe(() => {
+			if (node?.status !== statuses.at(-1)) statuses.push(node?.status);
+		});
 		expect(node?.queuedInput).toEqual([]);
 		await until(() =>
 			[...(node?.liveTools.values() ?? [])].some(
@@ -366,7 +407,14 @@ describe("interaction and cleanup", () => {
 		await sent;
 		expect(node?.queuedInput).toEqual(["are you there?"]);
 		release.resolve();
-		expect((await result).output).toBe("are you there?");
+		// The reply to the user neither stops the run nor becomes its result.
+		expect(await result).toMatchObject({
+			status: "done",
+			output: "task result",
+		});
+		expect(replies(tree, "1")).toEqual(["are you there?", "task result"]);
+		expect(resumptions(tree, "1")).toBe(1);
+		expect(statuses).toEqual(["running", "done"]);
 		expect(node?.queuedInput).toEqual([]);
 	});
 

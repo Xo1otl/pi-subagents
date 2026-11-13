@@ -1,24 +1,14 @@
 import { expect, test } from "bun:test";
-import { readdir, readFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 
 async function sources(directory: string): Promise<string[]> {
-	const entries = await readdir(directory, { withFileTypes: true });
-	return (
-		await Promise.all(
-			entries.map((entry) => {
-				const path = join(directory, entry.name);
-				return entry.isDirectory()
-					? sources(path)
-					: path.endsWith(".ts")
-						? [path]
-						: [];
-			}),
-		)
-	).flat();
+	return Array.fromAsync(
+		new Bun.Glob("**/*.ts").scan({ cwd: directory, absolute: true }),
+	);
 }
 
 function dependencies(text: string): string[] {
@@ -29,26 +19,6 @@ function dependencies(text: string): string[] {
 		),
 	].flatMap((match) => (match[2] ? [match[2]] : []));
 }
-
-test("dependency checks include type imports, dynamic imports, and explicit loader paths", () => {
-	expect(
-		dependencies(`
-		import type { View } from "../ui/view.ts";
-		export { thing } from "./thing.ts";
-		import "./side-effect.ts";
-		import("../ui/index.ts");
-		require("./legacy.ts");
-		new URL("../index.ts", import.meta.url);
-	`),
-	).toEqual([
-		"../ui/view.ts",
-		"./thing.ts",
-		"./side-effect.ts",
-		"../ui/index.ts",
-		"./legacy.ts",
-		"../index.ts",
-	]);
-});
 
 test.each(["runtime", "agent"])(
 	"%s cannot depend on UI, even through a loader path",

@@ -8,9 +8,11 @@ import type {
 	AgentSessionEvent,
 	CreateAgentSessionOptions,
 	ExtensionError,
+	SessionEntry,
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import {
+	lastInterruption,
 	type RunSummary,
 	SUBAGENT_USAGE_KIND,
 	summarizeOwnUsage,
@@ -31,7 +33,8 @@ export interface SessionOwner {
 }
 
 export interface SubagentsOptions {
-	/** onCreated transfers cleanup ownership, even if initialization later rejects.
+	/** onCreated publishes the session and transfers cleanup ownership, even if
+	 * initialization later rejects. Resolution signals that binding is ready.
 	 * onError receives the session's extension errors, e.g. through bindExtensions.
 	 */
 	createSession: (
@@ -39,7 +42,11 @@ export interface SubagentsOptions {
 		owner: SessionOwner,
 		onCreated: (session: AgentSession) => void,
 		onError: (error: ExtensionError) => void,
-	) => Promise<AgentSession>;
+	) => Promise<void>;
+	/** Start a turn that returns an idle session to its delegated task, with a
+	 * message that is not the user's. Settles with that turn.
+	 */
+	resumeSession: (session: AgentSession) => Promise<void>;
 	disposeSession: (session: AgentSession) => Promise<void>;
 	/** Captured root ledger; billing never follows session replacement. */
 	rootSessionManager?: SessionManager;
@@ -195,6 +202,7 @@ function toolSnapshot(
 /** Owns one session's mutable state; all operations are safe to pass as callbacks. */
 export function createSubagents({
 	createSession,
+	resumeSession,
 	disposeSession,
 	rootSessionManager,
 }: SubagentsOptions): Subagents {
@@ -421,24 +429,43 @@ export function createSubagents({
 				initialized();
 			}
 
-			try {
-				// Prompts and deliveries can start further prompts and track more work.
-				// Recheck after the await: new completion/input preflight can arrive in
-				// the microtask that resolves it. Finalization below is synchronous.
-				do {
-					await settled(node.id);
-					await node.session?.waitForIdle();
-				} while (
-					completions.get(node.id)?.size ||
-					node.session?.isIdle === false
+			let entries: SessionEntry[];
+			let summary: RunSummary;
+			for (let resumedFrom: string | undefined; ; ) {
+				try {
+					// Prompts and deliveries can start further prompts and track more
+					// work. Recheck after the await: new completion/input preflight can
+					// arrive in the microtask that resolves it. The rest, up to
+					// resumption or finalization, is synchronous.
+					do {
+						await settled(node.id);
+						await node.session?.waitForIdle();
+					} while (
+						completions.get(node.id)?.size ||
+						node.session?.isIdle === false
+					);
+				} catch (error) {
+					recordError(node, error);
+				}
+				entries =
+					node.session?.sessionManager.getEntries().slice(firstEntry ?? 0) ??
+					[];
+				summary = summarizeRun(entries, node.cancelled, node.error);
+				// The parent receives a delegated run's last message, so a reply to
+				// the user must not be it: return to the task, once per interruption.
+				// A conversation the user continued is theirs to lead.
+				const interruption =
+					!sent && summary.status === "done"
+						? lastInterruption(entries)
+						: undefined;
+				if (!node.session || !interruption || interruption.id === resumedFrom)
+					break;
+				resumedFrom = interruption.id;
+				trackCompletion(
+					node.id,
+					Promise.resolve(node.session).then(resumeSession),
 				);
-			} catch (error) {
-				recordError(node, error);
 			}
-
-			const entries =
-				node.session?.sessionManager.getEntries().slice(firstEntry ?? 0) ?? [];
-			const summary = summarizeRun(entries, node.cancelled, node.error);
 			const usage = summarizeOwnUsage(entries);
 			// Bill before terminal listeners can restart a conversation. Each run's
 			// local delta reaches every captured ancestor exactly once, without a turn

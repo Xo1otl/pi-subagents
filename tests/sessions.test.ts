@@ -26,6 +26,9 @@ import {
 	until,
 } from "./fixtures.ts";
 
+const backgroundGuidance =
+	"BG jobs (e.g., `nohup`) tracked via PGID; PGID exit → notify + resume(if idle).";
+
 const parents: AgentSession[] = [];
 const trees: Subagents[] = [];
 afterEach(async () => {
@@ -191,7 +194,7 @@ test("loads workspace resources into a fresh, ephemeral child of a persistent pa
 	expect(JSON.stringify(child.messages)).not.toContain("an earlier task");
 });
 
-test("adds skill-read and background-resumption guidance to children and descendants only", async () => {
+test("adds skill guidance to child system prompts only, and background guidance to every tracked bash tool", async () => {
 	const { parent, tree, context, agentDir } = await setup({
 		streamFn: hierarchyStream,
 	});
@@ -202,10 +205,10 @@ test("adds skill-read and background-resumption guidance to children and descend
 	);
 	const guidance =
 		"Skip default skill-file loading for direct `skill://` paths.";
-	const wake =
-		"Background jobs tracked by PGID (incl. nohup); on group exit ⇒ notify (+ wake if idle).";
 	const base = parent.resourceLoader.getAppendSystemPrompt();
-	expect(parent.systemPrompt).not.toContain(wake);
+	const guidelines = parent.getToolDefinition("bash")?.promptGuidelines;
+	expect(guidelines?.at(-1)).toBe(backgroundGuidance);
+	expect(parent.systemPrompt).toContain(backgroundGuidance);
 	expect(parent.systemPrompt).not.toContain(guidance);
 	expect(base).not.toContain(guidance);
 
@@ -214,13 +217,55 @@ test("adds skill-read and background-resumption guidance to children and descend
 	expect(tree.tree().map((node) => node.id)).toEqual(["1", "1.1"]);
 	for (const node of tree.tree()) {
 		const appended = node.session?.resourceLoader.getAppendSystemPrompt();
-		expect(appended).toEqual([...base, guidance, wake]);
-		expect(node.session?.systemPrompt).toContain(wake);
+		expect(appended).toEqual([...base, guidance]);
+		expect(node.session?.getToolDefinition("bash")?.promptGuidelines).toEqual(
+			guidelines,
+		);
+		expect(node.session?.systemPrompt).toContain(backgroundGuidance);
 		expect(node.session?.systemPrompt).toContain(guidance);
 		expect(node.session?.systemPrompt).toContain("STANDARD_SKILL_MARKER");
 	}
 	expect(parent.systemPrompt).not.toContain(guidance);
 });
+
+test.each(["inactive", "overridden"] as const)(
+	"does not advertise background tracking when bash is %s",
+	async (mode) => {
+		const { tree, context } = await setup({
+			settings: mode === "inactive" ? { defaultTools: ["read"] } : {},
+		});
+		if (mode === "overridden")
+			await configuredExtension(
+				context,
+				`
+				pi.registerTool({
+					name: "bash", label: "Remote bash", description: "Remote execution",
+					parameters: { type: "object", properties: {} },
+					promptGuidelines: ["REMOTE_BASH_MARKER"],
+					async execute() { return { content: [{ type: "text", text: "remote" }], details: undefined }; }
+				});
+				`,
+			);
+		await tree.start(ROOT, "child", context).result;
+		const child = tree.get("1")?.session;
+		if (!child) throw new Error("Missing child");
+		if (mode === "inactive") {
+			expect(child.getActiveToolNames()).not.toContain("bash");
+			expect(child.getToolDefinition("bash")?.promptGuidelines).toContain(
+				backgroundGuidance,
+			);
+		} else {
+			expect(child.getToolDefinition("bash")?.promptGuidelines).toEqual([
+				"REMOTE_BASH_MARKER",
+			]);
+			expect(child.systemPrompt).toContain("REMOTE_BASH_MARKER");
+		}
+		expect(child.systemPrompt).not.toContain(backgroundGuidance);
+		expect(child.resourceLoader.getAppendSystemPrompt()).not.toContain(
+			backgroundGuidance,
+		);
+	},
+);
 
 test("provides machine-facing delegation in children without loading UI registrations", async () => {
 	const { tree, context } = await setup();

@@ -7,6 +7,7 @@ import type { SubagentResult } from "../runtime/index.ts";
  */
 export const SUBAGENT_RESULT_TYPE = "subagent-result";
 export const SUBAGENT_USAGE_TYPE = "subagent-usage";
+export const SUBAGENT_RESUME_TYPE = "subagent-resume";
 export const COMMAND_EXIT_TYPE = "subagent-command-exit";
 
 export interface SubagentReceipt {
@@ -23,10 +24,25 @@ export interface SubagentCompletionDetails {
 }
 
 export interface SubagentCompletionMessage {
-	customType: string;
+	customType: typeof SUBAGENT_RESULT_TYPE;
 	content: AgentToolResult<unknown>["content"];
 	display: boolean;
 	details: SubagentCompletionDetails;
+}
+
+export interface CommandExitDetails {
+	pgid: number;
+	command: string;
+	cwd: string;
+	/** A job that outlived its shell has no known status, not an implied success. */
+	exitCode: null;
+}
+
+export interface CommandExitMessage {
+	customType: typeof COMMAND_EXIT_TYPE;
+	content: string;
+	display: boolean;
+	details: CommandExitDetails;
 }
 
 /** Details may come from persisted sessions, so they are checked rather than trusted. */

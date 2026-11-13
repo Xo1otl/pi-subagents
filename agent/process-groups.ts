@@ -4,13 +4,19 @@ import { promisify } from "node:util";
 
 const exec = promisify(execFile);
 
-/** Wait independently of the shell/tool, without blocking the agent's turn. */
+/** Wait independently of the shell/tool, without blocking the agent's turn.
+ * Polling backs off, as a job may be a server that runs for days.
+ */
 export async function waitForGroupToFinish(
 	pgid: number,
 	signal?: AbortSignal,
 ): Promise<void> {
-	while (await isProcessGroupActive(pgid, signal))
-		await setTimeout(100, undefined, { signal });
+	for (
+		let delay = 100;
+		await isProcessGroupActive(pgid, signal);
+		delay = Math.min(delay * 2, 1000)
+	)
+		await setTimeout(delay, undefined, { signal });
 }
 
 /** A shell can exit before its background jobs, which retain its POSIX process

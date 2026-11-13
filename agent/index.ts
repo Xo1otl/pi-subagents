@@ -16,11 +16,13 @@ import {
 	type SubagentResult,
 	type Subagents,
 } from "../runtime/index.ts";
+import { trackCommands } from "./commands.ts";
 import {
 	discardSubagentCompletion,
 	subagentCompletionMessage,
 } from "./completions.ts";
 import {
+	type CommandExitMessage,
 	SUBAGENT_RESULT_TYPE,
 	SUBAGENT_USAGE_TYPE,
 	type SubagentCompletionMessage,
@@ -29,6 +31,7 @@ import {
 import {
 	createChildSession,
 	disposeChildSession,
+	resumeChildSession,
 	sessionOwner,
 	spawnContext,
 } from "./sessions.ts";
@@ -57,6 +60,7 @@ export function createSubagentRuntime(
 				onError,
 				subagentsExtension,
 			),
+		resumeSession: resumeChildSession,
 		disposeSession: disposeChildSession,
 	});
 }
@@ -69,6 +73,9 @@ export interface SubagentView {
 	dispose(): void;
 }
 
+/** What reaches the root's context without having been asked for in its turn. */
+type Notice = SubagentCompletionMessage | CommandExitMessage;
+
 interface SessionBinding {
 	runtime: Subagents;
 	/** Pi's public SessionManager behind the context's read-only view. */
@@ -80,10 +87,14 @@ interface SessionBinding {
 	accounting: SessionBoundaryDraft[];
 	/** Formatting artifacts remain ours until the queued message is persisted. */
 	pendingCompletions: Set<SubagentCompletionMessage>;
-	/** Root completions wait here while it is busy: an interrupt clears pi's queue. */
-	held: SubagentCompletionMessage[];
-	/** A one-shot root holds results until all of its delegated work has finished. */
+	/** Root notices wait here while it is busy: an interrupt clears pi's queue. */
+	held: Notice[];
+	/** A one-shot root holds notices until all of its background work has finished. */
 	awaitingResults: boolean;
+}
+
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
 }
 
 /** Wire Pi's lifecycle and return the undecorated, machine-facing tool. */
@@ -121,6 +132,8 @@ export function createSubagentIntegration(
 		} finally {
 			// Fence deliveries before awaiting cancellation or asynchronous initialization.
 			source?.stopWatchingAbort();
+			// Command watchers are tracked work, which shutdown would wait for.
+			commands?.stop();
 			binding = undefined;
 			const cleanup = source ? discardPending(source) : Promise.resolve();
 			if (owner) stopDelegated(owner);
@@ -142,14 +155,18 @@ export function createSubagentIntegration(
 		}
 	}
 
-	/** Persist held root completions in order; only the last may start a turn. */
+	/** Persist held root notices in order; only the last may start a turn. */
 	function release(source: SessionBinding, triggerTurn: boolean): void {
 		const messages = source.held.splice(0);
 		messages.forEach((message, index) => {
 			const trigger = triggerTurn && index === messages.length - 1;
-			pi.sendMessage(message, { deliverAs: "followUp", triggerTurn: trigger });
+			pi.sendMessage<Notice["details"]>(message, {
+				deliverAs: "followUp",
+				triggerTurn: trigger,
+			});
 			// An idle session appends an untriggered message at once, without message_end.
-			if (!trigger) source.pendingCompletions.delete(message);
+			if (!trigger && message.customType === SUBAGENT_RESULT_TYPE)
+				source.pendingCompletions.delete(message);
 		});
 	}
 
@@ -157,6 +174,44 @@ export function createSubagentIntegration(
 		if (isCurrent(source, ctx) && ctx.isIdle() && !source.awaitingResults)
 			release(source, true);
 	}
+
+	// A delegated session's jobs belong to its run (see delegatedCommands). The
+	// root's are the user's: watched for the model, never ended, and told like
+	// results, which an interrupt must not drop.
+	const commands = owner
+		? undefined
+		: trackCommands(pi, {
+				ownsJobs: false,
+				track(work, ctx) {
+					const source = binding;
+					if (!source || !isCurrent(source, ctx)) {
+						// No session is left to tell.
+						void work.catch(() => {});
+						return;
+					}
+					source.runtime.trackCompletion(
+						ROOT,
+						work.catch((error: unknown) => {
+							ctx.ui.notify(
+								`Background command tracking failed: ${errorMessage(error)}`,
+								"error",
+							);
+							// Print and JSON modes have no notifications; keep the
+							// rejection for the runtime's shutdown report.
+							throw error;
+						}),
+					);
+				},
+				listener(ctx) {
+					const source = binding;
+					if (!source || !isCurrent(source, ctx)) return undefined;
+					return (exit) => {
+						if (!isCurrent(source, ctx)) return;
+						source.held.push(exit);
+						releaseIfIdle(source, ctx);
+					};
+				},
+			});
 
 	function takeAccounting(ctx: ExtensionContext): SessionBoundaryDraft[] {
 		if (!binding || !isCurrent(binding, ctx)) return [];
@@ -272,7 +327,8 @@ export function createSubagentIntegration(
 					await discardPending(source);
 			} else {
 				if (ctx.mode === "print" || ctx.mode === "json") {
-					// One-shot modes exit after settling, which would cancel delegated work.
+					// One-shot modes exit after settling, which would cancel delegated
+					// work and leave command exits untold.
 					source.awaitingResults = true;
 					try {
 						await source.runtime.settled(ROOT);
@@ -370,7 +426,7 @@ export function createSubagentIntegration(
 				.catch((error: unknown) => {
 					if (canDeliver())
 						ctx.ui.notify(
-							`Subagent ${started.id} completion delivery failed: ${error instanceof Error ? error.message : String(error)}`,
+							`Subagent ${started.id} completion delivery failed: ${errorMessage(error)}`,
 							"error",
 						);
 					// Headless UI is a no-op. Keep the rejection for runtime settlement

@@ -1,40 +1,67 @@
 import { expect, mock, test } from "bun:test";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage } from "@earendil-works/pi-ai";
 import {
 	type AgentSession,
 	type AgentSessionEvent,
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
-import { createSubagents, ROOT, type SpawnContext } from "../runtime/index.ts";
+import {
+	createSubagents,
+	ROOT,
+	type SpawnContext,
+	type SubagentsOptions,
+} from "../runtime/index.ts";
 import { deferred, model, response, until } from "./fixtures.ts";
 
 const context: SpawnContext = { cwd: "/unused", model, projectTrusted: false };
 
+/** Only the SDK boundary is stubbed; entries use Pi's real ledger. */
+function sessionStub(overrides: Partial<AgentSession> = {}): AgentSession {
+	const sessionManager = SessionManager.inMemory();
+	return {
+		sessionManager,
+		subscribe: () => () => {},
+		prompt: async (text: string) => {
+			sessionManager.appendMessage(response(text));
+		},
+		waitForIdle: async () => {},
+		abort: async () => {},
+		clearQueue: () => ({ steering: [], followUp: [] }),
+		...overrides,
+	} as AgentSession;
+}
+
+function runtimeWith(
+	options: Pick<SubagentsOptions, "createSession"> & Partial<SubagentsOptions>,
+) {
+	return createSubagents({
+		resumeSession: async () => {},
+		disposeSession: async () => {},
+		...options,
+	});
+}
+
+function runtimeFor(
+	session: AgentSession,
+	options: Partial<SubagentsOptions> = {},
+) {
+	return runtimeWith({
+		createSession: async (_context, _owner, onCreated) => onCreated(session),
+		...options,
+	});
+}
+
 test("runtime owns execution but delegates session creation and disposal", async () => {
-	const entries: { type: "message"; message: AssistantMessage }[] = [];
 	const unsubscribe = mock(() => {});
 	const prompt = mock(async (_instructions: string) => {
-		entries.push({ type: "message", message: response("complete output") });
+		session.sessionManager.appendMessage(response("complete output"));
 	});
-	const session = {
-		subscribe: () => unsubscribe,
-		prompt,
-		waitForIdle: async () => {},
-		sessionManager: { getEntries: () => entries },
-	} as unknown as AgentSession;
+	const session = sessionStub({ subscribe: () => unsubscribe, prompt });
 	const disposeSession = mock(async (_session: AgentSession) => {});
-	const createSession = mock(
-		async (
-			_context: SpawnContext,
-			_owner: unknown,
-			onCreated: (session: AgentSession) => void,
-		) => {
-			onCreated(session);
-			return session;
-		},
+	const createSession = mock<SubagentsOptions["createSession"]>(
+		async (_context, _owner, onCreated) => onCreated(session),
 	);
-	const runtime = createSubagents({ createSession, disposeSession });
+	const runtime = runtimeFor(session, { createSession, disposeSession });
 	try {
 		expect(createSession).not.toHaveBeenCalled();
 		const result = await runtime.start(ROOT, "task instructions", context)
@@ -53,8 +80,8 @@ test("runtime owns execution but delegates session creation and disposal", async
 			id: "1",
 			status: "done",
 			output: "complete output",
+			usage: { totalTokens: 3 },
 		});
-		expect(result.usage.totalTokens).toBe(3);
 	} finally {
 		await runtime.dispose();
 		await runtime.dispose();
@@ -65,28 +92,12 @@ test("runtime owns execution but delegates session creation and disposal", async
 });
 
 test("ledger write failures do not leave completed runs stuck running or prevent reuse", async () => {
-	const entries: { type: "message"; message: AssistantMessage }[] = [];
 	const rootSessionManager = SessionManager.inMemory();
 	const appendUsage = rootSessionManager.appendUsage.bind(rootSessionManager);
 	rootSessionManager.appendUsage = () => {
 		throw new Error("ledger unavailable");
 	};
-	const session = {
-		subscribe: () => () => {},
-		prompt: async () => {
-			entries.push({ type: "message", message: response("done") });
-		},
-		waitForIdle: async () => {},
-		sessionManager: { getEntries: () => entries },
-	} as unknown as AgentSession;
-	const runtime = createSubagents({
-		rootSessionManager,
-		createSession: async (_context, _owner, onCreated) => {
-			onCreated(session);
-			return session;
-		},
-		disposeSession: async () => {},
-	});
+	const runtime = runtimeFor(sessionStub(), { rootSessionManager });
 	try {
 		await expect(
 			runtime.start(ROOT, "initial", context).result,
@@ -104,31 +115,19 @@ test("ledger write failures do not leave completed runs stuck running or prevent
 test("start reserves a running receipt synchronously, before session initialization", async () => {
 	const initialized = deferred();
 	const finished = deferred();
-	const entries: { type: "message"; message: AssistantMessage }[] = [];
-	const session = {
-		subscribe: () => () => {},
+	const session = sessionStub({
 		prompt: async () => {
 			await finished.promise;
-			entries.push({ type: "message", message: response("child finished") });
+			session.sessionManager.appendMessage(response("child finished"));
 		},
-		waitForIdle: async () => {},
-		sessionManager: { getEntries: () => entries },
-	} as unknown as AgentSession;
-	const createSession = mock(
-		async (
-			_context: SpawnContext,
-			_owner: unknown,
-			onCreated: (session: AgentSession) => void,
-		) => {
+	});
+	const createSession = mock<SubagentsOptions["createSession"]>(
+		async (_context, _owner, onCreated) => {
 			await initialized.promise;
 			onCreated(session);
-			return session;
 		},
 	);
-	const runtime = createSubagents({
-		createSession,
-		disposeSession: async () => {},
-	});
+	const runtime = runtimeFor(session, { createSession });
 	try {
 		const started = runtime.start(ROOT, "delayed child", context);
 		expect(started.id).toBe("1");
@@ -163,10 +162,7 @@ test("start validates synchronously without reserving nodes, and shutdown reject
 	const createSession = mock(async () => {
 		throw new Error("should not initialize");
 	});
-	const runtime = createSubagents({
-		createSession,
-		disposeSession: async () => {},
-	});
+	const runtime = runtimeWith({ createSession });
 	expect(() => runtime.start(ROOT, " ", context)).toThrow("must not be empty");
 	expect(() => runtime.start("missing", "hello", context)).toThrow(
 		"Unknown parent",
@@ -182,21 +178,13 @@ test("cancellation during session initialization prevents prompting and disposes
 	const initialized = deferred();
 	const entered = deferred();
 	const prompt = mock(async () => {});
-	const session = {
-		subscribe: () => () => {},
-		prompt,
-		waitForIdle: async () => {},
-		abort: async () => {},
-		clearQueue: () => {},
-		sessionManager: { getEntries: () => [] },
-	} as unknown as AgentSession;
+	const session = sessionStub({ prompt });
 	const disposeSession = mock(async () => {});
-	const runtime = createSubagents({
+	const runtime = runtimeFor(session, {
 		createSession: async (_context, _owner, onCreated) => {
 			entered.resolve();
 			await initialized.promise;
 			onCreated(session);
-			return session;
 		},
 		disposeSession,
 	});
@@ -213,7 +201,7 @@ test("cancellation during session initialization prevents prompting and disposes
 
 test("initialization failures are run data, and orphaned completion failures are reported at shutdown", async () => {
 	const disposeSession = mock(async (_session: AgentSession) => {});
-	const runtime = createSubagents({
+	const runtime = runtimeWith({
 		createSession: async () => {
 			throw new Error("session unavailable");
 		},
@@ -233,26 +221,16 @@ test("initialization failures are run data, and orphaned completion failures are
 });
 
 test("rejected completion work remains an error even when it drains before waitForIdle", async () => {
-	const entries: { type: "message"; message: AssistantMessage }[] = [];
-	const session = {
-		subscribe: () => () => {},
+	const session = sessionStub({
 		prompt: async () => {
 			runtime.trackCompletion(
 				"1",
 				Promise.reject(new Error("delivery failed")),
 			);
-			entries.push({ type: "message", message: response("otherwise done") });
+			session.sessionManager.appendMessage(response("otherwise done"));
 		},
-		waitForIdle: async () => {},
-		sessionManager: { getEntries: () => entries },
-	} as unknown as AgentSession;
-	const runtime = createSubagents({
-		createSession: async (_context, _owner, onCreated) => {
-			onCreated(session);
-			return session;
-		},
-		disposeSession: async () => {},
 	});
+	const runtime = runtimeFor(session);
 	try {
 		expect(await runtime.start(ROOT, "task", context).result).toMatchObject({
 			status: "error",
@@ -265,14 +243,9 @@ test("rejected completion work remains an error even when it drains before waitF
 });
 
 test("a send arriving after an idle snapshot but before finalization is drained and billed", async () => {
-	const entries: { type: "message"; message: AssistantMessage }[] = [];
 	let sent: Promise<void> | undefined;
 	let waits = 0;
-	const session = {
-		subscribe: () => () => {},
-		prompt: async (text: string) => {
-			entries.push({ type: "message", message: response(text) });
-		},
+	const session = sessionStub({
 		waitForIdle: async () => {
 			// Lands in the microtask that resolves the idle wait.
 			if (waits++ === 0)
@@ -280,15 +253,8 @@ test("a send arriving after an idle snapshot but before finalization is drained 
 					sent = runtime.send("1", "late input");
 				});
 		},
-		sessionManager: { getEntries: () => entries },
-	} as unknown as AgentSession;
-	const runtime = createSubagents({
-		createSession: async (_context, _owner, onCreated) => {
-			onCreated(session);
-			return session;
-		},
-		disposeSession: async () => {},
 	});
+	const runtime = runtimeFor(session);
 	try {
 		expect(await runtime.start(ROOT, "initial", context).result).toMatchObject({
 			output: "late input",
@@ -300,32 +266,75 @@ test("a send arriving after an idle snapshot but before finalization is drained 
 	}
 });
 
+test.each([true, false])(
+	"a delegated run that last answered the user resumes its task once per interruption; a continued run does not (resumption heard: %s)",
+	async (heard) => {
+		let interruption: string | undefined = "question";
+		let sent: Promise<void> | undefined;
+		const session = sessionStub({
+			// Like Pi, record the input that each reply answers.
+			prompt: async (text: string) => {
+				session.sessionManager.appendMessage({
+					role: "user",
+					content: text,
+					timestamp: Date.now(),
+				});
+				session.sessionManager.appendMessage(response(`re: ${text}`));
+			},
+			waitForIdle: async () => {
+				const text = interruption;
+				interruption = undefined;
+				if (text)
+					queueMicrotask(() => {
+						sent = runtime.send("1", text);
+					});
+			},
+		});
+		const resumeSession = mock(async (resumed: AgentSession) => {
+			// A resumption that adds nothing must not be repeated forever.
+			if (!heard) return;
+			resumed.sessionManager.appendCustomMessageEntry("resume", "resume", true);
+			resumed.sessionManager.appendMessage(response("task result"));
+		});
+		const runtime = runtimeFor(session, { resumeSession });
+		try {
+			expect(await runtime.start(ROOT, "task", context).result).toMatchObject({
+				status: "done",
+				output: heard ? "task result" : "re: question",
+			});
+			await sent;
+			expect(resumeSession).toHaveBeenCalledTimes(1);
+			interruption = "again";
+			await runtime.send("1", "continue");
+			await sent;
+			expect(session.sessionManager.getEntries().at(-1)).toMatchObject({
+				message: { content: [{ type: "text", text: "re: again" }] },
+			});
+			expect(runtime.get("1")?.status).toBe("done");
+			expect(resumeSession).toHaveBeenCalledTimes(1);
+		} finally {
+			await runtime.dispose();
+		}
+	},
+);
+
 test("failed binding revokes a published session and retry creates a fresh one", async () => {
-	const entries: { type: "message"; message: AssistantMessage }[] = [];
 	const unsubscribe = mock(() => {});
 	const failedPrompt = mock(async () => {
 		throw new Error("disposed session was reused");
 	});
-	const failed = {
+	const failed = sessionStub({
 		subscribe: () => unsubscribe,
 		prompt: failedPrompt,
-	} as unknown as AgentSession;
-	const good = {
-		subscribe: () => () => {},
-		prompt: async () => {
-			entries.push({ type: "message", message: response("retry complete") });
-		},
-		waitForIdle: async () => {},
-		sessionManager: { getEntries: () => entries },
-	} as unknown as AgentSession;
+	});
+	const good = sessionStub();
 	const disposeSession = mock(async (_session: AgentSession) => {});
 	let creates = 0;
-	const runtime = createSubagents({
+	const runtime = runtimeFor(good, {
 		createSession: async (_context, _owner, onCreated) => {
 			const session = creates++ === 0 ? failed : good;
 			onCreated(session);
 			if (session === failed) throw new Error("binding failed");
-			return session;
 		},
 		disposeSession,
 	});
@@ -359,16 +368,9 @@ test("disposal attempts every session and unsubscribe before reporting cleanup e
 		if (disposeSession.mock.calls.length === 1)
 			throw new Error("cleanup failed");
 	});
-	const runtime = createSubagents({
+	const runtime = runtimeWith({
 		createSession: async (_context, _owner, onCreated) => {
-			const session = {
-				subscribe: () => unsubscribe,
-				prompt: async () => {},
-				waitForIdle: async () => {},
-				sessionManager: { getEntries: () => [] },
-			} as unknown as AgentSession;
-			onCreated(session);
-			return session;
+			onCreated(sessionStub({ subscribe: () => unsubscribe }));
 		},
 		disposeSession,
 	});
@@ -391,24 +393,14 @@ test("disposal attempts every session and unsubscribe before reporting cleanup e
 
 test("abort failures are observed and reported at shutdown without skipping disposal", async () => {
 	const gate = deferred();
-	const session = {
-		subscribe: () => () => {},
+	const session = sessionStub({
 		prompt: async () => gate.promise,
-		waitForIdle: async () => {},
-		clearQueue: () => {},
 		abort: async () => {
 			throw new Error("abort failed");
 		},
-		sessionManager: { getEntries: () => [] },
-	} as unknown as AgentSession;
-	const disposeSession = mock(async () => {});
-	const runtime = createSubagents({
-		createSession: async (_context, _owner, onCreated) => {
-			onCreated(session);
-			return session;
-		},
-		disposeSession,
 	});
+	const disposeSession = mock(async () => {});
+	const runtime = runtimeFor(session, { disposeSession });
 	const started = runtime.start(ROOT, "task", context);
 	await until(() => Boolean(runtime.get("1")?.session));
 	runtime.abort("1");
@@ -422,24 +414,14 @@ test("abort failures are observed and reported at shutdown without skipping disp
 
 test("terminal listeners can restart without the old run clearing their operation", async () => {
 	const gate = deferred();
-	const entries: { type: "message"; message: AssistantMessage }[] = [];
 	let restarted: Promise<void> | undefined;
-	const session = {
-		subscribe: () => () => {},
+	const session = sessionStub({
 		prompt: async (text: string) => {
 			if (text === "restart") await gate.promise;
-			entries.push({ type: "message", message: response(text) });
+			session.sessionManager.appendMessage(response(text));
 		},
-		waitForIdle: async () => {},
-		sessionManager: { getEntries: () => entries },
-	} as unknown as AgentSession;
-	const runtime = createSubagents({
-		createSession: async (_context, _owner, onCreated) => {
-			onCreated(session);
-			return session;
-		},
-		disposeSession: async () => {},
 	});
+	const runtime = runtimeFor(session);
 	runtime.subscribe(() => {
 		if (runtime.get("1")?.status === "done" && !restarted)
 			restarted = runtime.send("1", "restart");
@@ -461,7 +443,6 @@ test("terminal listeners can restart without the old run clearing their operatio
 
 test("liveTools retains full raw snapshots, authoritative terminal results, and nested parent IDs until the next run", async () => {
 	let listener: (event: AgentSessionEvent) => void = () => {};
-	const entries: { type: "message"; message: AssistantMessage }[] = [];
 	const first: AgentToolResult<unknown> = {
 		content: [{ type: "text", text: "first" }],
 		details: { progress: 1 },
@@ -471,8 +452,8 @@ test("liveTools retains full raw snapshots, authoritative terminal results, and 
 		details: { complete: true },
 	};
 	let runs = 0;
-	const session = {
-		subscribe: (handler: typeof listener) => {
+	const session = sessionStub({
+		subscribe: (handler) => {
 			listener = handler;
 			return () => {};
 		},
@@ -515,18 +496,10 @@ test("liveTools retains full raw snapshots, authoritative terminal results, and 
 					isError: false,
 				});
 			} else expect(runtime.get("1")?.liveTools.size).toBe(0);
-			entries.push({ type: "message", message: response("done") });
+			session.sessionManager.appendMessage(response("done"));
 		},
-		waitForIdle: async () => {},
-		sessionManager: { getEntries: () => entries },
-	} as unknown as AgentSession;
-	const runtime = createSubagents({
-		createSession: async (_context, _owner, onCreated) => {
-			onCreated(session);
-			return session;
-		},
-		disposeSession: async () => {},
 	});
+	const runtime = runtimeFor(session);
 	try {
 		expect((await runtime.start(ROOT, "tools", context).result).status).toBe(
 			"done",

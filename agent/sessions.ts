@@ -17,7 +17,8 @@ import {
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import type { SessionOwner, SpawnContext } from "../runtime/index.ts";
-import { backgroundCommands } from "./commands.ts";
+import { delegatedCommands } from "./commands.ts";
+import { SUBAGENT_RESUME_TYPE } from "./protocol.ts";
 
 /** Each delegated session has its own event bus, which answers this request.
  * Unlike module state, the bus reaches every copy of this extension, including
@@ -79,7 +80,7 @@ export async function createChildSession(
 	onCreated: (session: AgentSession) => void,
 	onError: (error: ExtensionError) => void,
 	extension: ExtensionFactory,
-): Promise<AgentSession> {
+): Promise<void> {
 	const agentDir = context.agentDir ?? getAgentDir();
 	const settingsManager = SettingsManager.create(context.cwd, agentDir, {
 		projectTrusted: context.projectTrusted,
@@ -104,15 +105,10 @@ export async function createChildSession(
 		appendSystemPromptOverride: (base) => [
 			...base,
 			"Skip default skill-file loading for direct `skill://` paths.",
-			"Background jobs tracked by PGID (incl. nohup); on group exit ⇒ notify (+ wake if idle).",
 		],
 		extensionFactories: [
 			ownedWarming,
-			{
-				name: "subagent-commands",
-				factory: backgroundCommands(owner, settingsManager),
-				replaceable: true,
-			},
+			{ name: "subagent-commands", factory: delegatedCommands(owner) },
 			// A configured installation takes precedence, without duplicate registrations.
 			// Otherwise children receive only the machine-facing extension, not the UI entrypoint.
 			{
@@ -161,7 +157,20 @@ export async function createChildSession(
 		shutdownHandler: () => owner.runtime.abort(owner.id),
 		onError,
 	});
-	return session;
+}
+
+/** Return a delegated run to its task once it has answered the user. The
+ * promise settles with the turn, so startup failures fail the run.
+ */
+export function resumeChildSession(session: AgentSession): Promise<void> {
+	return session.sendCustomMessage(
+		{
+			customType: SUBAGENT_RESUME_TYPE,
+			content: "Interruption handled. Continue your task.",
+			display: true,
+		},
+		{ triggerTurn: true },
+	);
 }
 
 export async function disposeChildSession(

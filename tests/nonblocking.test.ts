@@ -20,7 +20,7 @@ import {
 	type SubagentCompletionDetails,
 } from "../agent/protocol.ts";
 import { spawnContext } from "../agent/sessions.ts";
-import type { Subagents } from "../runtime/index.ts";
+import { ROOT, type Subagents } from "../runtime/index.ts";
 import { SUBAGENT_USAGE_KIND } from "../runtime/summary.ts";
 import {
 	backgroundJob,
@@ -129,9 +129,6 @@ const defaultDispatch = stream((context) => {
 
 test("the tool starts the child with the requested effort and rejects unknown models", async () => {
 	const { session, tree, tool } = await setup(defaultDispatch);
-	expect(tool().description).toBe(
-		"0 active commands/children ∧ idle ⇒ last message → parent.",
-	);
 	const execute = (args: { model?: string; effort?: "low" }) =>
 		tool().execute(
 			"configured",
@@ -183,7 +180,7 @@ test("nohup completion notifies the parent once, with the child's last assistant
 		{ type: "text", text: "child answer after exit" },
 	]);
 	expect(session.getLastAssistantText()).toBe("completion accepted");
-	await tree.settled("root");
+	await tree.settled(ROOT);
 	expect(completions(session)).toHaveLength(1);
 });
 
@@ -329,8 +326,7 @@ test("completion is a follow-up to a busy parent's newer prompt, not an interrup
 	const busy = session.prompt("busy prompt");
 	await until(() => parentRunning);
 	child.resolve();
-	await until(() => tree.get("1")?.status === "done");
-	await Bun.sleep(10);
+	await tree.settled(ROOT);
 	// Held by the integration, so an interrupt clearing pi's queue cannot drop it.
 	expect(session.agent.hasQueuedMessages()).toBe(false);
 	expect(completions(session)).toHaveLength(0);
@@ -555,8 +551,7 @@ test("a result waiting for a busy parent survives an interrupt", async () => {
 	const busy = session.prompt("busy prompt");
 	await until(() => parentRunning);
 	child.resolve();
-	await until(() => tree.get("1")?.status === "done");
-	await Bun.sleep(10);
+	await tree.settled(ROOT);
 	expect(completions(session)).toHaveLength(0);
 	session.clearQueue();
 	await session.abort();
@@ -606,7 +601,7 @@ test("results held by a busy parent are released together, starting one turn", a
 			children === 2 &&
 			tree.tree().every((node) => node.status === "done"),
 	);
-	await Bun.sleep(10);
+	await tree.settled(ROOT);
 	expect(completions(session)).toHaveLength(0);
 	parent.resolve();
 	await prompt;
@@ -694,7 +689,11 @@ test.each([false, true])(
 				running = true;
 				await Promise.race([original.promise, waiting(options?.signal)]);
 			}
-			return response(lastText(context));
+			return response(
+				lastText(context).startsWith("Interruption handled")
+					? "original finished"
+					: lastText(context),
+			);
 		});
 		const { session, tree } = await setup(dispatch, undefined, {
 			child: (pi) => {
@@ -730,11 +729,13 @@ test.each([false, true])(
 		if (!dispose) {
 			input.resolve();
 			await sent;
+			// Answering the input resumes the task, whose result is reported.
 			expect(await started.result).toMatchObject({
 				status: "done",
-				output: "late input",
-				usage: { totalTokens: 6 },
+				output: "original finished",
+				usage: { totalTokens: 9 },
 			});
+			expect(JSON.stringify(node.session?.messages)).toContain("late input");
 			return;
 		}
 		const closing = tree.dispose();

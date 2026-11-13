@@ -1,15 +1,8 @@
 import { expect, test } from "bun:test";
-import {
-	createAgentSession,
-	DefaultResourceLoader,
-	type ExtensionFactory,
-	SessionManager,
-	SettingsManager,
-	type Theme,
-} from "@earendil-works/pi-coding-agent";
+import type { ExtensionFactory, Theme } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import extension from "../index.ts";
-import { spawnContext } from "./fixtures.ts";
+import { hierarchyStream, parentSession } from "./fixtures.ts";
 
 test.each([false, true])(
 	"other extensions can wrap subagent renderers regardless of load order (%s)",
@@ -40,29 +33,11 @@ test.each([false, true])(
 				};
 			});
 		};
-		const context = await spawnContext();
-		if (!context.agentDir) throw new Error("Missing test agent directory");
-		const settingsManager = SettingsManager.create(
-			context.cwd,
-			context.agentDir,
+		const session = await parentSession(
+			hierarchyStream,
+			wrapperFirst ? [wrapper, extension] : [extension, wrapper],
 		);
-		const resourceLoader = new DefaultResourceLoader({
-			cwd: context.cwd,
-			agentDir: context.agentDir,
-			settingsManager,
-			extensionFactories: wrapperFirst
-				? [wrapper, extension]
-				: [extension, wrapper],
-		});
-		await resourceLoader.reload();
-		const { session } = await createAgentSession({
-			...context,
-			settingsManager,
-			resourceLoader,
-			sessionManager: SessionManager.inMemory(context.cwd),
-		});
 		try {
-			await session.bindExtensions({ mode: "print" });
 			const tool = session.getToolDefinition("subagent");
 			const renderers = session.extensionRunner.resolveToolRenderers(
 				"subagent",

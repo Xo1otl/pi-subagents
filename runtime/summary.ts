@@ -16,7 +16,10 @@ export interface RunSummary {
 }
 
 /** Raw entries are the single source of billing, including descendant charges. */
-function summarizeUsage(entries: readonly SessionEntry[]): Usage {
+function summarizeUsage(
+	entries: readonly SessionEntry[],
+	ownOnly = false,
+): Usage {
 	const usage: Usage = {
 		input: 0,
 		output: 0,
@@ -25,17 +28,16 @@ function summarizeUsage(entries: readonly SessionEntry[]): Usage {
 		totalTokens: 0,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
-	const usages = entries.flatMap((entry) => {
-		if (entry.type === "message") {
-			const message = entry.message;
-			return (message.role === "assistant" || message.role === "toolResult") &&
-				message.usage
-				? [message.usage]
-				: [];
-		}
-		return "usage" in entry && entry.usage ? [entry.usage] : [];
-	});
-	for (const used of usages) {
+	for (const entry of entries) {
+		if (ownOnly && entry.type === "usage" && entry.kind === SUBAGENT_USAGE_KIND)
+			continue;
+		const used =
+			entry.type === "message"
+				? (entry.message.role === "assistant" ||
+						entry.message.role === "toolResult") &&
+					entry.message.usage
+				: "usage" in entry && entry.usage;
+		if (!used) continue;
 		usage.input += used.input;
 		usage.output += used.output;
 		usage.cacheRead += used.cacheRead;
@@ -60,11 +62,23 @@ function summarizeUsage(entries: readonly SessionEntry[]): Usage {
 
 /** Propagate only new, local charges; descendants bill every ancestor themselves. */
 export function summarizeOwnUsage(entries: readonly SessionEntry[]): Usage {
-	return summarizeUsage(
-		entries.filter(
-			(entry) => entry.type !== "usage" || entry.kind !== SUBAGENT_USAGE_KIND,
-		),
+	return summarizeUsage(entries, true);
+}
+
+/** The user's message that a run last answered, unless the run began with it
+ * or has moved on since: its task comes first, and every wake-up (a result, a
+ * command exit, a resumption) is a custom message.
+ */
+export function lastInterruption(
+	entries: readonly SessionEntry[],
+): SessionEntry | undefined {
+	const inputs = entries.filter(
+		(entry) =>
+			entry.type === "custom_message" ||
+			(entry.type === "message" && entry.message.role === "user"),
 	);
+	const last = inputs.at(-1);
+	return inputs.length > 1 && last?.type === "message" ? last : undefined;
 }
 
 /** Derive one run's result from the raw entries it appended.
