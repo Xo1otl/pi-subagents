@@ -167,6 +167,19 @@ export const hierarchyStream = stream((context) => {
 			? response(completion[2] ?? "")
 			: response("", { stopReason: "error", errorMessage: completion[2] });
 	}
+	// A resumed task restates its result.
+	if (text.startsWith("Continue task")) {
+		const previous = context.messages.findLast(
+			(message) => message.role === "assistant",
+		);
+		return response(
+			previous?.role === "assistant"
+				? previous.content
+						.flatMap((part) => (part.type === "text" ? [part.text] : []))
+						.join("\n")
+				: "",
+		);
+	}
 	const match = /^nest:(\d+)$/.exec(text);
 	if (match && Number(match[1]) > 0) {
 		return toolCall("subagent", {

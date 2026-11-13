@@ -65,22 +65,6 @@ export function summarizeOwnUsage(entries: readonly SessionEntry[]): Usage {
 	return summarizeUsage(entries, true);
 }
 
-/** The user's message that a run last answered, unless the run began with it
- * or has moved on since: its task comes first, and every wake-up (a result, a
- * command exit, a resumption) is a custom message.
- */
-export function lastInterruption(
-	entries: readonly SessionEntry[],
-): SessionEntry | undefined {
-	const inputs = entries.filter(
-		(entry) =>
-			entry.type === "custom_message" ||
-			(entry.type === "message" && entry.message.role === "user"),
-	);
-	const last = inputs.at(-1);
-	return inputs.length > 1 && last?.type === "message" ? last : undefined;
-}
-
 /** Derive one run's result from the raw entries it appended.
  * Raw entries survive compaction and context edits, so neither final output
  * nor billing disappears when a full pi session repairs its model context.

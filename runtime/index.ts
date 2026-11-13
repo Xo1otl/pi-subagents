@@ -12,7 +12,6 @@ import type {
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import {
-	lastInterruption,
 	type RunSummary,
 	SUBAGENT_USAGE_KIND,
 	summarizeOwnUsage,
@@ -118,6 +117,12 @@ export interface Subagents {
 }
 
 interface ActiveRun {
+	/** Started by the user continuing a conversation, which is theirs to lead. */
+	readonly userLed: boolean;
+	/** User input reached the agent since the run began or last resumed its task,
+	 * so its latest reply may answer the user rather than conclude the task.
+	 */
+	interrupted: boolean;
 	/** Serialize input preflight, not entire prompts or delegated runs. */
 	preflight: Promise<void>;
 	/** Settles once the run, including descendant delivery, finishes. */
@@ -306,11 +311,18 @@ export function createSubagents({
 		});
 		// Sent input is queued until the session queues, starts or handles it.
 		const input = { text: instructions };
+		// Only a user-led run's own input is sent; anything else the user sends
+		// interrupts a delegated task.
+		const interrupts = sent && !active.userLed;
 		if (sent) node.pendingInput.add(input);
 		const accepted = (disposition?: string) => {
 			const withdrawn = sent && !node.pendingInput.delete(input);
 			// Stopping already handed this input back; it must not reach the agent too.
 			if (withdrawn && disposition === "queued") node.session?.clearQueue();
+			// Whether queued, answered at once, or handled by an extension (which
+			// may still prompt the agent), the user's input interrupted the task.
+			else if (interrupts && disposition && !withdrawn)
+				active.interrupted = true;
 			resolvePreflight();
 		};
 		const prompt = previous.then(async () => {
@@ -381,6 +393,8 @@ export function createSubagents({
 		let settle = () => {};
 		// Track the whole delegated run before any lifecycle callback can request shutdown.
 		const active: ActiveRun = {
+			userLed: sent,
+			interrupted: false,
 			preflight: new Promise<void>((resolve) => {
 				initialized = resolve;
 			}),
@@ -431,7 +445,7 @@ export function createSubagents({
 
 			let entries: SessionEntry[];
 			let summary: RunSummary;
-			for (let resumedFrom: string | undefined; ; ) {
+			for (;;) {
 				try {
 					// Prompts and deliveries can start further prompts and track more
 					// work. Recheck after the await: new completion/input preflight can
@@ -452,15 +466,13 @@ export function createSubagents({
 					[];
 				summary = summarizeRun(entries, node.cancelled, node.error);
 				// The parent receives a delegated run's last message, so a reply to
-				// the user must not be it: return to the task, once per interruption.
-				// A conversation the user continued is theirs to lead.
-				const interruption =
-					!sent && summary.status === "done"
-						? lastInterruption(entries)
-						: undefined;
-				if (!node.session || !interruption || interruption.id === resumedFrom)
+				// the user must not be it. Whatever followed the user's input (tool
+				// calls, extension messages, results, command exits), the run returns
+				// to its task, or restates its result, once per batch of interruptions.
+				// User-led runs never set the flag.
+				if (!node.session || !active.interrupted || summary.status !== "done")
 					break;
-				resumedFrom = interruption.id;
+				active.interrupted = false;
 				trackCompletion(
 					node.id,
 					Promise.resolve(node.session).then(resumeSession),

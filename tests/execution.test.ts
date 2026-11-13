@@ -266,20 +266,36 @@ test("a send arriving after an idle snapshot but before finalization is drained 
 	}
 });
 
-test.each([true, false])(
-	"a delegated run that last answered the user resumes its task once per interruption; a continued run does not (resumption heard: %s)",
-	async (heard) => {
+test.each(
+	[true, false].flatMap((heard) =>
+		(["nothing", "context", "wake-up"] as const).map(
+			(follows) => [heard, follows] as const,
+		),
+	),
+)(
+	"a delegated run interrupted by the user resumes its task once per interruption, whatever follows its reply; a continued run does not (resumption heard: %s, after the input: %s)",
+	async (heard, follows) => {
 		let interruption: string | undefined = "question";
 		let sent: Promise<void> | undefined;
 		const session = sessionStub({
 			// Like Pi, record the input that each reply answers.
-			prompt: async (text: string) => {
-				session.sessionManager.appendMessage({
+			prompt: async (text, options) => {
+				options?.preflightResult?.("started");
+				const { sessionManager } = session;
+				sessionManager.appendMessage({
 					role: "user",
 					content: text,
 					timestamp: Date.now(),
 				});
-				session.sessionManager.appendMessage(response(`re: ${text}`));
+				// E.g. before_agent_start context, which follows the user's input.
+				if (follows === "context")
+					sessionManager.appendCustomMessageEntry("context", "context", false);
+				sessionManager.appendMessage(response(`re: ${text}`));
+				// E.g. a command exit that the agent acknowledges after its reply.
+				if (follows === "wake-up" && text !== "task") {
+					sessionManager.appendCustomMessageEntry("exit", "exit", true);
+					sessionManager.appendMessage(response("noted"));
+				}
 			},
 			waitForIdle: async () => {
 				const text = interruption;
@@ -300,16 +316,26 @@ test.each([true, false])(
 		try {
 			expect(await runtime.start(ROOT, "task", context).result).toMatchObject({
 				status: "done",
-				output: heard ? "task result" : "re: question",
+				output: heard
+					? "task result"
+					: follows === "wake-up"
+						? "noted"
+						: "re: question",
 			});
 			await sent;
 			expect(resumeSession).toHaveBeenCalledTimes(1);
 			interruption = "again";
 			await runtime.send("1", "continue");
 			await sent;
-			expect(session.sessionManager.getEntries().at(-1)).toMatchObject({
-				message: { content: [{ type: "text", text: "re: again" }] },
-			});
+			expect(
+				session.sessionManager
+					.getEntries()
+					.some(
+						(entry) =>
+							entry.type === "message" &&
+							JSON.stringify(entry.message).includes("re: again"),
+					),
+			).toBe(true);
 			expect(runtime.get("1")?.status).toBe("done");
 			expect(resumeSession).toHaveBeenCalledTimes(1);
 		} finally {

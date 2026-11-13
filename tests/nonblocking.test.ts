@@ -161,6 +161,9 @@ test("nohup completion notifies the parent once, with the child's last assistant
 			if (text.startsWith("Subagent ")) return response("completion accepted");
 			if (text.startsWith("Process group "))
 				return response("child answer after exit");
+			// The user's input interrupted the task, so the child restates it.
+			if (text.startsWith("Continue task"))
+				return response("child result restated");
 			if (text === "final update") return response("last child answer");
 			return response("available while job runs");
 		}),
@@ -177,7 +180,7 @@ test("nohup completion notifies the parent once, with the child's last assistant
 	expect(existsSync(job.finished)).toBe(true);
 	expect(completions(session)[0]?.content).toEqual([
 		{ type: "text", text: "Subagent 1 done." },
-		{ type: "text", text: "child answer after exit" },
+		{ type: "text", text: "child result restated" },
 	]);
 	expect(session.getLastAssistantText()).toBe("completion accepted");
 	await tree.settled(ROOT);

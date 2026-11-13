@@ -203,12 +203,14 @@ describe("silent hierarchy", () => {
 			expect(node?.session?.getLastAssistantText()).toBe("live continuation");
 			expect([...node.liveTools.keys()]).toEqual(tools);
 			gate.resolve();
+			// The continuation interrupted the task, so the parent restates its result.
 			expect(await started.result).toMatchObject({
 				status: "done",
 				output: "hello",
-				usage: { totalTokens: 15 },
+				usage: { totalTokens: 18 },
 			});
-			expect(node?.session?.getSessionStats().tokens.total).toBe(15);
+			expect(resumptions(tree, "1")).toBe(1);
+			expect(node?.session?.getSessionStats().tokens.total).toBe(18);
 		} finally {
 			gate.resolve();
 			await sent;

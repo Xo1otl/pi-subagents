@@ -117,6 +117,8 @@ test.each(["nohup", ""])(
 					return toolCall("bash", { command: second.command });
 				if (text.startsWith("Process group "))
 					return response("background checked");
+				if (text.startsWith("Continue task"))
+					return response("background checked, restated");
 				return response(
 					ctx.messages.at(-1)?.role === "toolResult" ? "latest reply" : text,
 				);
@@ -137,7 +139,7 @@ test.each(["nohup", ""])(
 		await second.release();
 		expect(await started.result).toMatchObject({
 			status: "done",
-			output: "background checked",
+			output: "background checked, restated",
 		});
 		expect(existsSync(first.finished)).toBe(true);
 		expect(existsSync(second.finished)).toBe(true);
@@ -156,6 +158,8 @@ test("command completion does not report a busy session's previous reply", async
 				await Promise.race([reply.promise, waiting(options?.signal)]);
 			if (text.startsWith("Process group "))
 				return response("verified after exit");
+			if (text.startsWith("Continue task"))
+				return response("verified after exit, restated");
 			return response(text);
 		}),
 	);
@@ -172,7 +176,7 @@ test("command completion does not report a busy session's previous reply", async
 	await sent;
 	expect(await started.result).toMatchObject({
 		status: "done",
-		output: "verified after exit",
+		output: "verified after exit, restated",
 	});
 });
 
