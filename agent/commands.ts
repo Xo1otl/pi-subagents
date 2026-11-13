@@ -219,7 +219,7 @@ export function trackCommands(
 			...bash,
 			promptGuidelines: [
 				...(bash.promptGuidelines ?? []),
-				"BG jobs (e.g., `nohup`) tracked via PGID; exit → notify + resume if idle. Output/exit code not included; capture to file.",
+				"BG jobs (e.g., `nohup`) tracked via original bash PGID; exit → notify + resume if idle. Output/exit code not included; capture to file.",
 			],
 			// Replace execution without enabling a tool excluded by defaultTools.
 			defaultActive: false,
