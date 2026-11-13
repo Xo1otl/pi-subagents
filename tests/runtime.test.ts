@@ -36,7 +36,7 @@ const echo = stream((context) => {
 	const text = lastText(context);
 	return text === "monitor"
 		? toolCall("blocking", {})
-		: response(text.startsWith("Interruption handled") ? "task result" : text);
+		: response(text.startsWith("Continue task") ? "task result" : text);
 });
 
 function resumptions(tree: Subagents, id: string): number {

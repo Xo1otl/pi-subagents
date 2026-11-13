@@ -690,7 +690,7 @@ test.each([false, true])(
 				await Promise.race([original.promise, waiting(options?.signal)]);
 			}
 			return response(
-				lastText(context).startsWith("Interruption handled")
+				lastText(context).startsWith("Continue task")
 					? "original finished"
 					: lastText(context),
 			);

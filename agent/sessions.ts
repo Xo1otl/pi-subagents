@@ -166,7 +166,7 @@ export function resumeChildSession(session: AgentSession): Promise<void> {
 	return session.sendCustomMessage(
 		{
 			customType: SUBAGENT_RESUME_TYPE,
-			content: "Interruption handled. Continue your task.",
+			content: "Continue task, or restate final result if done.",
 			display: true,
 		},
 		{ triggerTurn: true },
