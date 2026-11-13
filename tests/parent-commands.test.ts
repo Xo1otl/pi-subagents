@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import type { Provider } from "@earendil-works/pi-ai";
+import type { Provider, TranscriptContext } from "@earendil-works/pi-ai";
 import type {
 	AgentSession,
 	ExtensionContext,
@@ -17,6 +17,7 @@ import { ROOT, type Subagents } from "../runtime/index.ts";
 import {
 	backgroundJob,
 	deferred,
+	lastCustomMessage,
 	lastText,
 	parentSession,
 	response,
@@ -45,7 +46,10 @@ afterEach(async () => {
 
 /** A root that starts `job` when told to, with the rest of its replies given. */
 async function setup(
-	reply: (text: string, signal?: AbortSignal) => string | Promise<string>,
+	reply: (
+		context: TranscriptContext,
+		signal?: AbortSignal,
+	) => string | Promise<string>,
 	{
 		mode,
 		extensions = [],
@@ -63,7 +67,7 @@ async function setup(
 			return response(
 				context.messages.at(-1)?.role === "toolResult"
 					? "job started"
-					: await reply(text, options?.signal),
+					: await reply(context, options?.signal),
 			);
 		},
 	);
@@ -103,8 +107,10 @@ async function group(job: Job): Promise<number> {
 	return Number((await readFile(job.group, "utf8")).trim());
 }
 
-const checked = (text: string) =>
-	text.startsWith("Process group ") ? "checked after exit" : text;
+const checked = (context: TranscriptContext) =>
+	lastCustomMessage(context, COMMAND_EXIT_TYPE)
+		? "checked after exit"
+		: lastText(context);
 
 test("a parent's background job resumes it when idle, and private user commands stay untracked", async () => {
 	const { session, tree, job } = await setup(checked);
@@ -139,13 +145,14 @@ test("a job exit waits for a busy parent, survives its interrupt, and does not r
 	const busy = deferred();
 	let running = false;
 	let notified = 0;
-	const { session, tree, job } = await setup(async (text, signal) => {
+	const { session, tree, job } = await setup(async (context, signal) => {
+		const text = lastText(context);
 		if (text === "busy prompt") {
 			running = true;
 			await Promise.race([busy.promise, waiting(signal)]);
 		}
-		if (text.startsWith("Process group ")) notified++;
-		return checked(text);
+		if (lastCustomMessage(context, COMMAND_EXIT_TYPE)) notified++;
+		return checked(context);
 	});
 	try {
 		await session.prompt("start job");

@@ -12,10 +12,12 @@ import type {
 	OverlayHandle,
 	TUI,
 } from "@earendil-works/pi-tui";
+import { SUBAGENT_RESULT_TYPE } from "../agent/protocol.ts";
 import extension from "../index.ts";
 import { SWITCHER_OVERLAY } from "../ui/switcher.ts";
 import {
 	fullscreen,
+	lastCustomMessage,
 	lastText,
 	parentSession,
 	response,
@@ -41,7 +43,7 @@ test("a real root extension opens the switcher overlay from commands and the roo
 			);
 			return root ? waiting(options?.signal) : response(lastText(context));
 		}
-		if (lastText(context).startsWith("Subagent "))
+		if (lastCustomMessage(context, SUBAGENT_RESULT_TYPE))
 			return response("completion accepted");
 		const text = lastText(context);
 		if (text === "delegate")

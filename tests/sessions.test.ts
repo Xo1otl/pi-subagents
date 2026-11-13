@@ -17,6 +17,7 @@ import extension from "../index.ts";
 import { ROOT, type SpawnContext, type Subagents } from "../runtime/index.ts";
 import {
 	hierarchyStream,
+	lastCompletion,
 	lastText,
 	model,
 	response,
@@ -305,8 +306,8 @@ test("configured web search remains available throughout nested delegation", asy
 		settings: { defaultTools: ["read", "grep"] },
 		streamFn: stream((context) => {
 			const text = lastText(context);
-			if (text.startsWith("Subagent "))
-				return response(text.split("\n").slice(1).join("\n"));
+			const completion = lastCompletion(context);
+			if (completion) return response(completion.output);
 			if (context.messages.at(-1)?.role === "toolResult") return response(text);
 			return text === "delegate search"
 				? toolCall("subagent", { instructions: "search" })
@@ -341,8 +342,8 @@ test("runs recursive delegation through pi's codemode extension", async () => {
 		settings: { defaultTools: ["+codemode"] },
 		streamFn: stream((context) => {
 			const text = lastText(context);
-			if (text.startsWith("Subagent "))
-				return response(text.split("\n").slice(1).join("\n"));
+			const completion = lastCompletion(context);
+			if (completion) return response(completion.output);
 			if (context.messages.at(-1)?.role === "toolResult") return response(text);
 			return toolCall("codemode", {
 				code:

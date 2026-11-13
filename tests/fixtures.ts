@@ -30,8 +30,15 @@ import {
 	TUI_KEYBINDINGS,
 	TuiAltScreen,
 } from "@earendil-works/pi-tui";
+import { SUBAGENT_RESUME_TYPE } from "../agent/protocol.ts";
 import type { SpawnContext } from "../runtime/index.ts";
 import { SWITCHER_OVERLAY } from "../ui/switcher.ts";
+import protocolFixture, {
+	lastCompletion,
+	lastCustomMessage,
+} from "./protocol.ts";
+
+export { lastCompletion, lastCustomMessage } from "./protocol.ts";
 
 export const model: Model<"openai-responses"> = {
 	id: "test-model",
@@ -159,16 +166,17 @@ export const hierarchyStream = stream((context) => {
 			? response("", { stopReason: "error", errorMessage: text })
 			: response("Delegated work is running.");
 	}
-	const completion = /^Subagent [\d.]+ (done|error|aborted)\.\n([\s\S]*)$/.exec(
-		text,
-	);
+	const completion = lastCompletion(context);
 	if (completion) {
-		return completion[1] === "done"
-			? response(completion[2] ?? "")
-			: response("", { stopReason: "error", errorMessage: completion[2] });
+		return completion.status === "done"
+			? response(completion.output)
+			: response("", {
+					stopReason: "error",
+					errorMessage: completion.error ?? completion.output,
+				});
 	}
 	// A resumed task restates its result.
-	if (text.startsWith("Continue task")) {
+	if (lastCustomMessage(context, SUBAGENT_RESUME_TYPE)) {
 		const previous = context.messages.findLast(
 			(message) => message.role === "assistant",
 		);
@@ -231,6 +239,11 @@ export async function spawnContext(
 	const agentDir = join(directory, "agent");
 	await mkdir(cwd);
 	await mkdir(agentDir);
+	await mkdir(join(agentDir, "extensions"));
+	await writeFile(
+		join(agentDir, "extensions", "protocol.js"),
+		`export { default } from ${JSON.stringify(new URL("./protocol.ts", import.meta.url).pathname)};`,
+	);
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 	await writeFile(
 		join(agentDir, "settings.json"),
@@ -283,7 +296,7 @@ export async function parentSession(
 		onChildStart,
 		onChildLoad,
 	});
-	await mkdir(join(context.agentDir, "extensions"));
+	await mkdir(join(context.agentDir, "extensions"), { recursive: true });
 	await writeFile(
 		join(context.agentDir, "extensions", "provider.js"),
 		`export default function(pi) {
@@ -308,6 +321,7 @@ export async function parentSession(
 		noPromptTemplates: true,
 		noThemes: true,
 		extensionFactories: [
+			protocolFixture,
 			// reload() resets API registrations; restore the root's deterministic provider too.
 			(pi) => pi.registerProvider(testProvider(streamFn)),
 			...extensionFactories,

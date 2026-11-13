@@ -15,7 +15,9 @@ import {
 	type SubagentView,
 } from "../agent/index.ts";
 import {
+	COMMAND_EXIT_TYPE,
 	SUBAGENT_RESULT_TYPE,
+	SUBAGENT_RESUME_TYPE,
 	SUBAGENT_USAGE_TYPE,
 	type SubagentCompletionDetails,
 } from "../agent/protocol.ts";
@@ -25,6 +27,7 @@ import { SUBAGENT_USAGE_KIND } from "../runtime/summary.ts";
 import {
 	backgroundJob,
 	deferred,
+	lastCustomMessage,
 	lastText,
 	model,
 	parentSession,
@@ -121,7 +124,8 @@ const defaultDispatch = stream((context) => {
 		return toolCall("subagent", { instructions: "child task" });
 	if (context.messages.at(-1)?.role === "toolResult")
 		return response("parent available");
-	if (text.startsWith("Subagent ")) return response("completion accepted");
+	if (lastCustomMessage(context, SUBAGENT_RESULT_TYPE))
+		return response("completion accepted");
 	return response(
 		text === "child task" ? "child answer" : "another prompt accepted",
 	);
@@ -158,11 +162,12 @@ test("nohup completion notifies the parent once, with the child's last assistant
 				if (!job) throw new Error("Missing job");
 				return toolCall("bash", { command: job.command });
 			}
-			if (text.startsWith("Subagent ")) return response("completion accepted");
-			if (text.startsWith("Process group "))
+			if (lastCustomMessage(context, SUBAGENT_RESULT_TYPE))
+				return response("completion accepted");
+			if (lastCustomMessage(context, COMMAND_EXIT_TYPE))
 				return response("child answer after exit");
 			// The user's input interrupted the task, so the child restates it.
-			if (text.startsWith("Continue task"))
+			if (lastCustomMessage(context, SUBAGENT_RESUME_TYPE))
 				return response("child result restated");
 			if (text === "final update") return response("last child answer");
 			return response("available while job runs");
@@ -317,7 +322,7 @@ test("completion is a follow-up to a busy parent's newer prompt, not an interrup
 			await Promise.race([parent.promise, waiting(options?.signal)]);
 			return response("newer prompt finished");
 		}
-		if (text.startsWith("Subagent ")) {
+		if (lastCustomMessage(context, SUBAGENT_RESULT_TYPE)) {
 			completionRequests++;
 			return response("completion accepted");
 		}
@@ -483,7 +488,7 @@ test("a result arriving during an interrupt is kept without restarting the turn"
 			parentRunning = true;
 			return waiting(options?.signal);
 		}
-		if (text.startsWith("Subagent ")) completionRequests++;
+		if (lastCustomMessage(context, SUBAGENT_RESULT_TYPE)) completionRequests++;
 		if (text === "another prompt")
 			resultInContext = JSON.stringify(context.messages).includes(
 				"child answer",
@@ -545,7 +550,7 @@ test("a result waiting for a busy parent survives an interrupt", async () => {
 			parentRunning = true;
 			return waiting(options?.signal);
 		}
-		if (text.startsWith("Subagent ")) completionRequests++;
+		if (lastCustomMessage(context, SUBAGENT_RESULT_TYPE)) completionRequests++;
 		return defaultDispatch(model, context, options).result();
 	});
 	const { session, tree } = await setup(dispatch);
@@ -590,7 +595,7 @@ test("results held by a busy parent are released together, starting one turn", a
 			await Promise.race([parent.promise, waiting(options?.signal)]);
 			return response("parent finished");
 		}
-		if (text.startsWith("Subagent ")) {
+		if (lastCustomMessage(context, SUBAGENT_RESULT_TYPE)) {
 			completionRequests++;
 			return response("completions accepted");
 		}
@@ -693,7 +698,7 @@ test.each([false, true])(
 				await Promise.race([original.promise, waiting(options?.signal)]);
 			}
 			return response(
-				lastText(context).startsWith("Continue task")
+				lastCustomMessage(context, SUBAGENT_RESUME_TYPE)
 					? "original finished"
 					: lastText(context),
 			);

@@ -11,6 +11,7 @@ import {
 	blockingTool,
 	deferred,
 	hierarchyStream,
+	lastCustomMessage,
 	lastText,
 	model,
 	response,
@@ -36,7 +37,9 @@ const echo = stream((context) => {
 	const text = lastText(context);
 	return text === "monitor"
 		? toolCall("blocking", {})
-		: response(text.startsWith("Continue task") ? "task result" : text);
+		: response(
+				lastCustomMessage(context, SUBAGENT_RESUME_TYPE) ? "task result" : text,
+			);
 });
 
 function resumptions(tree: Subagents, id: string): number {

@@ -6,11 +6,16 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createSubagentRuntime } from "../agent/index.ts";
 import { waitForGroupToFinish } from "../agent/process-groups.ts";
-import { COMMAND_EXIT_TYPE } from "../agent/protocol.ts";
+import {
+	COMMAND_EXIT_TYPE,
+	SUBAGENT_RESULT_TYPE,
+	SUBAGENT_RESUME_TYPE,
+} from "../agent/protocol.ts";
 import { ROOT, type Subagents } from "../runtime/index.ts";
 import {
 	backgroundJob,
 	deferred,
+	lastCustomMessage,
 	lastText,
 	response,
 	spawnContext,
@@ -115,9 +120,9 @@ test.each(["nohup", ""])(
 					return toolCall("bash", { command: first.command });
 				if (text === "second")
 					return toolCall("bash", { command: second.command });
-				if (text.startsWith("Process group "))
+				if (lastCustomMessage(ctx, COMMAND_EXIT_TYPE))
 					return response("background checked");
-				if (text.startsWith("Continue task"))
+				if (lastCustomMessage(ctx, SUBAGENT_RESUME_TYPE))
 					return response("background checked, restated");
 				return response(
 					ctx.messages.at(-1)?.role === "toolResult" ? "latest reply" : text,
@@ -156,9 +161,9 @@ test("command completion does not report a busy session's previous reply", async
 			if (text === "start") return toolCall("bash", { command: job.command });
 			if (text === "still thinking")
 				await Promise.race([reply.promise, waiting(options?.signal)]);
-			if (text.startsWith("Process group "))
+			if (lastCustomMessage(ctx, COMMAND_EXIT_TYPE))
 				return response("verified after exit");
-			if (text.startsWith("Continue task"))
+			if (lastCustomMessage(ctx, SUBAGENT_RESUME_TYPE))
 				return response("verified after exit, restated");
 			return response(text);
 		}),
@@ -222,14 +227,14 @@ test.each(["command", "child"] as const)(
 				if (text === "start") return toolCall("bash", { command: job.command });
 				if (last?.role === "toolResult" && last.toolName === "bash")
 					return toolCall("subagent", { instructions: "child work" });
-				if (text.startsWith("Process group "))
+				if (lastCustomMessage(ctx, COMMAND_EXIT_TYPE))
 					return response("checked background");
 				if (text === "child work") {
 					await Promise.race([child.promise, waiting(options?.signal)]);
 					return response("child finished");
 				}
 				return response(
-					text.startsWith("Subagent ")
+					lastCustomMessage(ctx, SUBAGENT_RESULT_TYPE)
 						? "final parent answer"
 						: "waiting for all",
 				);
@@ -287,7 +292,7 @@ test("a command-exit wake can launch another background command before reporting
 		stream((ctx) => {
 			const text = lastText(ctx);
 			if (text === "start") return toolCall("bash", { command: first.command });
-			if (text.startsWith("Process group ")) {
+			if (lastCustomMessage(ctx, COMMAND_EXIT_TYPE)) {
 				notifications++;
 				return notifications === 1
 					? toolCall("bash", { command: second.command })
@@ -351,7 +356,7 @@ test("configured bash overrides are not silently replaced with local execution",
 	);
 	if (!context.agentDir) throw new Error("Missing agent directory");
 	const directory = join(context.agentDir, "extensions");
-	await mkdir(directory);
+	await mkdir(directory, { recursive: true });
 	await writeFile(
 		join(directory, "remote.js"),
 		`export default function(pi) {
@@ -377,7 +382,7 @@ test("failed commands still wait for jobs they already started and retain shell 
 						command: `${job.command}\nprintf '%s' "$PREFIX_VALUE"; exit 7`,
 					})
 				: response(
-						lastText(ctx).startsWith("Process group ")
+						lastCustomMessage(ctx, COMMAND_EXIT_TYPE)
 							? "checked after shell failure"
 							: lastText(ctx),
 					),
