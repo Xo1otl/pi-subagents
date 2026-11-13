@@ -21,8 +21,7 @@ pi -e ./tools/pi-subagents/index.ts   # or: pi install ./tools/pi-subagents
 - Bash process groups are tracked, including `&`/`nohup` jobs that outlive their shell. On exit, `bg-exit` wakes the agent if idle, or queues for its next turn. It holds no output or exit code.
 - Subagents own their jobs: Ctrl+C and shutdown stop them.
 - The root watches its own jobs and your `!` commands (`!!` stays private), never stopping them.
-- Untracked: `setsid`/`setpgid`, bash overrides, and other tools' processes. On Windows, nothing is tracked.
-- To start an untracked daemon, use `setsid -f cmd`: it forks, so no shell is left in the group waiting on the daemon and holding a subagent's run open.
+- Untracked: `setsid`/`setpgid` (detach with `setsid -f cmd`), bash overrides, and other tools' processes. On Windows, nothing is tracked.
 
 ## Switcher
 
