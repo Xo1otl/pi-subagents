@@ -166,7 +166,8 @@ export function resumeChildSession(session: AgentSession): Promise<void> {
 	return session.sendCustomMessage(
 		{
 			customType: SUBAGENT_RESUME_TYPE,
-			content: "Continue the task; if done, report its outcome to the parent.",
+			content:
+				"Resume the original task; if done, report back on the full task (including user changes), as the parent hasn't seen this chat.",
 			display: true,
 		},
 		{ triggerTurn: true },
