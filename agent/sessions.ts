@@ -182,7 +182,7 @@ export function resumeChildSession(session: AgentSession): Promise<void> {
 		{
 			customType: SUBAGENT_RESUME_TYPE,
 			content:
-				"You are a subagent. 1st chat msg was from parent, who can't see this chat; intervening msgs from user. Incomplete → resume; done → report to parent.",
+				"You are a subagent. 1st chat msg was from parent, who can't see this chat; intervening msgs from user. Task incomplete → resume; done → report to parent.",
 			display: true,
 		},
 		{ triggerTurn: true },
