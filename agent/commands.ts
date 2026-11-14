@@ -66,7 +66,7 @@ function commandExit(
 ): CommandExitMessage {
 	return {
 		customType: COMMAND_EXIT_TYPE,
-		content: `Process group ${pgid} exited: ${commandPreview(command)}`,
+		content: `PGID ${pgid} exited: ${commandPreview(command)}`,
 		display: true,
 		details: { pgid, command, cwd, exitCode: null },
 	};

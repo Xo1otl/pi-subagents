@@ -155,7 +155,7 @@ test.each(["nohup", ""])(
 			),
 		).toBe(true);
 		expect(exits(tree)[0]).toMatchObject({
-			content: `Process group ${pgid} exited: ${first.command.slice(0, 200)} …`,
+			content: `PGID ${pgid} exited: ${first.command.slice(0, 200)} …`,
 		});
 	},
 );
