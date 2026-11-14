@@ -219,7 +219,7 @@ export function trackCommands(
 			...bash,
 			promptGuidelines: [
 				...(bash.promptGuidelines ?? []),
-				"BG jobs (`nohup`, etc.) tracked via bash PGID; exit → notify + resume if idle (no output/exit code reported; log to file). Awaited: launch (e.g. `nohup cmd > log 2>&1 &`) → check once → notified on exit. Outliving session: leave the PGID, e.g. `setsid -f cmd`, not `… && setsid cmd &` (subshell keeps it). Avoid sleep-poll.",
+				"BG jobs (`nohup`, etc.) tracked via bash PGID; exit → notify + resume if idle (no output/exit code reported; log to file). Awaited: launch (e.g. `nohup cmd > log 2>&1 &`) → check once → notified on exit. Outliving session: leave the PGID, e.g. `setsid -f cmd`, not `… && setsid cmd &` (subshell keeps it). Avoid foreground sleep-poll.",
 			],
 			// Replace execution without enabling a tool excluded by defaultTools.
 			defaultActive: false,
