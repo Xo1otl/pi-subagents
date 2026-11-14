@@ -142,6 +142,21 @@ test.each(["nohup", ""])(
 		expect(existsSync(first.finished)).toBe(true);
 		expect(existsSync(second.finished)).toBe(true);
 		expect(exits(tree)).toHaveLength(2);
+		// The launch result names the group; its exit notice stays one line.
+		const pgid = await first.pgid();
+		const messages = tree.get("1")?.session?.messages ?? [];
+		expect(
+			messages.some(
+				(message) =>
+					message.role === "toolResult" &&
+					JSON.stringify(message.content).includes(
+						`[PGID ${pgid} running; exit will be notified]`,
+					),
+			),
+		).toBe(true);
+		expect(exits(tree)[0]).toMatchObject({
+			content: `Process group ${pgid} exited: ${first.command.slice(0, 200)} …`,
+		});
 	},
 );
 

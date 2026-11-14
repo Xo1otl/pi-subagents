@@ -9,7 +9,6 @@ import {
 	type ExtensionContext,
 	type ExtensionFactory,
 	SettingsManager,
-	truncateHead,
 } from "@earendil-works/pi-coding-agent";
 import { hasErrorCode } from "../runtime/errors.ts";
 import type { SessionOwner } from "../runtime/index.ts";
@@ -50,15 +49,24 @@ interface TrackedSession {
 	readonly prefix: string | undefined;
 }
 
+/** Enough of a command to tell its exit apart: its first line, capped. The
+ * launch result names the PGID; details keep the full command.
+ */
+function commandPreview(command: string): string {
+	const lines = command.split("\n").filter((line) => line.trim());
+	const first = [...(lines[0]?.trim() ?? "")];
+	const preview = first.slice(0, 200).join("");
+	return first.length > 200 || lines.length > 1 ? `${preview} …` : preview;
+}
+
 function commandExit(
 	pgid: number,
 	command: string,
 	cwd: string,
 ): CommandExitMessage {
-	const preview = truncateHead(command, { maxLines: 20, maxBytes: 4096 });
 	return {
 		customType: COMMAND_EXIT_TYPE,
-		content: `Process group ${pgid} exited:\n${preview.content}${preview.truncated ? "\n[command truncated]" : ""}`,
+		content: `Process group ${pgid} exited: ${commandPreview(command)}`,
 		display: true,
 		details: { pgid, command, cwd, exitCode: null },
 	};
@@ -119,7 +127,7 @@ export function trackCommands(
 		command: string,
 		cwd: string,
 		aborted: boolean,
-	): Promise<void> {
+	): Promise<number | undefined> {
 		const pgid = await recordedGroup(path);
 		// Foreground-only commands are already reported by their tool result.
 		// Only groups that outlive the shell/tool need an asynchronous wakeup.
@@ -149,6 +157,7 @@ export function trackCommands(
 				}),
 			ctx,
 		);
+		return pgid;
 	}
 
 	const operations: BashOperations = {
@@ -159,6 +168,12 @@ export function trackCommands(
 				host.track(Promise.reject(error), from.ctx);
 			const directory = await mkdtemp(join(tmpdir(), "pi-subagents-command-"));
 			const path = join(directory, "pgid");
+			// The bash tool keeps accepting output until exec settles.
+			let endsLine = true;
+			const onData = (data: Buffer) => {
+				if (data.length) endsLine = data[data.length - 1] === 0x0a;
+				options.onData(data);
+			};
 			try {
 				// Pi's local backend starts a detached shell: $$ is its PGID. A
 				// private side channel preserves stdout/stderr, streaming, timeouts,
@@ -167,7 +182,7 @@ export function trackCommands(
 				return await from.shell.exec(
 					`command printf '%s\\n' "$$" > ${quoted} || exit\n${command}`,
 					cwd,
-					options,
+					{ ...options, onData },
 				);
 			} finally {
 				// Do not expose configuration-only shell prefixes in model messages.
@@ -177,13 +192,20 @@ export function trackCommands(
 						: command;
 				// Tracking failures are the host's to report: they must neither
 				// replace the command's own outcome nor pass for a handled tool error.
-				await record(
+				const pgid = await record(
 					from,
 					path,
 					submitted,
 					cwd,
 					options.signal?.aborted === true,
 				).catch(fail);
+				// Name the tracked group at launch, so its exit notice can stay short.
+				if (pgid !== undefined)
+					options.onData(
+						Buffer.from(
+							`${endsLine ? "" : "\n"}[PGID ${pgid} running; exit will be notified]\n`,
+						),
+					);
 				await rm(directory, { recursive: true, force: true }).catch(fail);
 			}
 		},
