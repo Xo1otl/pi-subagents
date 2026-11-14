@@ -6,19 +6,40 @@ import { hasErrorCode } from "../runtime/errors.ts";
 
 const exec = promisify(execFile);
 
+/** How long a group's status may stay unknown before its watcher says so. */
+export const UNKNOWN_STATUS_REPORT_MS = 60_000;
+
 /** Wait independently of the shell/tool, without blocking the agent's turn.
  * Polling backs off, as a job may be a server that runs for days.
+ *
+ * A check can fail, e.g. `ps` timing out under load, while the group runs on:
+ * failures neither end the wait nor pass for the group's end. Once the status
+ * has stayed unknown for `unknownAfterMs`, `onUnknown` is told, once; waiting
+ * continues, and only rejects on abort or when `onUnknown` fails.
  */
 export async function waitForGroupToFinish(
 	pgid: number,
 	signal?: AbortSignal,
+	onUnknown?: (error: unknown) => void | Promise<void>,
+	unknownAfterMs = UNKNOWN_STATUS_REPORT_MS,
 ): Promise<void> {
-	for (
-		let delay = 100;
-		await isProcessGroupActive(pgid, signal);
-		delay = Math.min(delay * 2, 1000)
-	)
+	assertProcessGroup(pgid);
+	let unknownSince: number | undefined;
+	let told = false;
+	for (let delay = 100; ; delay = Math.min(delay * 2, 1000)) {
+		try {
+			if (!(await isProcessGroupActive(pgid, signal))) return;
+			unknownSince = undefined;
+		} catch (error) {
+			signal?.throwIfAborted();
+			unknownSince ??= performance.now();
+			if (!told && performance.now() - unknownSince >= unknownAfterMs) {
+				told = true;
+				await onUnknown?.(error);
+			}
+		}
 		await setTimeout(delay, undefined, { signal });
+	}
 }
 
 /** A shell can exit before its background jobs, which retain its POSIX process

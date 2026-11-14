@@ -23,7 +23,7 @@ import {
 	subagentCompletionMessage,
 } from "./completions.ts";
 import {
-	type CommandExitMessage,
+	type CommandMessage,
 	SUBAGENT_RESULT_TYPE,
 	SUBAGENT_USAGE_TYPE,
 	type SubagentCompletionMessage,
@@ -69,7 +69,7 @@ export interface SubagentView {
 }
 
 /** What reaches the root's context without having been asked for in its turn. */
-type Notice = SubagentCompletionMessage | CommandExitMessage;
+type Notice = SubagentCompletionMessage | CommandMessage;
 
 interface SessionBinding {
 	runtime: Subagents;
@@ -196,9 +196,9 @@ export function createSubagentIntegration(
 				listener(ctx) {
 					const source = binding;
 					if (!source || !isCurrent(source, ctx)) return undefined;
-					return (exit) => {
+					return (message) => {
 						if (!isCurrent(source, ctx)) return;
-						source.held.push(exit);
+						source.held.push(message);
 						releaseIfIdle(source, ctx);
 					};
 				},

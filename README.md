@@ -19,6 +19,7 @@ pi -e ./tools/pi-subagents/index.ts   # or: pi install ./tools/pi-subagents
 ## Background jobs (POSIX)
 
 - Bash process groups are tracked, including `&`/`nohup` jobs that outlive their shell. On exit, `bg-exit` wakes the agent if idle, or queues for its next turn. It holds no output or exit code.
+- A group whose status cannot be read for a minute gets one `bg-unknown`, delivered the same way. It is neither stopped nor dropped: its `bg-exit` still follows.
 - Subagents own their jobs: Ctrl+C and shutdown stop them.
 - The root watches its own jobs and your `!` commands (`!!` stays private), never stopping them.
 - Untracked: `setsid`/`setpgid` (detach with `setsid -f cmd`), bash overrides, and other tools' processes. On Windows, nothing is tracked.

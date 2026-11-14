@@ -10,19 +10,27 @@ import {
 	type ExtensionFactory,
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { hasErrorCode } from "../runtime/errors.ts";
+import { errorMessage, hasErrorCode } from "../runtime/errors.ts";
 import type { SessionOwner } from "../runtime/index.ts";
 import {
 	isProcessGroupActive,
+	UNKNOWN_STATUS_REPORT_MS,
 	waitForGroupToFinish,
 } from "./process-groups.ts";
-import { COMMAND_EXIT_TYPE, type CommandExitMessage } from "./protocol.ts";
+import {
+	COMMAND_EXIT_TYPE,
+	COMMAND_UNKNOWN_TYPE,
+	type CommandExitMessage,
+	type CommandMessage,
+	type CommandUnknownMessage,
+} from "./protocol.ts";
 
-/** Tells the conversation that ran a command of its exit, waking it if idle.
- * The signal aborts once the exit must no longer be told.
+/** Tells the conversation that ran a command of its exit, or that its status
+ * stayed unknown, waking it if idle. The signal aborts once the command's
+ * messages must no longer be told.
  */
 export type CommandListener = (
-	exit: CommandExitMessage,
+	message: CommandMessage,
 	signal: AbortSignal,
 ) => void | Promise<void>;
 
@@ -69,6 +77,22 @@ function commandExit(
 		content: `PGID ${pgid} exited: ${commandPreview(command)}`,
 		display: true,
 		details: { pgid, command, cwd, exitCode: null },
+	};
+}
+
+function commandUnknown(
+	pgid: number,
+	command: string,
+	cwd: string,
+	error: unknown,
+): CommandUnknownMessage {
+	const reason = errorMessage(error).replace(/\s+/g, " ").trim();
+	const seconds = UNKNOWN_STATUS_REPORT_MS / 1000;
+	return {
+		customType: COMMAND_UNKNOWN_TYPE,
+		content: `PGID ${pgid} status unknown for ${seconds}s (${commandPreview(reason)}); not stopped, still watched, exit notified once seen: ${commandPreview(command)}`,
+		display: true,
+		details: { pgid, command, cwd, error: reason },
 	};
 }
 
@@ -131,7 +155,12 @@ export function trackCommands(
 		const pgid = await recordedGroup(path);
 		// Foreground-only commands are already reported by their tool result.
 		// Only groups that outlive the shell/tool need an asynchronous wakeup.
-		if (pgid === undefined || !(await isProcessGroupActive(pgid))) return;
+		// A failed check leaves the group to the watcher, which retries it.
+		if (
+			pgid === undefined ||
+			!(await isProcessGroupActive(pgid).catch(() => true))
+		)
+			return;
 		const { ctx } = from;
 		const notify = aborted || from !== session ? undefined : host.listener(ctx);
 		if (!notify) {
@@ -141,7 +170,11 @@ export function trackCommands(
 		const { signal } = scope;
 		groups.set(pgid, ctx);
 		host.track(
-			waitForGroupToFinish(pgid, signal)
+			// An unknown status is told, not taken for an end: the group stays
+			// owned and watched.
+			waitForGroupToFinish(pgid, signal, (error) =>
+				notify(commandUnknown(pgid, command, cwd, error), signal),
+			)
 				.then(async () => {
 					if (signal.aborted) return;
 					// Never signal a finished (and possibly reused) PGID while the
@@ -151,7 +184,8 @@ export function trackCommands(
 				})
 				.catch((error: unknown) => {
 					if (signal.aborted) return;
-					// Watching failed while the group may still be running.
+					// Telling failed, which fails the run: it no longer waits for a
+					// group that may still be running, so the group ends with it.
 					if (groups.delete(pgid)) end(pgid, ctx);
 					throw error;
 				}),
@@ -296,7 +330,7 @@ export function delegatedCommands({
 					}
 				};
 				if (!running()) return undefined;
-				return async (exit, signal) => {
+				return async (message, signal) => {
 					if (!running()) return;
 					if (session.isCompacting && !session.isStreaming) {
 						await session.waitForIdle();
@@ -305,7 +339,7 @@ export function delegatedCommands({
 					// Unlike pi.sendMessage (void), the SDK promise observes turn
 					// startup failures, which fail the run instead of leaving a stale
 					// final answer.
-					await session.sendCustomMessage(exit, {
+					await session.sendCustomMessage<CommandMessage["details"]>(message, {
 						deliverAs: "steer",
 						triggerTurn: true,
 					});

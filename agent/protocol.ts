@@ -9,6 +9,7 @@ export const SUBAGENT_RESULT_TYPE = "subagent-result";
 export const SUBAGENT_USAGE_TYPE = "subagent-usage";
 export const SUBAGENT_RESUME_TYPE = "subagent-resume";
 export const COMMAND_EXIT_TYPE = "bg-exit";
+export const COMMAND_UNKNOWN_TYPE = "bg-unknown";
 
 export interface SubagentReceipt {
 	id: string;
@@ -44,6 +45,25 @@ export interface CommandExitMessage {
 	display: boolean;
 	details: CommandExitDetails;
 }
+
+export interface CommandUnknownDetails {
+	pgid: number;
+	command: string;
+	cwd: string;
+	/** Why the group's status could not be read. */
+	error: string;
+}
+
+/** A group whose status stayed unknown: neither stopped nor forgotten. */
+export interface CommandUnknownMessage {
+	customType: typeof COMMAND_UNKNOWN_TYPE;
+	content: string;
+	display: boolean;
+	details: CommandUnknownDetails;
+}
+
+/** What command tracking tells the conversation that ran the command. */
+export type CommandMessage = CommandExitMessage | CommandUnknownMessage;
 
 /** Details may come from persisted sessions, so they are checked rather than trusted. */
 export function subagentId(details: unknown): string | undefined {
