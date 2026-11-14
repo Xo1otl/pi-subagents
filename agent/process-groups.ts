@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { readdir, readFile } from "node:fs/promises";
 import { setTimeout } from "node:timers/promises";
 import { promisify } from "node:util";
 import { hasErrorCode } from "../runtime/errors.ts";
@@ -29,12 +30,7 @@ export async function isProcessGroupActive(
 	pgid: number,
 	signal?: AbortSignal,
 ): Promise<boolean> {
-	if (!Number.isSafeInteger(pgid) || pgid <= 1)
-		throw new Error(`Invalid process group: ${pgid}`);
-	if (process.platform === "win32")
-		throw new Error(
-			"Command completion tracking requires POSIX process groups.",
-		);
+	assertProcessGroup(pgid);
 	signal?.throwIfAborted();
 	try {
 		process.kill(-pgid, 0);
@@ -42,6 +38,8 @@ export async function isProcessGroupActive(
 		if (hasErrorCode(error, "ESRCH")) return false;
 		throw error;
 	}
+	// Linux needs no subprocess, which could itself fail under load.
+	if (process.platform === "linux") return hasLiveMember(pgid);
 	const { stdout } = await exec("ps", ["-A", "-o", "pgid=,stat="], {
 		signal,
 		timeout: 5000,
@@ -53,4 +51,36 @@ export async function isProcessGroupActive(
 		if (!match) throw new Error(`Invalid process status: ${line}`);
 		return Number(match[1]) === pgid && !/^[ZX]/.test(match[2] ?? "");
 	});
+}
+
+function assertProcessGroup(pgid: number): void {
+	if (!Number.isSafeInteger(pgid) || pgid <= 1)
+		throw new Error(`Invalid process group: ${pgid}`);
+	if (process.platform === "win32")
+		throw new Error(
+			"Command completion tracking requires POSIX process groups.",
+		);
+}
+
+/** Whether procfs lists a member of the group that has not finished. */
+async function hasLiveMember(pgid: number): Promise<boolean> {
+	for (const entry of await readdir("/proc")) {
+		if (!/^\d+$/.test(entry)) continue;
+		let stat: string;
+		try {
+			stat = await readFile(`/proc/${entry}/stat`, "utf8");
+		} catch (error) {
+			// Exited since the listing.
+			if (hasErrorCode(error, "ENOENT") || hasErrorCode(error, "ESRCH"))
+				continue;
+			throw error;
+		}
+		// `pid (comm) state ppid pgrp …`, where comm may contain anything.
+		const [state, , group] = stat
+			.slice(stat.lastIndexOf(")") + 2)
+			.split(" ", 3);
+		if (!state || !group) throw new Error(`Invalid process status: ${stat}`);
+		if (Number(group) === pgid && !/^[ZXx]/.test(state)) return true;
+	}
+	return false;
 }
