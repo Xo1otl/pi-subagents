@@ -2,8 +2,8 @@ import { expect, test } from "bun:test";
 import type { Usage } from "@earendil-works/pi-ai";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import { ROOT, type Subagents } from "../runtime/index.ts";
-import { SUBAGENT_USAGE_KIND } from "../runtime/summary.ts";
 import {
+	charges,
 	deferred,
 	hierarchyStream,
 	lastText,
@@ -14,14 +14,6 @@ import {
 	until,
 	waiting,
 } from "./fixtures.ts";
-
-function charges(session: AgentSession) {
-	return session.sessionManager
-		.getEntries()
-		.filter(
-			(entry) => entry.type === "usage" && entry.kind === SUBAGENT_USAGE_KIND,
-		);
-}
 
 async function settled(session: AgentSession, tree: Subagents) {
 	await tree.settled(ROOT);

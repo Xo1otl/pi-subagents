@@ -10,11 +10,10 @@ import {
 	spawnContext,
 	stream,
 	testRuntime,
+	theme,
 	toolCall,
 	until,
 } from "./fixtures.ts";
-
-const theme = { fg: (_color: string, text: string) => text };
 
 /** A switcher showing agent 1's chat; `agents` completed agents exist up front. */
 async function setup(agents = 2) {

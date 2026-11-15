@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
-import type { ExtensionFactory, Theme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import extension from "../index.ts";
-import { parentSession } from "./fixtures.ts";
+import { parentSession, theme } from "./fixtures.ts";
 
 const renderOptions = {
 	outputPad: 0,
@@ -47,7 +47,6 @@ test.each([false, true])(
 			"subagent",
 			() => tool,
 		);
-		const theme = { fg: (_color: string, text: string) => text } as Theme;
 		const call = renderers
 			?.renderCall?.({ instructions: "hello" }, theme, {} as never)
 			.render(120)

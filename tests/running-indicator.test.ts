@@ -17,13 +17,13 @@ import {
 	spawnContext,
 	stream,
 	testRuntime,
+	theme,
 	toolCall,
 	until,
 	waiting,
 } from "./fixtures.ts";
 
 type Widget = string[] | ((tui: TUI, theme: Theme) => Component);
-const theme = { fg: (_color: string, text: string) => text } as Theme;
 
 function setup(bind = true) {
 	const runtime = testRuntime();

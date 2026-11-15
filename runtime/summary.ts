@@ -44,10 +44,7 @@ function entryUsage(entry: SessionEntry): Usage | undefined {
 }
 
 /** Raw entries are the single source of billing, including descendant charges. */
-function summarizeUsage(
-	entries: readonly SessionEntry[],
-	ownOnly = false,
-): Usage {
+function summarizeUsage(entries: readonly SessionEntry[]): Usage {
 	const usage: Usage = {
 		input: 0,
 		output: 0,
@@ -57,8 +54,6 @@ function summarizeUsage(
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
 	for (const entry of entries) {
-		if (ownOnly && entry.type === "usage" && entry.kind === SUBAGENT_USAGE_KIND)
-			continue;
 		const used = entryUsage(entry);
 		if (!used) continue;
 		for (const key of TOKEN_KEYS) usage[key] += used[key];
@@ -71,7 +66,12 @@ function summarizeUsage(
 
 /** Propagate only new, local charges; descendants bill every ancestor themselves. */
 export function summarizeOwnUsage(entries: readonly SessionEntry[]): Usage {
-	return summarizeUsage(entries, true);
+	return summarizeUsage(
+		entries.filter(
+			(entry) =>
+				!(entry.type === "usage" && entry.kind === SUBAGENT_USAGE_KIND),
+		),
+	);
 }
 
 export interface RunOutcome {
@@ -105,38 +105,39 @@ export function summarizeRun(
 			final = entry.message;
 	}
 	const usage = summarizeUsage(entries);
-	if (report !== undefined)
-		return {
-			status: "done",
-			output: report || "(no output)",
-			usage,
-			unreported: false,
-		};
-	let status: RunSummary["status"];
-	let unreported = false;
-	if (cancelled || final?.stopReason === "aborted") {
-		status = "aborted";
-		error = "Subagent was aborted.";
-	} else if (
+	const done = (output: string) => ({
+		status: "done" as const,
+		output: output || "(no output)",
+		usage,
+		unreported: false,
+	});
+	const failed = (status: "error" | "aborted", reason: string) => ({
+		status,
+		error: reason,
+		output: reason,
+		usage,
+		unreported: false,
+	});
+
+	if (report !== undefined) return done(report);
+	if (cancelled || final?.stopReason === "aborted")
+		return failed("aborted", "Subagent was aborted.");
+	// A turn may end on tools that terminate it, such as a report.
+	if (
 		error ||
-		// A turn may end on tools that terminate it, such as a report.
 		(final && final.stopReason !== "stop" && final.stopReason !== "toolUse")
-	) {
-		status = "error";
-		error ??=
-			final?.errorMessage ??
-			`Subagent ended without a complete response (${final?.stopReason ?? "no response"}).`;
-	} else if (reportOf) {
-		status = "error";
-		error = UNREPORTED;
-		unreported = true;
-	} else {
-		status = "done";
-	}
+	)
+		return failed(
+			"error",
+			error ||
+				final?.errorMessage ||
+				`Subagent ended without a complete response (${final?.stopReason ?? "no response"}).`,
+		);
 	const last = final ? contentText(final.content) : "";
-	const output =
-		unreported && last
-			? `${UNREPORTED} Its last message:\n\n${last}`
-			: error || last || "(no output)";
-	return { status, error, output, usage, unreported };
+	if (!reportOf) return done(last);
+	return {
+		...failed("error", UNREPORTED),
+		output: last ? `${UNREPORTED} Its last message:\n\n${last}` : UNREPORTED,
+		unreported: true,
+	};
 }

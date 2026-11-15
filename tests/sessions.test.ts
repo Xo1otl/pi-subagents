@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import type { Provider } from "@earendil-works/pi-ai";
+import { getCurrentSystemMessage, type Provider } from "@earendil-works/pi-ai";
 import {
 	createAgentSession,
 	createBashToolDefinition,
@@ -10,7 +10,11 @@ import {
 	SessionManager,
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { REPORT_TOOL } from "../agent/protocol.ts";
+import {
+	REPORT_TOOL,
+	SUBAGENT_REMINDER_TYPE,
+	SUBAGENT_ROLE_SECTION,
+} from "../agent/protocol.ts";
 import { spawnContext } from "../agent/sessions.ts";
 import extension from "../index.ts";
 import { ROOT } from "../runtime/index.ts";
@@ -20,6 +24,7 @@ import {
 	deferred,
 	hierarchyStream,
 	lastCompletion,
+	lastCustomMessage,
 	lastText,
 	model,
 	onCleanup,
@@ -91,14 +96,6 @@ async function setup({
 	await parent.bindExtensions({ mode: "rpc" });
 	const tree = testRuntime();
 	return { parent, tree, context, cwd, agentDir };
-}
-
-/** Configure a child extension, given as its default export's body. */
-function configuredExtension(
-	context: { agentDir: string },
-	body: string,
-): Promise<void> {
-	return childExtension(context, "behavior", body);
 }
 
 test("captures the current workspace, model, thinking level and trust decision", () => {
@@ -254,7 +251,7 @@ test("children of an in-memory parent stay in memory", async () => {
 		expect(node.session?.sessionFile).toBeUndefined();
 });
 
-test("adds skill guidance to child system prompts only, and background guidance to every tracked bash tool", async () => {
+test("only a child whose task names a `skill://` path is told to skip default skill loading", async () => {
 	const { parent, tree, context, agentDir } = await setup({
 		streamFn: hierarchyStream,
 	});
@@ -264,32 +261,39 @@ test("adds skill guidance to child system prompts only, and background guidance 
 		"---\nname: standard\ndescription: STANDARD_SKILL_MARKER\n---\nSkill instructions.",
 	);
 	const base = parent.resourceLoader.getAppendSystemPrompt();
+	await tree.start(ROOT, "Follow skill://standard/references/role.md.", context)
+		.result;
+	await tree.start(ROOT, "plain task", context).result;
+	const appended = (id: string) =>
+		tree.get(id)?.session?.resourceLoader.getAppendSystemPrompt() ?? [];
+	// Wording is not under test: the guidance is whatever the first child gains.
+	const guidance = appended("1").at(-1) ?? "";
+	expect(appended("1")).toEqual([...base, guidance]);
+	expect(base).not.toContain(guidance);
+	expect(tree.get("1")?.session?.systemPrompt).toContain(guidance);
+	expect(appended("2")).toEqual(base);
+	expect(tree.get("2")?.session?.systemPrompt).not.toContain(guidance);
+	expect(parent.systemPrompt).not.toContain(guidance);
+	// Skills stay listed either way.
+	for (const id of ["1", "2"])
+		expect(tree.get(id)?.session?.systemPrompt).toContain(
+			"STANDARD_SKILL_MARKER",
+		);
+});
+
+test("background guidance reaches every tracked bash tool, descendants included", async () => {
+	const { parent, tree, context } = await setup({ streamFn: hierarchyStream });
 	const guidelines = parent.getToolDefinition("bash")?.promptGuidelines;
 	const backgroundGuidance = addedGuidance(guidelines);
 	expect(parent.systemPrompt).toContain(backgroundGuidance);
-
-	const result = await tree.start(ROOT, "nest:1", context).result;
-	expect(result.status).toBe("done");
+	await tree.start(ROOT, "nest:1", context).result;
 	expect(tree.tree().map((node) => node.id)).toEqual(["1", "1.1"]);
-	const [guidance = "", ...extra] =
-		tree
-			.get("1")
-			?.session?.resourceLoader.getAppendSystemPrompt()
-			.slice(base.length) ?? [];
-	expect(guidance).not.toBe("");
-	expect(extra).toEqual([]);
-	expect(base).not.toContain(guidance);
 	for (const node of tree.tree()) {
-		const appended = node.session?.resourceLoader.getAppendSystemPrompt();
-		expect(appended).toEqual([...base, guidance]);
 		expect(node.session?.getToolDefinition("bash")?.promptGuidelines).toEqual(
 			guidelines,
 		);
 		expect(node.session?.systemPrompt).toContain(backgroundGuidance);
-		expect(node.session?.systemPrompt).toContain(guidance);
-		expect(node.session?.systemPrompt).toContain("STANDARD_SKILL_MARKER");
 	}
-	expect(parent.systemPrompt).not.toContain(guidance);
 });
 
 test.each(["inactive", "overridden"] as const)(
@@ -301,8 +305,9 @@ test.each(["inactive", "overridden"] as const)(
 		const guidelines = parent.getToolDefinition("bash")?.promptGuidelines;
 		const backgroundGuidance = addedGuidance(guidelines);
 		if (mode === "overridden")
-			await configuredExtension(
+			await childExtension(
 				context,
+				"behavior",
 				`
 				pi.registerTool({
 					name: "bash", label: "Remote bash", description: "Remote execution",
@@ -340,15 +345,10 @@ test("provides machine-facing delegation in children without loading UI registra
 	if (!child) throw new Error("Missing child");
 	const tool = child.getToolDefinition("subagent");
 	expect(tool).toBeDefined();
-	// Only a child has a parent to report to: its system prompt gains the
-	// tool's one guideline, without listing the tool.
+	// Only a child has a parent to report to, through a tool its prompt does
+	// not list.
 	expect(child.getActiveToolNames()).toContain(REPORT_TOOL);
 	expect(parent.getToolDefinition(REPORT_TOOL)).toBeUndefined();
-	const guidelines =
-		child.getToolDefinition(REPORT_TOOL)?.promptGuidelines ?? [];
-	expect(guidelines).toHaveLength(1);
-	expect(child.systemPrompt).toContain(guidelines[0] ?? "missing");
-	expect(parent.systemPrompt).not.toContain(guidelines[0] ?? "missing");
 	expect(child.systemPrompt).not.toContain(`- ${REPORT_TOOL}:`);
 	expect(tool?.renderCall).toBeUndefined();
 	expect(tool?.renderResult).toBeUndefined();
@@ -362,6 +362,41 @@ test("provides machine-facing delegation in children without loading UI registra
 	expect(delegation?.shortcuts.size).toBe(0);
 	expect(delegation?.toolRenderers ?? []).toHaveLength(0);
 	expect(child.systemPrompt).not.toContain("/subagents");
+});
+
+test("a subagent's prompt gives its role while its parent's task runs, and drops it once the user takes over", async () => {
+	/** The role section each request carried, by what the request answers. */
+	const roles = new Map<string, string | null | undefined>();
+	const { parent, tree, context } = await setup({
+		streamFn: stream((context) => {
+			const reminded = lastCustomMessage(context, SUBAGENT_REMINDER_TYPE);
+			roles.set(
+				reminded ? "reminder" : lastText(context),
+				getCurrentSystemMessage(context.messages)?.sections?.[
+					SUBAGENT_ROLE_SECTION
+				],
+			);
+			// Reported once reminded, so the task spans two runs.
+			return reminded ? report("task done") : response(lastText(context));
+		}),
+	});
+	await parent.prompt("root prompt");
+	expect(await tree.start(ROOT, "task", context).result).toMatchObject({
+		status: "done",
+		output: "task done",
+	});
+	await tree.send("1", "takeover");
+	expect([...roles.keys()]).toEqual([
+		"root prompt",
+		"task",
+		"reminder",
+		"takeover",
+	]);
+	expect(roles.get("root prompt")).toBeUndefined();
+	// Every run of the task carries the role, which points to the report tool.
+	expect(roles.get("task")).toContain(REPORT_TOOL);
+	expect(roles.get("reminder")).toBe(roles.get("task"));
+	expect(roles.get("takeover")).toBeUndefined();
 });
 
 test("configured web search remains available throughout nested delegation", async () => {
@@ -380,8 +415,9 @@ test("configured web search remains available throughout nested delegation", asy
 				: toolCall("web_search", { query: "pi" });
 		}),
 	});
-	await configuredExtension(
+	await childExtension(
 		context,
+		"behavior",
 		`
 		pi.registerTool({
 			name: "web_search", label: "Web search", description: "Test search tool",
@@ -499,8 +535,9 @@ test("runs standard extension permission and result hooks in the child's context
 					: toolCall("read", { path: "AGENTS.md" }),
 		),
 	});
-	await configuredExtension(
+	await childExtension(
 		context,
+		"behavior",
 		`
 		pi.on("tool_call", (event) => {
 			if (event.toolName === "write") return { block: true, reason: "POLICY_BLOCKED" };
@@ -599,8 +636,9 @@ test("standard compaction preserves final output and summarization usage", async
 			}),
 		),
 	});
-	await configuredExtension(
+	await childExtension(
 		context,
+		"behavior",
 		`
 		pi.on("session_before_compact", (event) => ({ compaction: {
 			summary: "COMPACTION_MARKER",
@@ -630,8 +668,9 @@ test("dispatches standard extension commands without sending them to the model, 
 			return report("pong");
 		}),
 	});
-	await configuredExtension(
+	await childExtension(
 		context,
+		"behavior",
 		`
 		pi.registerCommand("ping", { description: "Ping", handler: async () => {
 			pi.sendMessage({ customType: "ping", content: "PING_MARKER", display: false });
@@ -660,7 +699,7 @@ test("cancellation during async standard input hooks stops the later agent loop"
 		entered.resolve();
 		await gate.promise;
 	};
-	await configuredExtension(context, `pi.on("input", ${shared(hook)});`);
+	await childExtension(context, "behavior", `pi.on("input", ${shared(hook)});`);
 	const result = tree.start(ROOT, "wait", context).result;
 	await entered.promise;
 	tree.abort("1");

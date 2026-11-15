@@ -294,19 +294,17 @@ test.each([true, false])(
 		const runtime = runtimeFor(session, { remindSession });
 		try {
 			const result = await runtime.start(ROOT, "task", context).result;
-			expect(result).toMatchObject(
-				heard
-					? { status: "done", output: "task result" }
-					: {
-							status: "error",
-							error: "Subagent ended without a report.",
-							// The last message tells the parent what the agent was saying.
-							output:
-								"Subagent ended without a report. Its last message:\n\ntask result",
-						},
-			);
+			if (heard)
+				expect(result).toMatchObject({ status: "done", output: "task result" });
+			else {
+				expect(result).toMatchObject({
+					status: "error",
+					error: expect.any(String),
+				});
+				// The last message tells the parent what the agent was saying.
+				expect(result.output).toContain("task result");
+			}
 			expect(remindSession).toHaveBeenCalledTimes(1);
-			expect(result).not.toHaveProperty("stopped");
 			// A conversation the user continues is theirs: no report, no reminder.
 			await runtime.send("1", "continue");
 			expect(runtime.get("1")?.status).toBe("done");

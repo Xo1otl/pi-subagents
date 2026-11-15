@@ -2,17 +2,12 @@ import { expect, test } from "bun:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { normalizeContext } from "@earendil-works/pi-ai";
 import {
-	COMMAND_NOTICE_TYPES,
-	SUBAGENT_REMINDER_TYPE,
-	SUBAGENT_RESULT_TYPE,
-} from "../agent/protocol.ts";
-import { lastCustomMessage, protocolMessages } from "./protocol.ts";
+	lastCustomMessage,
+	PROTOCOL_TYPES,
+	protocolMessages,
+} from "./protocol.ts";
 
-test.each([
-	...COMMAND_NOTICE_TYPES,
-	SUBAGENT_RESULT_TYPE,
-	SUBAGENT_REMINDER_TYPE,
-])(
+test.each(PROTOCOL_TYPES)(
 	"test providers route %s by protocol type, regardless of wording",
 	(customType) => {
 		for (const content of ["", "Arbitrary replacement wording."]) {

@@ -6,6 +6,7 @@ import {
 	blockingTool,
 	chatting,
 	fullscreen,
+	hasRunningTool,
 	lastText,
 	onCleanup,
 	paused,
@@ -14,11 +15,11 @@ import {
 	spawnContext,
 	stream,
 	testRuntime,
+	theme,
 	toolCall,
 	until,
 } from "./fixtures.ts";
 
-const theme = { fg: (_color: string, text: string) => text };
 const left = "\x1b[D";
 
 /** Open the switcher the way ctx.ui.custom() does with an overlay. */
@@ -227,11 +228,7 @@ test("a message sent during a blocking tool stays visible as queued, and Ctrl+C 
 	);
 	await blockingTool(context);
 	const result = tree.start(ROOT, "monitor", context).result;
-	await until(() =>
-		[...(tree.get("1")?.liveTools.values() ?? [])].some(
-			(tool) => tool.status === "running",
-		),
-	);
+	await until(() => hasRunningTool(tree.get("1")));
 	terminal.input("QUEUED_MESSAGE");
 	terminal.input("\r");
 	await until(() => tree.get("1")?.queuedInput.length === 1);

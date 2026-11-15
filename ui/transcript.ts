@@ -117,17 +117,25 @@ function transcriptBlocks(node: Subagent): Block[] {
 		occurrences.set(key, occurrence + 1);
 		const id = `${key}:${occurrence}`;
 		if (message.role === "assistant") {
-			message.content.forEach((part, index) => {
+			for (const [index, part] of message.content.entries()) {
+				const partId = `${id}:${index}`;
 				if (part.type === "toolCall")
 					addTool(part.id, part.name, part.arguments);
-				else if (part.type === "text" || part.type === "thinking")
+				else if (part.type === "thinking")
 					blocks.push({
-						id: `${id}:${index}`,
-						kind: part.type === "thinking" ? "thinking" : "message",
-						label: part.type === "thinking" ? "thinking" : "assistant",
-						text: part.type === "thinking" ? part.thinking : part.text,
+						id: partId,
+						kind: "thinking",
+						label: "thinking",
+						text: part.thinking,
 					});
-			});
+				else if (part.type === "text")
+					blocks.push({
+						id: partId,
+						kind: "message",
+						label: "assistant",
+						text: part.text,
+					});
+			}
 		} else if (message.role === "toolResult") {
 			// Old or extension-injected transcripts can contain orphan results.
 			addTool(message.toolCallId, message.toolName);

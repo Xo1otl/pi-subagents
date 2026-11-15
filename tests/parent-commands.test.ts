@@ -13,6 +13,7 @@ import { COMMAND_EXIT_TYPE } from "../agent/protocol.ts";
 import { ROOT } from "../runtime/index.ts";
 import {
 	backgroundJob,
+	customMessages,
 	deferred,
 	lastCustomMessage,
 	lastText,
@@ -54,12 +55,8 @@ async function setup(
 	return { session, tree, job };
 }
 
-function exits(session: AgentSession) {
-	return session.messages.filter(
-		(message) =>
-			message.role === "custom" && message.customType === COMMAND_EXIT_TYPE,
-	);
-}
+const exits = (session: AgentSession) =>
+	customMessages(session.messages, COMMAND_EXIT_TYPE);
 
 const checked = (context: TranscriptContext) =>
 	lastCustomMessage(context, COMMAND_EXIT_TYPE)

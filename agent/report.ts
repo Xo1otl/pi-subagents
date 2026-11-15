@@ -1,7 +1,31 @@
-import { defineTool } from "@earendil-works/pi-coding-agent";
+import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { SessionOwner } from "../runtime/index.ts";
-import { REPORT_TOOL, type ReportDetails } from "./protocol.ts";
+import {
+	REPORT_TOOL,
+	type ReportDetails,
+	SUBAGENT_ROLE_SECTION,
+} from "./protocol.ts";
+
+/** What a delegated session's prompt gains while its parent's task runs. With
+ * the tool's declaration alone, models answered their task in the chat and
+ * reported only once reminded; terser wording did not hold.
+ */
+const ROLE = `You are a subagent. Only the first message is from your parent, who can't see this chat; when the task is done, send the result via \`${REPORT_TOOL}\`.`;
+
+/** Give a delegated session its role and the tool that delivers its result.
+ * The role is the session's, not the tool's, and only while it serves its
+ * parent's task: a conversation the user takes over drops it. Each run's
+ * prompt options start from the session's own, so a run that leaves the
+ * section out removes it.
+ */
+export function registerReporting(pi: ExtensionAPI, owner: SessionOwner): void {
+	pi.registerTool(reportTool(owner));
+	pi.on("before_agent_start", ({ systemPromptOptions }) => {
+		if (owner.runtime.get(owner.id)?.delegated)
+			systemPromptOptions.sections[SUBAGENT_ROLE_SECTION] = ROLE;
+	});
+}
 
 /** How a subagent delivers its result. The report is kept as the tool
  * result's state, not picked from the chat; the latest one reaches the parent
@@ -9,18 +33,12 @@ import { REPORT_TOOL, type ReportDetails } from "./protocol.ts";
  * is stopped at once: the agent alone is told, and decides whether that
  * changes its result.
  */
-export function reportTool({ runtime, id }: SessionOwner) {
+function reportTool({ runtime, id }: SessionOwner) {
 	return defineTool({
 		name: REPORT_TOOL,
 		label: "Report",
 		description:
-			"Deliver your result to your parent agent and end your run. Report once all work (incl. child agents and tracked bg jobs) is done. (Any leftovers will be force-stopped.)",
-		// The one line a subagent's system prompt gains, as the tool exists only
-		// there. With the declaration alone, models answered their task in the
-		// chat and reported only once reminded; terser wording did not hold.
-		promptGuidelines: [
-			"You are a subagent: your 1st message is your parent agent's task. End it with report, the only thing the parent sees.",
-		],
+			"Call when all work is done (auto-terminates child agents and tracked bg jobs).",
 		parameters: Type.Object({ result: Type.String({ minLength: 1 }) }),
 		// Only the model's own calls can end its turn.
 		exposure: "model-only",
@@ -46,8 +64,8 @@ export function reportTool({ runtime, id }: SessionOwner) {
 					{
 						type: "text",
 						text: stopped.length
-							? `Reported; leftovers stopped: ${stopped.join("; ")}. Report again if that changes your result.`
-							: "Reported.",
+							? `Report recorded; leftovers stopped: ${stopped.join("; ")}. Reporting again replaces it.`
+							: "Report recorded.",
 					},
 				],
 				details,

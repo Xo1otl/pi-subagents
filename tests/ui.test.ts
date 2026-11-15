@@ -23,6 +23,8 @@ import {
 	parentSession,
 	response,
 	stream,
+	taskText,
+	theme,
 	toolCall,
 	until,
 	waiting,
@@ -32,18 +34,11 @@ type Custom = ExtensionUIContext["custom"];
 
 test("a real root extension opens the switcher overlay from commands and the root editor, and cleans up on reload", async () => {
 	const dispatch = stream((context, options) => {
-		if (context.messages.at(-1)?.role === "toolResult") {
-			const root = context.messages.some(
-				(message) =>
-					message.role === "user" &&
-					(typeof message.content === "string"
-						? message.content === "delegate"
-						: message.content.some(
-								(part) => part.type === "text" && part.text === "delegate",
-							)),
-			);
-			return root ? waiting(options?.signal) : response(lastText(context));
-		}
+		// The root keeps its turn running; the middle agent replies.
+		if (context.messages.at(-1)?.role === "toolResult")
+			return taskText(context) === "delegate"
+				? waiting(options?.signal)
+				: response(lastText(context));
 		if (lastCustomMessage(context, SUBAGENT_RESULT_TYPE))
 			return response("completion accepted");
 		const text = lastText(context);
@@ -57,7 +52,6 @@ test("a real root extension opens the switcher overlay from commands and the roo
 		streamFn: dispatch,
 		extensions: [extension],
 	});
-	const theme = { fg: (_color: string, text: string) => text } as Theme;
 	const terminal = fullscreen({ columns: 80 });
 	const tui = terminal.tui;
 	const keybindings = terminal.keybindings as KeybindingsManager;

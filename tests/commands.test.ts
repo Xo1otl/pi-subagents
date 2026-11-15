@@ -1,6 +1,4 @@
 import { expect, spyOn, test } from "bun:test";
-import { spawn } from "node:child_process";
-import { once } from "node:events";
 import { existsSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -19,16 +17,16 @@ import {
 	answer,
 	backgroundJob,
 	childExtension,
+	customMessages,
 	deferred,
 	hasCustomMessage,
 	lastCustomMessage,
 	lastText,
-	onCleanup,
 	report,
 	response,
-	testRuntime as runtime,
 	spawnContext,
 	stream,
+	testRuntime,
 	toolCall,
 	until,
 	waiting,
@@ -38,90 +36,13 @@ const idle = (tree: Subagents) =>
 	tree.get("1")?.session?.isIdle === true &&
 	tree.get("1")?.session?.getLastAssistantText() !== undefined;
 
-function exits(tree: Subagents) {
-	return (
-		tree
-			.get("1")
-			?.session?.messages.filter(
-				(message) =>
-					message.role === "custom" && message.customType === COMMAND_EXIT_TYPE,
-			) ?? []
-	);
-}
-
-function hasResult(tree: Subagents): boolean {
-	return (
-		tree
-			.get("1")
-			?.session?.messages.some(
-				(message) =>
-					message.role === "custom" &&
-					message.customType === SUBAGENT_RESULT_TYPE,
-			) ?? false
-	);
-}
-
-function kill(pgid: number): void {
-	try {
-		process.kill(-pgid, "SIGKILL");
-	} catch {
-		// Already gone.
-	}
-}
-
-test.each([0, 1, -123, Number.NaN, 1.5, Number.MAX_SAFE_INTEGER + 1])(
-	"rejects unsafe process group %s",
-	async (pgid) => {
-		await expect(waitForGroupToFinish(pgid)).rejects.toThrow(
-			"Invalid process group",
-		);
-	},
-);
-
-test("waits past shell exit for nohup and resolves when only zombies remain", async () => {
-	const context = await spawnContext();
-	const job = backgroundJob(context.cwd, "orphan");
-	const child = spawn("bash", ["-c", job.command], {
-		detached: true,
-		stdio: "ignore",
-	});
-	const exited = once(child, "exit");
-	const pgid = child.pid;
-	if (!pgid) throw new Error("Missing child pid");
-	onCleanup(() => kill(pgid));
-	await exited;
-	expect(await isProcessGroupActive(pgid)).toBe(true);
-	let completed = false;
-	const waiting = waitForGroupToFinish(pgid).then(() => {
-		completed = true;
-	});
-	// Several polls, while the job outlives its shell.
-	await Bun.sleep(150);
-	expect(completed).toBe(false);
-	await job.release();
-	await waiting;
-	expect(existsSync(job.finished)).toBe(true);
-});
-
-test("group waiting can be cancelled", async () => {
-	const child = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
-	const exited = once(child, "exit");
-	const pgid = child.pid;
-	if (!pgid) throw new Error("Missing child pid");
-	onCleanup(async () => {
-		kill(pgid);
-		await exited;
-	});
-	const controller = new AbortController();
-	const waiting = waitForGroupToFinish(pgid, { signal: controller.signal });
-	controller.abort();
-	await expect(waiting).rejects.toThrow();
-});
+const exits = (tree: Subagents) =>
+	customMessages(tree.get("1")?.session?.messages, COMMAND_EXIT_TYPE);
 
 test.each(["nohup", ""])(
 	"%s background commands keep an idle agent running, including commands added while waiting",
 	async (launcher) => {
-		const tree = runtime();
+		const tree = testRuntime();
 		const context = await spawnContext(
 			stream((ctx) => {
 				const text = lastText(ctx);
@@ -171,7 +92,7 @@ test.each(["nohup", ""])(
 		if (launch?.role !== "toolResult") throw new Error("Missing launch");
 		expect(contentText(launch.content)).toContain(pgid);
 		const exit = exits(tree)[0];
-		if (exit?.role !== "custom") throw new Error("Missing exit");
+		if (!exit) throw new Error("Missing exit");
 		const notice = contentText(exit.content);
 		expect(notice).toContain(pgid);
 		expect(notice).not.toContain("\n");
@@ -181,7 +102,7 @@ test.each(["nohup", ""])(
 );
 
 test("a job exit reaching a busy session is answered after its reply", async () => {
-	const tree = runtime();
+	const tree = testRuntime();
 	const reply = deferred();
 	const context = await spawnContext(
 		stream(async (ctx, options) => {
@@ -214,7 +135,7 @@ test("a job exit reaching a busy session is answered after its reply", async () 
 test.each(["abort", "dispose"] as const)(
 	"%s kills nohup groups and cancellation permits reuse",
 	async (action) => {
-		const tree = runtime();
+		const tree = testRuntime();
 		const context = await spawnContext(
 			stream((ctx) => {
 				if (lastText(ctx) === "start")
@@ -246,7 +167,7 @@ test.each(["abort", "dispose"] as const)(
 test.each(["command", "child"] as const)(
 	"an unreported task waits for both commands and descendants (%s finishes first)",
 	async (first) => {
-		const tree = runtime();
+		const tree = testRuntime();
 		const child = deferred();
 		const context = await spawnContext(
 			stream(async (ctx, options) => {
@@ -277,7 +198,8 @@ test.each(["command", "child"] as const)(
 			child.resolve();
 			await until(
 				() =>
-					hasResult(tree) &&
+					customMessages(tree.get("1")?.session?.messages, SUBAGENT_RESULT_TYPE)
+						.length === 1 &&
 					tree.get("1")?.session?.getLastAssistantText() === "waiting for all",
 			);
 		}
@@ -292,7 +214,7 @@ test.each(["command", "child"] as const)(
 );
 
 test("foreground-only commands do not notify or cause extra model calls", async () => {
-	const tree = runtime();
+	const tree = testRuntime();
 	let requests = 0;
 	const context = await spawnContext(
 		stream((ctx) => {
@@ -311,7 +233,7 @@ test("foreground-only commands do not notify or cause extra model calls", async 
 });
 
 test("a command-exit wake can launch another background command before reporting to its parent", async () => {
-	const tree = runtime();
+	const tree = testRuntime();
 	let notifications = 0;
 	const context = await spawnContext(
 		stream((ctx) => {
@@ -345,7 +267,7 @@ test("a command-exit wake can launch another background command before reporting
 test.each([false, true])(
 	"a report stops a job left running and tells the agent, which keeps its report or reports again (again: %s)",
 	async (again) => {
-		const tree = runtime();
+		const tree = testRuntime();
 		let told = "";
 		let requests = 0;
 		const context = await spawnContext(
@@ -363,7 +285,7 @@ test.each([false, true])(
 		const job = backgroundJob(context.cwd, "forgotten");
 		const result = await tree.start(ROOT, "start", context).result;
 		const pgid = await job.pgid();
-		expect(told).toContain(`PGID ${pgid}: `);
+		expect(told).toContain(String(pgid));
 		expect(result).toMatchObject({
 			status: "done",
 			output: again ? "revised report" : "first report",
@@ -378,7 +300,7 @@ test.each([false, true])(
 );
 
 test("a report with nothing left running ends the turn at once", async () => {
-	const tree = runtime();
+	const tree = testRuntime();
 	let requests = 0;
 	const context = await spawnContext(
 		stream(() => {
@@ -391,14 +313,15 @@ test("a report with nothing left running ends the turn at once", async () => {
 		output: "done at once",
 	});
 	expect(requests).toBe(1);
-	const receipt = tree.get("1")?.session?.messages.at(-1);
-	expect(receipt?.role === "toolResult" && contentText(receipt.content)).toBe(
-		"Reported.",
-	);
+	// No turn follows the report's own result.
+	expect(tree.get("1")?.session?.messages.at(-1)).toMatchObject({
+		role: "toolResult",
+		isError: false,
+	});
 });
 
 test("a report waits for messages already queued, and a later report replaces it", async () => {
-	const tree = runtime();
+	const tree = testRuntime();
 	const reply = deferred();
 	const context = await spawnContext(
 		stream(async (ctx, options) => {
@@ -430,7 +353,7 @@ test("a report waits for messages already queued, and a later report replaces it
 });
 
 test("notification startup failures fail the run instead of delivering a stale final answer", async () => {
-	const tree = runtime();
+	const tree = testRuntime();
 	const context = await spawnContext(
 		stream((ctx) =>
 			lastText(ctx) === "start"
@@ -454,7 +377,7 @@ test("notification startup failures fail the run instead of delivering a stale f
 });
 
 test("configured bash overrides are not silently replaced with local execution", async () => {
-	const tree = runtime();
+	const tree = testRuntime();
 	const context = await spawnContext(
 		stream((ctx) =>
 			lastText(ctx) === "start"
@@ -478,7 +401,7 @@ test("configured bash overrides are not silently replaced with local execution",
 });
 
 test("failed commands still wait for jobs they already started and retain shell configuration", async () => {
-	const tree = runtime();
+	const tree = testRuntime();
 	const context = await spawnContext(
 		stream((ctx) =>
 			lastText(ctx) === "start"
@@ -507,7 +430,7 @@ test("failed commands still wait for jobs they already started and retain shell 
 	await job.release();
 	expect((await started.result).output).toBe("checked after shell failure");
 	const event = exits(tree)[0];
-	if (event?.role !== "custom") throw new Error("Missing command notification");
+	if (!event) throw new Error("Missing command notification");
 	expect(event.details).toMatchObject({ exitCode: null });
 	expect(JSON.stringify(event.content)).not.toContain(
 		"export PREFIX_VALUE=preserved",

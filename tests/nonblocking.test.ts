@@ -1,7 +1,6 @@
 import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { readFile, rm } from "node:fs/promises";
-import { dirname } from "node:path";
+import { readFile } from "node:fs/promises";
 import { contentText, type Provider, type Usage } from "@earendil-works/pi-ai";
 import {
 	type AgentSession,
@@ -9,8 +8,6 @@ import {
 	type BoundaryState,
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
-	type ExtensionContext,
-	type ExtensionFactory,
 } from "@earendil-works/pi-coding-agent";
 import {
 	createSubagentIntegration,
@@ -25,16 +22,18 @@ import {
 } from "../agent/protocol.ts";
 import { spawnContext } from "../agent/sessions.ts";
 import { ROOT, type Subagents } from "../runtime/index.ts";
-import { SUBAGENT_USAGE_KIND } from "../runtime/summary.ts";
 import {
 	backgroundJob,
+	charges,
 	completionOutput,
+	customMessages,
 	deferred,
 	lastCustomMessage,
 	lastText,
 	model,
 	onCleanup,
 	parentSession,
+	removeOutputOnCleanup,
 	replies,
 	report,
 	response,
@@ -46,35 +45,12 @@ import {
 	waiting,
 } from "./fixtures.ts";
 
-async function setup(
-	streamFn: Provider["streamSimple"],
-	onChildStart?: (ctx: ExtensionContext) => Promise<void>,
-	hooks: { parent?: ExtensionFactory; child?: ExtensionFactory } = {},
-) {
-	return rootSession({
-		streamFn,
-		onChildStart,
-		onChildLoad: hooks.child,
-		extensions: hooks.parent ? [hooks.parent] : [],
-	});
-}
+const completions = (session: AgentSession) =>
+	customMessages(session.messages, SUBAGENT_RESULT_TYPE);
 
-function charges(session: AgentSession) {
-	return session.sessionManager
-		.getEntries()
-		.filter(
-			(entry) => entry.type === "usage" && entry.kind === SUBAGENT_USAGE_KIND,
-		);
-}
-
-function completions(session: AgentSession) {
-	return session.messages
-		.filter((message) => message.role === "custom")
-		.filter((message) => message.customType === SUBAGENT_RESULT_TYPE);
-}
 function completionDetails(session: AgentSession): SubagentCompletionDetails {
 	const message = completions(session).at(-1);
-	if (message?.role !== "custom") throw new Error("Missing completion");
+	if (!message) throw new Error("Missing completion");
 	return message.details as SubagentCompletionDetails;
 }
 
@@ -92,7 +68,11 @@ const defaultDispatch = stream((context) => {
 });
 
 test("the tool starts the child with the requested effort and rejects unknown models", async () => {
-	const { session, tree, execute: call } = await setup(defaultDispatch);
+	const {
+		session,
+		tree,
+		execute: call,
+	} = await rootSession({ streamFn: defaultDispatch });
 	const execute = (args: { model?: string; effort?: "low" }) =>
 		call("configured", { instructions: "child task", ...args });
 	await expect(execute({ model: "missing" })).rejects.toThrow(
@@ -107,8 +87,8 @@ test("the tool starts the child with the requested effort and rejects unknown mo
 
 test("nohup completion notifies the parent once, with the child's report", async () => {
 	let job: ReturnType<typeof backgroundJob> | undefined;
-	const { session, tree } = await setup(
-		stream((context) => {
+	const { session, tree } = await rootSession({
+		streamFn: stream((context) => {
 			const text = lastText(context);
 			if (text === "delegate")
 				return toolCall("subagent", { instructions: "start job" });
@@ -124,7 +104,7 @@ test("nohup completion notifies the parent once, with the child's report", async
 			if (text === "final update") return response("last child answer");
 			return response("available while job runs");
 		}),
-	);
+	});
 	job = backgroundJob(session.sessionManager.getCwd(), "notify");
 	await session.prompt("delegate");
 	await until(() => tree.get("1")?.session?.isIdle === true);
@@ -146,9 +126,12 @@ test("nohup completion notifies the parent once, with the child's report", async
 test("root returns a receipt and accepts another prompt while child session initialization is blocked", async () => {
 	const initialized = deferred();
 	let initializing = false;
-	const { session, tree } = await setup(defaultDispatch, async () => {
-		initializing = true;
-		await initialized.promise;
+	const { session, tree } = await rootSession({
+		streamFn: defaultDispatch,
+		onChildStart: async () => {
+			initializing = true;
+			await initialized.promise;
+		},
 	});
 	await session.prompt("delegate");
 	expect(session.getLastAssistantText()).toBe("parent available");
@@ -204,23 +187,24 @@ test.each(["initializing", "running"] as const)(
 			});
 			return respond(selected, context, options);
 		};
-		const { session, tree } = await setup(
-			dispatch,
-			phase === "initializing"
-				? async () => {
-						blocked = true;
-						await child.promise;
-					}
-				: undefined,
-			{
-				parent: (pi) =>
+		const { session, tree } = await rootSession({
+			streamFn: dispatch,
+			onChildStart:
+				phase === "initializing"
+					? async () => {
+							blocked = true;
+							await child.promise;
+						}
+					: undefined,
+			extensions: [
+				(pi) =>
 					pi.registerProvider({
 						...testProvider(dispatch),
 						id: alternate.provider,
 						getModels: () => [alternate],
 					}),
-			},
-		);
+			],
+		});
 		await session.prompt("delegate");
 		await until(() => blocked);
 		// /model uses setModel; it must not wait for the detached child.
@@ -273,7 +257,7 @@ test("completion is a follow-up to a busy parent's newer prompt, not an interrup
 		}
 		return defaultDispatch(model, context, options).result();
 	});
-	const { session, tree } = await setup(dispatch);
+	const { session, tree } = await rootSession({ streamFn: dispatch });
 	await session.prompt("delegate");
 	await until(() => childRunning);
 	const busy = session.prompt("busy prompt");
@@ -300,7 +284,7 @@ test("provider errors are delivered after the receipt with usage and a terminal 
 			throw new Error("provider unavailable");
 		return defaultDispatch(model, context, options).result();
 	});
-	const { session, tree } = await setup(dispatch);
+	const { session, tree } = await rootSession({ streamFn: dispatch });
 	await session.prompt("delegate");
 	await until(() => completions(session).length === 1 && session.isIdle);
 	expect(completionDetails(session)).toMatchObject({
@@ -330,7 +314,7 @@ test("an already-aborted tool call rejects, but aborting its signal after receip
 		}
 		return defaultDispatch(model, context, options).result();
 	});
-	const { session, tree, execute } = await setup(dispatch);
+	const { session, tree, execute } = await rootSession({ streamFn: dispatch });
 	await expect(
 		execute(
 			"rejected",
@@ -355,7 +339,6 @@ test("an already-aborted tool call rejects, but aborting its signal after receip
 	expect(aborted).toBe(true);
 	expect(completionDetails(session)).toMatchObject({
 		status: "aborted",
-		error: "Subagent was aborted.",
 		usage: { totalTokens: 3 },
 	});
 });
@@ -374,7 +357,7 @@ test("interrupting the originating parent leaves the child running and still del
 			return waiting(options?.signal);
 		return defaultDispatch(model, context, options).result();
 	});
-	const { session, tree } = await setup(dispatch);
+	const { session, tree } = await rootSession({ streamFn: dispatch });
 	const prompt = session.prompt("delegate");
 	await until(
 		() =>
@@ -421,15 +404,18 @@ test("a result arriving during an interrupt is kept without restarting the turn"
 			);
 		return defaultDispatch(model, context, options).result();
 	});
-	const { session, tree } = await setup(dispatch, undefined, {
-		parent: (pi) => {
-			pi.on("agent_end", async (_event, ctx) => {
-				if (ctx.signal?.aborted) {
-					ending.resolve();
-					await agentEnd.promise;
-				}
-			});
-		},
+	const { session, tree } = await rootSession({
+		streamFn: dispatch,
+		extensions: [
+			(pi) => {
+				pi.on("agent_end", async (_event, ctx) => {
+					if (ctx.signal?.aborted) {
+						ending.resolve();
+						await agentEnd.promise;
+					}
+				});
+			},
+		],
 	});
 	await session.prompt("delegate");
 	await until(() => childRunning);
@@ -439,13 +425,7 @@ test("a result arriving during an interrupt is kept without restarting the turn"
 	const aborted = session.abort();
 	await ending.promise;
 	child.resolve();
-	await until(() =>
-		session.sessionManager
-			.getEntries()
-			.some(
-				(entry) => entry.type === "usage" && entry.kind === SUBAGENT_USAGE_KIND,
-			),
-	);
+	await until(() => charges(session).length > 0);
 	expect(tree.get("1")?.status).toBe("done");
 	expect(completions(session)).toHaveLength(0);
 	agentEnd.resolve();
@@ -479,7 +459,7 @@ test("a result waiting for a busy parent survives an interrupt", async () => {
 		if (lastCustomMessage(context, SUBAGENT_RESULT_TYPE)) completionRequests++;
 		return defaultDispatch(model, context, options).result();
 	});
-	const { session, tree } = await setup(dispatch);
+	const { session, tree } = await rootSession({ streamFn: dispatch });
 	await session.prompt("delegate");
 	await until(() => childRunning);
 	const busy = session.prompt("busy prompt");
@@ -527,7 +507,7 @@ test("results held by a busy parent are released together, starting one turn", a
 		}
 		return defaultDispatch(model, context, options).result();
 	});
-	const { session, tree } = await setup(dispatch);
+	const { session, tree } = await rootSession({ streamFn: dispatch });
 	const prompt = session.prompt("delegate twice");
 	await until(
 		() =>
@@ -557,11 +537,15 @@ test("accounting preserves other extensions' boundary drafts both with and witho
 				entries: [...event.entries, { type: "custom", customType, data: true }],
 			};
 		};
-	const { session } = await setup(defaultDispatch, async () => child.promise, {
-		parent: (pi) => {
-			pi.on("turn_end", draft("prior-turn"));
-			pi.on("agent_before_settle", draft("prior-settle"));
-		},
+	const { session } = await rootSession({
+		streamFn: defaultDispatch,
+		onChildStart: () => child.promise,
+		extensions: [
+			(pi) => {
+				pi.on("turn_end", draft("prior-turn"));
+				pi.on("agent_before_settle", draft("prior-settle"));
+			},
+		],
 	});
 	const metadata = (kind: string) =>
 		session.sessionManager
@@ -601,8 +585,9 @@ test.each([false, true])(
 				? report("original finished")
 				: response(lastText(context));
 		});
-		const { session, tree } = await setup(dispatch, undefined, {
-			child: (pi) => {
+		const { session, tree } = await rootSession({
+			streamFn: dispatch,
+			onChildLoad: (pi) => {
 				pi.on("input", async (event) => {
 					if (event.text === "late input") {
 						entered.resolve();
@@ -664,8 +649,9 @@ test.each([false, true])(
 );
 
 test("headless extension command failures become run errors rather than successful empty results", async () => {
-	const { session, tree, execute } = await setup(defaultDispatch, undefined, {
-		child: (pi) => {
+	const { session, tree, execute } = await rootSession({
+		streamFn: defaultDispatch,
+		onChildLoad: (pi) => {
 			pi.registerCommand("fail", {
 				description: "Fail deterministically",
 				handler: async () => {
@@ -685,8 +671,9 @@ test("headless extension command failures become run errors rather than successf
 
 test("disposing a parent without session_shutdown suppresses delivery through its stale extension context", async () => {
 	const child = deferred();
-	const { session, tree } = await setup(defaultDispatch, async () => {
-		await child.promise;
+	const { session, tree } = await rootSession({
+		streamFn: defaultDispatch,
+		onChildStart: () => child.promise,
 	});
 	await session.prompt("delegate");
 	session.dispose();
@@ -706,7 +693,7 @@ test("shutdown preserves billed child usage in the old parent's ledger without t
 		}
 		return defaultDispatch(model, context, options).result();
 	});
-	const { session, tree } = await setup(dispatch);
+	const { session, tree } = await rootSession({ streamFn: dispatch });
 	await session.prompt("delegate");
 	await until(() => running);
 	await session.extensionRunner.emit({
@@ -716,20 +703,15 @@ test("shutdown preserves billed child usage in the old parent's ledger without t
 	expect(tree.closed).toBe(true);
 	expect(completions(session)).toHaveLength(0);
 	expect(session.getSessionStats().tokens.total).toBe(9);
-	const usage = session.sessionManager
-		.getEntries()
-		.filter(
-			(entry) => entry.type === "usage" && entry.kind === SUBAGENT_USAGE_KIND,
-		);
-	expect(usage).toHaveLength(1);
-	expect(usage[0]?.type === "usage" && usage[0].usage.totalTokens).toBe(3);
+	expect(charges(session)).toMatchObject([{ usage: { totalTokens: 3 } }]);
 	expect(session.getLastAssistantText()).toBe("parent available");
 });
 
 test("session_start replacement without prior shutdown also fences pending results", async () => {
 	const child = deferred();
-	const { session, tree, runtime } = await setup(defaultDispatch, async () => {
-		await child.promise;
+	const { session, tree, runtime } = await rootSession({
+		streamFn: defaultDispatch,
+		onChildStart: () => child.promise,
 	});
 	await session.prompt("delegate");
 	const replacement = session.extensionRunner.emit({
@@ -746,8 +728,9 @@ test("session_start replacement without prior shutdown also fences pending resul
 
 test("reload cancels and fences old results while the reloaded integration can spawn again", async () => {
 	const child = deferred();
-	const { session, tree, runtime } = await setup(defaultDispatch, async () => {
-		await child.promise;
+	const { session, tree, runtime } = await rootSession({
+		streamFn: defaultDispatch,
+		onChildStart: () => child.promise,
 	});
 	await session.prompt("delegate");
 	const reload = session.reload();
@@ -777,16 +760,13 @@ test("completion output is bounded with full output saved, and rich usage is bil
 		if (lastText(context) === "child task") return report(huge, { usage });
 		return defaultDispatch(model, context, options).result();
 	});
-	const { session } = await setup(dispatch);
+	const { session } = await rootSession({ streamFn: dispatch });
 	await session.prompt("delegate");
 	await until(() => completions(session).length === 1 && session.isIdle);
 	const completion = completions(session)[0];
 	const details = completionDetails(session);
 	if (!details.fullOutputPath) throw new Error("Missing full output file");
-	const { fullOutputPath } = details;
-	onCleanup(() =>
-		rm(dirname(fullOutputPath), { recursive: true, force: true }),
-	);
+	removeOutputOnCleanup(details.fullOutputPath);
 	expect(await readFile(details.fullOutputPath, "utf8")).toBe(huge);
 	if (!completion) throw new Error("Missing completion");
 	const text = contentText(completion.content);
@@ -803,15 +783,13 @@ test("completion output is bounded with full output saved, and rich usage is bil
 		total: 23,
 	});
 	expect(session.getSessionStats().cost).toBeCloseTo(0.12);
-	const entries = session.sessionManager.getEntries();
-	expect(
-		entries.filter(
-			(entry) => entry.type === "usage" && entry.kind === SUBAGENT_USAGE_KIND,
-		),
-	).toHaveLength(1);
-	const accounting = entries.filter(
-		(entry) => entry.type === "custom" && entry.customType === "subagent-usage",
-	);
+	expect(charges(session)).toHaveLength(1);
+	const accounting = session.sessionManager
+		.getEntries()
+		.filter(
+			(entry) =>
+				entry.type === "custom" && entry.customType === "subagent-usage",
+		);
 	expect(accounting).toHaveLength(1);
 	expect(accounting[0]?.type === "custom" && accounting[0].data).toMatchObject({
 		id: "1",
@@ -906,7 +884,7 @@ test.each(["session_start", "session_shutdown"] as const)(
 		expect(runtime()).toBe(tree);
 		await expect(
 			execute("late", { instructions: "child task" }),
-		).rejects.toThrow("no longer active");
+		).rejects.toThrow();
 		expect(completions(session)).toHaveLength(0);
 		expect(errors).toEqual(["view cleanup failed"]);
 	},

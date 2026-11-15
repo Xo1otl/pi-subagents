@@ -29,7 +29,7 @@ import {
  * stayed unknown, waking it if idle. The signal aborts once the command's
  * messages must no longer be told.
  */
-export type CommandListener = (
+type CommandListener = (
 	message: CommandMessage,
 	signal: AbortSignal,
 ) => void | Promise<void>;

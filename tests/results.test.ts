@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
-import { readFile, rm } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { contentText } from "@earendil-works/pi-ai";
 import {
 	DEFAULT_MAX_BYTES,
@@ -14,13 +14,12 @@ import {
 	renderSubagentCall,
 	renderSubagentResult,
 } from "../ui/tool-renderers.ts";
-import { completionOutput, onCleanup, response } from "./fixtures.ts";
-
-const theme = { fg: (_color: string, text: string) => text };
-
-function removeOnCleanup(outputFile: string): void {
-	onCleanup(() => rm(dirname(outputFile), { recursive: true, force: true }));
-}
+import {
+	completionOutput,
+	removeOutputOnCleanup,
+	response,
+	theme,
+} from "./fixtures.ts";
 
 function run(output: string): SubagentResult {
 	return {
@@ -70,7 +69,7 @@ test.each([
 		const message = await subagentCompletionMessage(result);
 		const path = message.details.fullOutputPath;
 		if (!path) throw new Error("Missing full output file");
-		removeOnCleanup(path);
+		removeOutputOnCleanup(path);
 		expect(isAbsolute(path)).toBe(true);
 		expect(await readFile(path, "utf8")).toBe(output);
 		const text = completionOutput(message);
@@ -124,8 +123,8 @@ test("continued runs with the same agent ID cannot overwrite earlier output file
 	const firstPath = first.details.fullOutputPath;
 	const secondPath = second.details.fullOutputPath;
 	if (!firstPath || !secondPath) throw new Error("Missing full output file");
-	removeOnCleanup(firstPath);
-	removeOnCleanup(secondPath);
+	removeOutputOnCleanup(firstPath);
+	removeOutputOnCleanup(secondPath);
 	expect(firstPath).not.toBe(secondPath);
 	expect(await readFile(firstPath, "utf8")).toBe("first\n".repeat(2100));
 	expect(await readFile(secondPath, "utf8")).toBe("second\n".repeat(2100));

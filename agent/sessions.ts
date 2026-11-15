@@ -18,7 +18,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { SessionOwner, SpawnContext } from "../runtime/index.ts";
 import { delegatedCommands } from "./commands.ts";
-import { SUBAGENT_REMINDER_TYPE } from "./protocol.ts";
+import { REPORT_TOOL, SUBAGENT_REMINDER_TYPE } from "./protocol.ts";
 
 /** Each delegated session has its own event bus, which answers this request.
  * Unlike module state, the bus reaches every copy of this extension, including
@@ -29,6 +29,14 @@ const OWNER_REQUEST = "pi-subagents:owner";
 interface OwnerRequest {
 	owner?: SessionOwner;
 }
+
+/** A parent following a skill delegates by naming its files, e.g. `Follow
+ * skill://auto-research/references/reviewer.md.`: the skill's SKILL.md is the
+ * parent's, and reading it too derails the child. Other tasks load skills as
+ * usual, so only these gain the line.
+ */
+const SKILL_PATH_GUIDANCE =
+	"Skip default skill-file loading for direct `skill://` paths.";
 
 /** The subagent a loading extension serves; undefined in a root session. */
 export function sessionOwner(events: EventBus): SessionOwner | undefined {
@@ -108,6 +116,9 @@ export async function createChildSession(
 				return { action: "stop" };
 		});
 	};
+	// A task is fixed at spawn, so the prompt never changes mid-conversation.
+	const namesSkillPaths =
+		owner.runtime.get(owner.id)?.instructions.includes("skill://") === true;
 	const eventBus = createEventBus();
 	eventBus.on(OWNER_REQUEST, (request) => {
 		(request as OwnerRequest).owner = owner;
@@ -117,10 +128,8 @@ export async function createChildSession(
 		agentDir,
 		settingsManager,
 		eventBus,
-		appendSystemPromptOverride: (base) => [
-			...base,
-			"Skip default skill-file loading for direct `skill://` paths.",
-		],
+		appendSystemPromptOverride: (base) =>
+			namesSkillPaths ? [...base, SKILL_PATH_GUIDANCE] : base,
 		extensionFactories: [
 			ownedWarming,
 			{ name: "subagent-commands", factory: delegatedCommands(owner) },
@@ -182,7 +191,7 @@ export function remindChildSession(session: AgentSession): Promise<void> {
 	return session.sendCustomMessage(
 		{
 			customType: SUBAGENT_REMINDER_TYPE,
-			content: "Not reported. Task incomplete → continue; done → report.",
+			content: `Not reported. Task incomplete → continue; done → \`${REPORT_TOOL}\`.`,
 			display: true,
 		},
 		{ triggerTurn: true },

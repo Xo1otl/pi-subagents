@@ -81,11 +81,6 @@ export interface SubagentToolExecution {
 	parentToolCallId?: string;
 }
 
-export interface SubagentStart {
-	id: string;
-	result: Promise<SubagentResult>;
-}
-
 /** Read-only view of a node; only the runtime changes it. */
 export interface Subagent {
 	readonly id: string;
@@ -127,7 +122,7 @@ export interface Subagents {
 		parentId: string,
 		instructions: string,
 		context: SpawnContext,
-	): SubagentStart;
+	): { id: string; result: Promise<SubagentResult> };
 	/** Include asynchronous work, such as result delivery, in a parent's
 	 * settlement. With a `leftover` handle, the parent's report stops it instead.
 	 */
@@ -192,12 +187,7 @@ function usageLedger(manager: SessionManager): UsageLedger {
 }
 
 function subagentTree(nodes: Iterable<Subagent>): Subagent[] {
-	const children = new Map<string, Subagent[]>();
-	for (const node of nodes) {
-		const siblings = children.get(node.parentId) ?? [];
-		siblings.push(node);
-		children.set(node.parentId, siblings);
-	}
+	const children = Map.groupBy(nodes, (node) => node.parentId);
 	const visit = (id: string): Subagent[] =>
 		(children.get(id) ?? []).flatMap((node) => [node, ...visit(node.id)]);
 	return visit(ROOT);
@@ -275,7 +265,7 @@ export function createSubagents({
 		parentId: string,
 		instructions: string,
 		context: SpawnContext,
-	): SubagentStart {
+	) {
 		assertOpen();
 		if (!instructions.trim())
 			throw new Error("Subagent instructions must not be empty.");
@@ -305,7 +295,7 @@ export function createSubagents({
 				return [
 					...(node.session?.getSteeringMessages() ?? []),
 					...(node.session?.getFollowUpMessages() ?? []),
-					...[...node.pendingInput].map((input) => input.text),
+					...Array.from(node.pendingInput, ({ text }) => text),
 				];
 			},
 		};
@@ -351,7 +341,7 @@ export function createSubagents({
 			pending?.size;
 			pending = completions.get(parentId)
 		)
-			await Promise.allSettled([...pending]);
+			await Promise.allSettled(pending);
 	}
 
 	function submit(
@@ -560,7 +550,7 @@ export function createSubagents({
 				error,
 				output,
 				usage: summary.usage,
-				...(active.leftover ? { leftover: true } : {}),
+				...(active.leftover && { leftover: true }),
 			};
 		} finally {
 			initialization.resolve();
@@ -650,7 +640,7 @@ export function createSubagents({
 			if (!belongsTo(nodes, node, id) || node.status !== "running") continue;
 			node.cancelled = true;
 			// Pending prompts observe cancellation and are never submitted.
-			const input = [...node.pendingInput].map((entry) => entry.text);
+			const input = Array.from(node.pendingInput, ({ text }) => text);
 			node.pendingInput.clear();
 			try {
 				const queued = node.session?.clearQueue();
@@ -676,7 +666,7 @@ export function createSubagents({
 					[...completions.values()].flatMap((pending) => [...pending]),
 				);
 			await Promise.all(
-				[...nodes.values()].map((node) => detach(node, node.session)),
+				Array.from(nodes.values(), (node) => detach(node, node.session)),
 			);
 			listeners.clear();
 			nodes.clear();

@@ -11,13 +11,12 @@ export const SUBAGENT_USAGE_TYPE = "subagent-usage";
 export const SUBAGENT_REMINDER_TYPE = "subagent-reminder";
 export const COMMAND_EXIT_TYPE = "bg-exit";
 export const COMMAND_UNKNOWN_TYPE = "bg-unknown";
-/** What command tracking tells an agent. */
-export const COMMAND_NOTICE_TYPES = [
-	COMMAND_EXIT_TYPE,
-	COMMAND_UNKNOWN_TYPE,
-] as const;
 /** The tool through which a subagent delivers its result and ends its task. */
-export const REPORT_TOOL = "report";
+export const REPORT_TOOL = "report_to_parent";
+/** The system prompt section that gives a delegated session its role, only
+ * while its parent's task runs.
+ */
+export const SUBAGENT_ROLE_SECTION = "subagent_role";
 
 /** A report is kept as the tool result's state, never shown to the model. */
 export interface ReportDetails {
@@ -44,7 +43,7 @@ export interface SubagentCompletionMessage {
 	details: SubagentCompletionDetails;
 }
 
-export interface CommandExitDetails {
+interface CommandExitDetails {
 	pgid: number;
 	command: string;
 	cwd: string;
@@ -59,7 +58,7 @@ export interface CommandExitMessage {
 	details: CommandExitDetails;
 }
 
-export interface CommandUnknownDetails {
+interface CommandUnknownDetails {
 	pgid: number;
 	command: string;
 	cwd: string;

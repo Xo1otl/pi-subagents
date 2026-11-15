@@ -1,8 +1,8 @@
 import { afterAll, afterEach } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
@@ -16,6 +16,7 @@ import {
 	type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import {
+	type AgentSession,
 	createAgentSession,
 	DefaultResourceLoader,
 	type ExtensionContext,
@@ -23,6 +24,7 @@ import {
 	ModelRuntime,
 	SessionManager,
 	SettingsManager,
+	type Theme,
 } from "@earendil-works/pi-coding-agent";
 import {
 	type Component,
@@ -40,7 +42,8 @@ import {
 } from "../agent/index.ts";
 import { REPORT_TOOL, SUBAGENT_REMINDER_TYPE } from "../agent/protocol.ts";
 import { errorMessage } from "../runtime/errors.ts";
-import type { SpawnContext, Subagents } from "../runtime/index.ts";
+import type { SpawnContext, Subagent, Subagents } from "../runtime/index.ts";
+import { SUBAGENT_USAGE_KIND } from "../runtime/summary.ts";
 import { SWITCHER_OVERLAY } from "../ui/switcher.ts";
 import protocolFixture, {
 	isProtocolMessage,
@@ -106,6 +109,52 @@ export function shared(value: unknown): string {
 	sharedKeys.push(key);
 	Reflect.set(globalThis, key, value);
 	return `globalThis[Symbol.for(${JSON.stringify(Symbol.keyFor(key))})]`;
+}
+
+/** Remove a completion's full-output file after the test. */
+export function removeOutputOnCleanup(path: string): void {
+	onCleanup(() => rm(dirname(path), { recursive: true, force: true }));
+}
+
+/** Kill a process group, unless it is already gone. */
+export function killGroup(pgid: number): void {
+	try {
+		process.kill(-pgid, "SIGKILL");
+	} catch {
+		// Already gone.
+	}
+}
+
+/** A theme that leaves text uncolored. */
+export const theme = { fg: (_color: string, text: string) => text } as Theme;
+
+type CustomMessage = Extract<AgentMessage, { role: "custom" }>;
+
+/** A transcript's custom messages of one type. */
+export function customMessages(
+	messages: readonly AgentMessage[] | undefined,
+	customType: string,
+): CustomMessage[] {
+	return (messages ?? []).filter(
+		(message): message is CustomMessage =>
+			message.role === "custom" && message.customType === customType,
+	);
+}
+
+/** The delegated runs billed to a session's ledger. */
+export function charges(session: AgentSession) {
+	return session.sessionManager
+		.getEntries()
+		.filter(
+			(entry) => entry.type === "usage" && entry.kind === SUBAGENT_USAGE_KIND,
+		);
+}
+
+/** Whether an agent has a tool call in flight. */
+export function hasRunningTool(node: Subagent | undefined): boolean {
+	return [...(node?.liveTools.values() ?? [])].some(
+		(tool) => tool.status === "running",
+	);
 }
 
 /** A runtime with Pi's session lifecycle, shut down after the test. */
@@ -177,7 +226,7 @@ export function report(
 }
 
 /** Whether the agent answering has a parent to report to. */
-export function canReport(context: TranscriptContext): boolean {
+function canReport(context: TranscriptContext): boolean {
 	return getCurrentTools(context.messages).some(
 		(tool) => tool.name === REPORT_TOOL,
 	);

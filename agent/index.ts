@@ -30,7 +30,7 @@ import {
 	type SubagentCompletionMessage,
 	subagentReceipt,
 } from "./protocol.ts";
-import { reportTool } from "./report.ts";
+import { registerReporting } from "./report.ts";
 import {
 	createChildSession,
 	disposeChildSession,
@@ -100,7 +100,45 @@ export function createSubagentIntegration(
 	const parentId = owner?.id ?? ROOT;
 	let binding: SessionBinding | undefined;
 	// Only a delegated session has a parent to report to.
-	if (owner) pi.registerTool(reportTool(owner));
+	if (owner) registerReporting(pi, owner);
+
+	// A delegated session's jobs belong to its run (see delegatedCommands). The
+	// root's are the user's: watched for the model, never ended, and told like
+	// results, which an interrupt must not drop.
+	const commands = owner
+		? undefined
+		: trackCommands(pi, {
+				ownsJobs: false,
+				track(work, ctx) {
+					const source = current(ctx);
+					if (!source) {
+						// No session is left to tell.
+						void work.catch(() => {});
+						return;
+					}
+					source.runtime.trackCompletion(
+						ROOT,
+						work.catch((error: unknown) => {
+							ctx.ui.notify(
+								`Background command tracking failed: ${errorMessage(error)}`,
+								"error",
+							);
+							// Not every mode shows notifications; keep the rejection
+							// for the runtime's shutdown report.
+							throw error;
+						}),
+					);
+				},
+				listener(ctx) {
+					const source = current(ctx);
+					if (!source) return undefined;
+					return (message) => {
+						if (!isCurrent(source, ctx)) return;
+						source.held.push(message);
+						releaseIfIdle(source, ctx);
+					};
+				},
+			});
 
 	function discardPending(source: SessionBinding): Promise<void> {
 		const messages = [...source.pendingCompletions];
@@ -172,44 +210,6 @@ export function createSubagentIntegration(
 	function releaseIfIdle(source: SessionBinding, ctx: ExtensionContext): void {
 		if (isCurrent(source, ctx) && ctx.isIdle()) release(source, true);
 	}
-
-	// A delegated session's jobs belong to its run (see delegatedCommands). The
-	// root's are the user's: watched for the model, never ended, and told like
-	// results, which an interrupt must not drop.
-	const commands = owner
-		? undefined
-		: trackCommands(pi, {
-				ownsJobs: false,
-				track(work, ctx) {
-					const source = current(ctx);
-					if (!source) {
-						// No session is left to tell.
-						void work.catch(() => {});
-						return;
-					}
-					source.runtime.trackCompletion(
-						ROOT,
-						work.catch((error: unknown) => {
-							ctx.ui.notify(
-								`Background command tracking failed: ${errorMessage(error)}`,
-								"error",
-							);
-							// Not every mode shows notifications; keep the rejection
-							// for the runtime's shutdown report.
-							throw error;
-						}),
-					);
-				},
-				listener(ctx) {
-					const source = current(ctx);
-					if (!source) return undefined;
-					return (message) => {
-						if (!isCurrent(source, ctx)) return;
-						source.held.push(message);
-						releaseIfIdle(source, ctx);
-					};
-				},
-			});
 
 	function takeAccounting(ctx: ExtensionContext): SessionBoundaryDraft[] {
 		return current(ctx)?.accounting.splice(0) ?? [];
@@ -372,7 +372,7 @@ export function createSubagentIntegration(
 	return defineTool({
 		name: "subagent",
 		label: "Subagent",
-		description: "Start a child agent; its report arrives later as a message.",
+		description: "Start a child agent (reports back when done).",
 		parameters: Type.Object({
 			instructions: Type.String({ minLength: 1 }),
 			model: Type.Optional(Type.String({ minLength: 1 })),

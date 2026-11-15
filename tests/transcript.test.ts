@@ -2,16 +2,16 @@ import { expect, test } from "bun:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { type AgentSession, initTheme } from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
+import { REPORT_TOOL } from "../agent/protocol.ts";
 import type { Subagent, SubagentToolExecution } from "../runtime/index.ts";
 import {
 	createTranscriptRenderer,
 	type TranscriptPreferences,
 } from "../ui/transcript.ts";
-import { model, report, response, toolCall } from "./fixtures.ts";
+import { model, report, response, theme, toolCall } from "./fixtures.ts";
 
 // Markdown follows Pi's active theme, like the main transcript.
 initTheme("dark");
-const theme = { fg: (_color: string, text: string) => text };
 function node(
 	messages: AgentMessage[] = [],
 	streamingMessage?: AgentMessage,
@@ -66,7 +66,7 @@ test("a report shows its result, not the receipt the model read back", () => {
 		{
 			role: "toolResult",
 			toolCallId: id,
-			toolName: "report",
+			toolName: REPORT_TOOL,
 			timestamp: 123,
 			content: [{ type: "text", text: "RECEIPT" }],
 			details: { result: "FULL_REPORT\nsecond line" },
@@ -76,7 +76,11 @@ test("a report shows its result, not the receipt the model read back", () => {
 	const rows = text(createTranscriptRenderer(theme), agent)
 		.split("\n")
 		.map((row) => row.trimEnd());
-	expect(rows).toEqual(["▸ report [done]", "FULL_REPORT", "second line"]);
+	expect(rows).toEqual([
+		`▸ ${REPORT_TOOL} [done]`,
+		"FULL_REPORT",
+		"second line",
+	]);
 });
 
 test("tool calls and results form one independently collapsible block, with thinking separate", () => {

@@ -11,9 +11,8 @@ export const UNKNOWN_STATUS_REPORT_MS = 60_000;
 
 export interface GroupWatch {
 	signal?: AbortSignal;
-	/** Told once, when the status has stayed unknown for `unknownAfterMs`. */
+	/** Told once, when the status has stayed unknown for UNKNOWN_STATUS_REPORT_MS. */
 	onUnknown?: (error: unknown) => void | Promise<void>;
-	unknownAfterMs?: number;
 }
 
 /** Wait independently of the shell/tool, without blocking the agent's turn.
@@ -21,16 +20,12 @@ export interface GroupWatch {
  *
  * A check can fail, e.g. `ps` timing out under load, while the group runs on:
  * failures neither end the wait nor pass for the group's end. Once the status
- * has stayed unknown for `unknownAfterMs`, `onUnknown` is told, once; waiting
- * continues, and only rejects on abort or when a callback fails.
+ * has stayed unknown for UNKNOWN_STATUS_REPORT_MS, `onUnknown` is told, once;
+ * waiting continues, and only rejects on abort or when a callback fails.
  */
 export async function waitForGroupToFinish(
 	pgid: number,
-	{
-		signal,
-		onUnknown,
-		unknownAfterMs = UNKNOWN_STATUS_REPORT_MS,
-	}: GroupWatch = {},
+	{ signal, onUnknown }: GroupWatch = {},
 ): Promise<void> {
 	assertProcessGroup(pgid);
 	let unknownSince: number | undefined;
@@ -43,7 +38,10 @@ export async function waitForGroupToFinish(
 		} catch (error) {
 			signal?.throwIfAborted();
 			unknownSince ??= performance.now();
-			if (!told && performance.now() - unknownSince >= unknownAfterMs) {
+			if (
+				!told &&
+				performance.now() - unknownSince >= UNKNOWN_STATUS_REPORT_MS
+			) {
 				told = true;
 				await onUnknown?.(error);
 			}

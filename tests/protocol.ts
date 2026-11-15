@@ -2,7 +2,8 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { contentText, type TranscriptContext } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
-	COMMAND_NOTICE_TYPES,
+	COMMAND_EXIT_TYPE,
+	COMMAND_UNKNOWN_TYPE,
 	SUBAGENT_REMINDER_TYPE,
 	SUBAGENT_RESULT_TYPE,
 	type SubagentCompletionDetails,
@@ -10,11 +11,14 @@ import {
 
 type CustomMessage = Extract<AgentMessage, { role: "custom" }>;
 const prefix = "pi-subagents-test-event:";
-const types = new Set<string>([
-	...COMMAND_NOTICE_TYPES,
+/** The messages through which the integration tells an agent something. */
+export const PROTOCOL_TYPES: string[] = [
+	COMMAND_EXIT_TYPE,
+	COMMAND_UNKNOWN_TYPE,
 	SUBAGENT_RESULT_TYPE,
 	SUBAGENT_REMINDER_TYPE,
-]);
+];
+const types = new Set(PROTOCOL_TYPES);
 
 /** Pi converts custom messages to user text before calling a provider. Preserve
  * their protocol metadata for deterministic test providers, not their wording.
