@@ -7,7 +7,7 @@ import {
 	createTranscriptRenderer,
 	type TranscriptPreferences,
 } from "../ui/transcript.ts";
-import { model, response, toolCall } from "./fixtures.ts";
+import { model, report, response, toolCall } from "./fixtures.ts";
 
 // Markdown follows Pi's active theme, like the main transcript.
 initTheme("dark");
@@ -24,6 +24,7 @@ function node(
 		context: { cwd: "/unused", model, projectTrusted: false },
 		status: "running",
 		cancelled: false,
+		delegated: true,
 		liveTools: new Map(),
 		queuedInput: [],
 		session: {
@@ -55,6 +56,28 @@ function text(
 		.map((row) => stripTerminalSequences(row.text))
 		.join("\n");
 }
+
+test("a report shows its result, not the receipt the model read back", () => {
+	const call = report("FULL_REPORT\nsecond line");
+	const id = call.content.find((part) => part.type === "toolCall")?.id;
+	if (!id) throw new Error("Missing call");
+	const agent = node([
+		call,
+		{
+			role: "toolResult",
+			toolCallId: id,
+			toolName: "report",
+			timestamp: 123,
+			content: [{ type: "text", text: "RECEIPT" }],
+			details: { result: "FULL_REPORT\nsecond line" },
+			isError: false,
+		},
+	]);
+	const rows = text(createTranscriptRenderer(theme), agent)
+		.split("\n")
+		.map((row) => row.trimEnd());
+	expect(rows).toEqual(["▸ report [done]", "FULL_REPORT", "second line"]);
+});
 
 test("tool calls and results form one independently collapsible block, with thinking separate", () => {
 	const call = toolCall("bash", { command: "npm test" });

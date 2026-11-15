@@ -23,17 +23,18 @@ import {
 	subagentCompletionMessage,
 } from "./completions.ts";
 import {
-	COMMAND_NOTICE_TYPES,
 	type CommandMessage,
+	reportOf,
 	SUBAGENT_RESULT_TYPE,
 	SUBAGENT_USAGE_TYPE,
 	type SubagentCompletionMessage,
 	subagentReceipt,
 } from "./protocol.ts";
+import { reportTool } from "./report.ts";
 import {
 	createChildSession,
 	disposeChildSession,
-	resumeChildSession,
+	remindChildSession,
 	sessionOwner,
 	spawnContext,
 } from "./sessions.ts";
@@ -56,9 +57,9 @@ export function createSubagentRuntime(
 		rootSessionManager,
 		createSession: (context, owner, onCreated, onError) =>
 			createChildSession(context, owner, onCreated, onError, headlessExtension),
-		resumeSession: resumeChildSession,
+		remindSession: remindChildSession,
 		disposeSession: disposeChildSession,
-		noticeTypes: COMMAND_NOTICE_TYPES,
+		reportOf,
 	});
 }
 
@@ -98,6 +99,8 @@ export function createSubagentIntegration(
 	// A root session's children report to ROOT, a delegated session's to its node.
 	const parentId = owner?.id ?? ROOT;
 	let binding: SessionBinding | undefined;
+	// Only a delegated session has a parent to report to.
+	if (owner) pi.registerTool(reportTool(owner));
 
 	function discardPending(source: SessionBinding): Promise<void> {
 		const messages = [...source.pendingCompletions];
@@ -369,7 +372,7 @@ export function createSubagentIntegration(
 	return defineTool({
 		name: "subagent",
 		label: "Subagent",
-		description: "0 active commands/children ∧ idle ⇒ last message → parent.",
+		description: "Start a child agent; its report arrives later as a message.",
 		parameters: Type.Object({
 			instructions: Type.String({ minLength: 1 }),
 			model: Type.Optional(Type.String({ minLength: 1 })),
@@ -404,7 +407,10 @@ export function createSubagentIntegration(
 						!signal?.aborted &&
 						!tree.get(owner.id)?.cancelled));
 			const completion = started.result
-				.then((result) => deliver(source, ctx, result, canDeliver))
+				// The report that stopped a leftover child already told its parent.
+				.then((result) =>
+					deliver(source, ctx, result, () => !result.leftover && canDeliver()),
+				)
 				.catch((error: unknown) => {
 					if (canDeliver())
 						ctx.ui.notify(

@@ -35,6 +35,16 @@ export interface SessionOwner {
 	id: string;
 }
 
+/** Work that a reporting task stops instead of waiting for. */
+export interface Leftover {
+	/** Names the work for the agent, e.g. a job's PGID and command. */
+	readonly label: string;
+	/** Stop the work, returning whether it was still running: work that
+	 * already ended may still be settling, e.g. while telling of its end.
+	 */
+	stop(): boolean;
+}
+
 export interface SubagentsOptions {
 	/** onCreated publishes the session and transfers cleanup ownership, even if
 	 * initialization later rejects. Resolution signals that binding is ready.
@@ -46,16 +56,16 @@ export interface SubagentsOptions {
 		onCreated: (session: AgentSession) => void,
 		onError: (error: ExtensionError) => void,
 	) => Promise<void>;
-	/** Start a turn that returns an idle session to its delegated task, with a
-	 * message that is not the user's. Settles with that turn.
+	/** Start a turn that reminds an idle task, which has nothing left to wait
+	 * for, to report, with a message that is not the user's. Settles with that
+	 * turn.
 	 */
-	resumeSession: (session: AgentSession) => Promise<void>;
+	remindSession: (session: AgentSession) => Promise<void>;
 	disposeSession: (session: AgentSession) => Promise<void>;
-	/** Custom messages that tell an agent of an event without giving it work,
-	 * such as a command's exit. A reply to one adds to the run's output rather
-	 * than replacing it (see summarizeRun).
+	/** The report an entry records, if any: the latest is a delegated task's
+	 * result (see summarizeRun).
 	 */
-	noticeTypes?: readonly string[];
+	reportOf: (entry: SessionEntry) => string | undefined;
 	/** Captured root ledger; billing never follows session replacement. */
 	rootSessionManager?: SessionManager;
 }
@@ -87,6 +97,10 @@ export interface Subagent {
 	readonly status: "running" | RunSummary["status"];
 	readonly error?: string;
 	readonly cancelled: boolean;
+	/** The parent's task is running, so a report reaches the parent. False
+	 * between runs and while the user continues a finished conversation.
+	 */
+	readonly delegated: boolean;
 	/** Raw execution snapshots, retained until the next delegated run. */
 	readonly liveTools: ReadonlyMap<string, SubagentToolExecution>;
 	/** Messages sent to this agent that have not reached its transcript;
@@ -98,6 +112,8 @@ export interface Subagent {
 /** Complete run data, independent of tool output limits and presentation. */
 export interface SubagentResult extends RunSummary {
 	id: string;
+	/** Stopped by its parent's report, which already told the parent agent. */
+	leftover?: boolean;
 }
 
 export interface Subagents {
@@ -112,8 +128,19 @@ export interface Subagents {
 		instructions: string,
 		context: SpawnContext,
 	): SubagentStart;
-	/** Include asynchronous work, such as result delivery, in a parent's settlement. */
-	trackCompletion(parentId: string, completion: Promise<void>): void;
+	/** Include asynchronous work, such as result delivery, in a parent's
+	 * settlement. With a `leftover` handle, the parent's report stops it instead.
+	 */
+	trackCompletion(
+		parentId: string,
+		completion: Promise<void>,
+		leftover?: Leftover,
+	): void;
+	/** Stop what a task left running as it reports: its delegated children
+	 * and its tracked work with a leftover handle, such as jobs. Returns what
+	 * was still running, by label. The children's results are not delivered.
+	 */
+	stopLeftovers(id: string): string[];
 	/** Resolves once a parent's tracked work, including late additions, drains. */
 	settled(parentId: string): Promise<void>;
 	/** Steer an active run; otherwise continue the same conversation. */
@@ -126,12 +153,15 @@ export interface Subagents {
 }
 
 interface ActiveRun {
-	/** Started by the user continuing a conversation, which is theirs to lead. */
-	readonly userLed: boolean;
-	/** User input reached the agent since the run began or last resumed its task,
-	 * so its latest reply may answer the user rather than conclude the task.
+	/** Started by the user continuing a conversation, which is theirs to lead:
+	 * it reports nothing.
 	 */
-	interrupted: boolean;
+	readonly userLed: boolean;
+	/** Stopped by its parent's report, which already told the parent agent. */
+	leftover: boolean;
+	/** Reminded to report since the run's tracked work last changed. */
+	reminded: boolean;
+	reminder?: Promise<void>;
 	/** Serialize input preflight, not entire prompts or delegated runs. */
 	preflight: Promise<void>;
 	/** Settles once the run, including descendant delivery, finishes. */
@@ -216,16 +246,17 @@ function toolSnapshot(
 /** Owns one session's mutable state; all operations are safe to pass as callbacks. */
 export function createSubagents({
 	createSession,
-	resumeSession,
+	remindSession,
 	disposeSession,
-	noticeTypes,
+	reportOf,
 	rootSessionManager,
 }: SubagentsOptions): Subagents {
-	const notices = new Set(noticeTypes);
 	const rootLedger = rootSessionManager && usageLedger(rootSessionManager);
 	const nodes = new Map<string, SubagentNode>();
 	/** Outstanding work by the parent whose settlement includes it. */
 	const completions = new Map<string, Set<Promise<void>>>();
+	/** How to stop outstanding work that a report leaves over. */
+	const leftovers = new Map<Promise<void>, Leftover>();
 	/** Failures without a running node to own them, reported at shutdown. */
 	const completionErrors: unknown[] = [];
 	const listeners = new Set<() => void>();
@@ -267,6 +298,9 @@ export function createSubagents({
 			unsubscribe: () => {},
 			liveTools: new Map(),
 			pendingInput: new Set(),
+			get delegated() {
+				return node.run !== undefined && !node.run.userLed;
+			},
 			get queuedInput() {
 				return [
 					...(node.session?.getSteeringMessages() ?? []),
@@ -282,14 +316,25 @@ export function createSubagents({
 		return { id, result };
 	}
 
-	function trackCompletion(parentId: string, completion: Promise<void>): void {
+	function trackCompletion(
+		parentId: string,
+		completion: Promise<void>,
+		leftover?: Leftover,
+	): void {
 		const pending = completions.get(parentId) ?? new Set();
 		completions.set(parentId, pending);
 		pending.add(completion);
+		if (leftover) leftovers.set(completion, leftover);
 		const remove = () => {
 			pending.delete(completion);
+			leftovers.delete(completion);
 			if (!pending.size && completions.get(parentId) === pending)
 				completions.delete(parentId);
+			const node = nodes.get(parentId);
+			// Anything but the reminder itself may have given the agent more to
+			// say, e.g. input, a child's result or a job's exit.
+			if (node?.run && completion !== node.run.reminder)
+				node.run.reminded = false;
 		};
 		// Observe detached work, but retain failures even if they settle before drainage.
 		void completion.then(remove, (error: unknown) => {
@@ -320,18 +365,11 @@ export function createSubagents({
 		active.preflight = preflight.promise;
 		// Sent input is queued until the session queues, starts or handles it.
 		const input = { text: instructions };
-		// Only a user-led run's own input is sent; anything else the user sends
-		// interrupts a delegated task.
-		const interrupts = sent && !active.userLed;
 		if (sent) node.pendingInput.add(input);
 		const accepted = (disposition?: string) => {
 			const withdrawn = sent && !node.pendingInput.delete(input);
 			// Stopping already handed this input back; it must not reach the agent too.
 			if (withdrawn && disposition === "queued") node.session?.clearQueue();
-			// Whether queued, answered at once, or handled by an extension (which
-			// may still prompt the agent), the user's input interrupted the task.
-			else if (interrupts && disposition && !withdrawn)
-				active.interrupted = true;
 			preflight.resolve();
 		};
 		const prompt = previous.then(async () => {
@@ -403,7 +441,8 @@ export function createSubagents({
 		// Track the whole delegated run before any lifecycle callback can request shutdown.
 		const active: ActiveRun = {
 			userLed: sent,
-			interrupted: false,
+			leftover: false,
+			reminded: false,
 			preflight: initialization.promise,
 			settled: settlement.promise,
 		};
@@ -448,14 +487,17 @@ export function createSubagents({
 				initialization.resolve();
 			}
 
+			// Only the parent's task reports; a conversation the user continued
+			// ends with its last message.
+			const taskReportOf = active.userLed ? undefined : reportOf;
 			let entries: SessionEntry[];
-			let summary: RunSummary;
+			let summary: RunSummary & { unreported: boolean };
 			for (;;) {
 				try {
 					// Prompts and deliveries can start further prompts and track more
 					// work. Recheck after the await: new completion/input preflight can
-					// arrive in the microtask that resolves it. The rest, up to
-					// resumption or finalization, is synchronous.
+					// arrive in the microtask that resolves it. The rest, up to a
+					// reminder or finalization, is synchronous.
 					do {
 						await settled(node.id);
 						await node.session?.waitForIdle();
@@ -469,19 +511,24 @@ export function createSubagents({
 				entries =
 					node.session?.sessionManager.getEntries().slice(firstEntry ?? 0) ??
 					[];
-				summary = summarizeRun(entries, node.cancelled, node.error, notices);
-				// The parent receives a delegated run's last message, so a reply to
-				// the user must not be it. Whatever followed the user's input (tool
-				// calls, extension messages, results, command exits), the run returns
-				// to its task, or restates its result, once per batch of interruptions.
-				// User-led runs never set the flag.
-				if (!node.session || !active.interrupted || summary.status !== "done")
+				summary = summarizeRun(entries, {
+					cancelled: node.cancelled,
+					error: node.error,
+					reportOf: taskReportOf,
+				});
+				// Idle with nothing left to wait for, yet unreported: remind the task,
+				// again only once its tracked work changes (see trackCompletion).
+				if (
+					!summary.unreported ||
+					active.reminded ||
+					!node.session ||
+					node.cancelled ||
+					closing
+				)
 					break;
-				active.interrupted = false;
-				trackCompletion(
-					node.id,
-					Promise.resolve(node.session).then(resumeSession),
-				);
+				active.reminded = true;
+				active.reminder = Promise.resolve(node.session).then(remindSession);
+				trackCompletion(node.id, active.reminder);
 			}
 			const usage = summarizeOwnUsage(entries);
 			// Bill before terminal listeners can restart a conversation. Each run's
@@ -506,11 +553,46 @@ export function createSubagents({
 				finish();
 				changed();
 			}
-			return { id: node.id, ...summary };
+			const { status, error, output } = summary;
+			return {
+				id: node.id,
+				status,
+				error,
+				output,
+				usage: summary.usage,
+				...(active.leftover ? { leftover: true } : {}),
+			};
 		} finally {
 			initialization.resolve();
 			finish();
 		}
+	}
+
+	function stopLeftovers(id: string): string[] {
+		const stopped: string[] = [];
+		// A child the user continues is theirs, and reports nothing anyway.
+		for (const child of nodes.values())
+			if (
+				child.parentId === id &&
+				child.run &&
+				!child.run.userLed &&
+				!child.cancelled
+			) {
+				child.run.leftover = true;
+				stopped.push(`subagent ${child.id}`);
+				abort(child.id);
+			}
+		for (const completion of completions.get(id) ?? []) {
+			const leftover = leftovers.get(completion);
+			if (!leftover) continue;
+			leftovers.delete(completion);
+			try {
+				if (leftover.stop()) stopped.push(leftover.label);
+			} catch (error) {
+				completionErrors.push(error);
+			}
+		}
+		return stopped;
 	}
 
 	/** Mirror a published session's events into its node. */
@@ -619,6 +701,7 @@ export function createSubagents({
 		},
 		start,
 		trackCompletion,
+		stopLeftovers,
 		settled,
 		send,
 		abort,

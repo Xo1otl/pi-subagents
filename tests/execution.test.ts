@@ -3,6 +3,7 @@ import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import {
 	type AgentSession,
 	type AgentSessionEvent,
+	type SessionEntry,
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import {
@@ -15,28 +16,43 @@ import { deferred, model, response, until } from "./fixtures.ts";
 
 const context: SpawnContext = { cwd: "/unused", model, projectTrusted: false };
 
+/** The runtime only needs to recognize reports; here they are custom entries. */
+const REPORT = "test-report";
+
+function reportOf(entry: SessionEntry): string | undefined {
+	return entry.type === "custom" && entry.customType === REPORT
+		? String(entry.data)
+		: undefined;
+}
+
+/** Answer like Pi, and report the answer unless told otherwise. */
+function reply(session: AgentSession, text: string, reported = true): void {
+	session.sessionManager.appendMessage(response(text));
+	if (reported) session.sessionManager.appendCustomEntry(REPORT, text);
+}
+
 /** Only the SDK boundary is stubbed; entries use Pi's real ledger. */
 function sessionStub(overrides: Partial<AgentSession> = {}): AgentSession {
 	const sessionManager = SessionManager.inMemory();
-	return {
+	const session = {
 		sessionManager,
 		subscribe: () => () => {},
-		prompt: async (text: string) => {
-			sessionManager.appendMessage(response(text));
-		},
+		prompt: async (text: string) => reply(session, text),
 		waitForIdle: async () => {},
 		abort: async () => {},
 		clearQueue: () => ({ steering: [], followUp: [] }),
 		...overrides,
 	} as AgentSession;
+	return session;
 }
 
 function runtimeWith(
 	options: Pick<SubagentsOptions, "createSession"> & Partial<SubagentsOptions>,
 ) {
 	return createSubagents({
-		resumeSession: async () => {},
+		remindSession: async () => {},
 		disposeSession: async () => {},
+		reportOf,
 		...options,
 	});
 }
@@ -54,7 +70,7 @@ function runtimeFor(
 test("runtime owns execution but delegates session creation and disposal", async () => {
 	const unsubscribe = mock(() => {});
 	const prompt = mock(async (_instructions: string) => {
-		session.sessionManager.appendMessage(response("complete output"));
+		reply(session, "complete output");
 	});
 	const session = sessionStub({ subscribe: () => unsubscribe, prompt });
 	const disposeSession = mock(async (_session: AgentSession) => {});
@@ -118,7 +134,7 @@ test("start reserves a running receipt synchronously, before session initializat
 	const session = sessionStub({
 		prompt: async () => {
 			await finished.promise;
-			session.sessionManager.appendMessage(response("child finished"));
+			reply(session, "child finished");
 		},
 	});
 	const createSession = mock<SubagentsOptions["createSession"]>(
@@ -227,7 +243,7 @@ test("rejected completion work remains an error even when it drains before waitF
 				"1",
 				Promise.reject(new Error("delivery failed")),
 			);
-			session.sessionManager.appendMessage(response("otherwise done"));
+			reply(session, "otherwise done", false);
 		},
 	});
 	const runtime = runtimeFor(session);
@@ -242,13 +258,13 @@ test("rejected completion work remains an error even when it drains before waitF
 	}
 });
 
-test("a send arriving after an idle snapshot but before finalization is drained and billed", async () => {
+test("a send arriving as the run's last work settles is drained and billed", async () => {
 	let sent: Promise<void> | undefined;
-	let waits = 0;
 	const session = sessionStub({
-		waitForIdle: async () => {
-			// Lands in the microtask that resolves the idle wait.
-			if (waits++ === 0)
+		prompt: async (text) => {
+			reply(session, text);
+			// Lands just before the microtask that resumes the run's drain.
+			if (text === "initial")
 				queueMicrotask(() => {
 					sent = runtime.send("1", "late input");
 				});
@@ -266,83 +282,125 @@ test("a send arriving after an idle snapshot but before finalization is drained 
 	}
 });
 
-test.each(
-	[true, false].flatMap((heard) =>
-		(["nothing", "context", "wake-up"] as const).map(
-			(follows) => [heard, follows] as const,
-		),
-	),
-)(
-	"a delegated run interrupted by the user resumes its task once per interruption, whatever follows its reply; a continued run does not (resumption heard: %s, after the input: %s)",
-	async (heard, follows) => {
-		let interruption: string | undefined = "question";
-		let sent: Promise<void> | undefined;
+test.each([true, false])(
+	"an idle task with nothing left to wait for is reminded once to report (reports when reminded: %s)",
+	async (heard) => {
 		const session = sessionStub({
-			// Like Pi, record the input that each reply answers.
-			prompt: async (text, options) => {
-				options?.preflightResult?.("started");
-				const { sessionManager } = session;
-				sessionManager.appendMessage({
-					role: "user",
-					content: text,
-					timestamp: Date.now(),
-				});
-				// E.g. before_agent_start context, which follows the user's input.
-				if (follows === "context")
-					sessionManager.appendCustomMessageEntry("context", "context", false);
-				sessionManager.appendMessage(response(`re: ${text}`));
-				// E.g. a command exit that the agent acknowledges after its reply.
-				if (follows === "wake-up" && text !== "task") {
-					sessionManager.appendCustomMessageEntry("exit", "exit", true);
-					sessionManager.appendMessage(response("noted"));
-				}
-			},
-			waitForIdle: async () => {
-				const text = interruption;
-				interruption = undefined;
-				if (text)
-					queueMicrotask(() => {
-						sent = runtime.send("1", text);
-					});
-			},
+			prompt: async (text) => reply(session, `re: ${text}`, false),
 		});
-		const resumeSession = mock(async (resumed: AgentSession) => {
-			// A resumption that adds nothing must not be repeated forever.
-			if (!heard) return;
-			resumed.sessionManager.appendCustomMessageEntry("resume", "resume", true);
-			resumed.sessionManager.appendMessage(response("task result"));
+		const remindSession = mock(async (reminded: AgentSession) => {
+			reply(reminded, "task result", heard);
 		});
-		const runtime = runtimeFor(session, { resumeSession });
+		const runtime = runtimeFor(session, { remindSession });
 		try {
-			expect(await runtime.start(ROOT, "task", context).result).toMatchObject({
-				status: "done",
-				output: heard
-					? "task result"
-					: follows === "wake-up"
-						? "noted"
-						: "re: question",
-			});
-			await sent;
-			expect(resumeSession).toHaveBeenCalledTimes(1);
-			interruption = "again";
+			const result = await runtime.start(ROOT, "task", context).result;
+			expect(result).toMatchObject(
+				heard
+					? { status: "done", output: "task result" }
+					: {
+							status: "error",
+							error: "Subagent ended without a report.",
+							// The last message tells the parent what the agent was saying.
+							output:
+								"Subagent ended without a report. Its last message:\n\ntask result",
+						},
+			);
+			expect(remindSession).toHaveBeenCalledTimes(1);
+			expect(result).not.toHaveProperty("stopped");
+			// A conversation the user continues is theirs: no report, no reminder.
 			await runtime.send("1", "continue");
-			await sent;
-			expect(
-				session.sessionManager
-					.getEntries()
-					.some(
-						(entry) =>
-							entry.type === "message" &&
-							JSON.stringify(entry.message).includes("re: again"),
-					),
-			).toBe(true);
 			expect(runtime.get("1")?.status).toBe("done");
-			expect(resumeSession).toHaveBeenCalledTimes(1);
+			expect(remindSession).toHaveBeenCalledTimes(1);
 		} finally {
 			await runtime.dispose();
 		}
 	},
 );
+
+test("an ignored reminder is repeated only once the task's work changes, e.g. with input", async () => {
+	let sent: Promise<void> | undefined;
+	const session = sessionStub({
+		prompt: async (text) => reply(session, `re: ${text}`, false),
+	});
+	const remindSession = mock(async (reminded: AgentSession) => {
+		const first = remindSession.mock.calls.length === 1;
+		reply(reminded, first ? "still working" : "task result", !first);
+		if (first) sent = runtime.send("1", "question");
+	});
+	const runtime = runtimeFor(session, { remindSession });
+	try {
+		expect(await runtime.start(ROOT, "task", context).result).toMatchObject({
+			status: "done",
+			output: "task result",
+			usage: { totalTokens: 12 },
+		});
+		await sent;
+		expect(remindSession).toHaveBeenCalledTimes(2);
+	} finally {
+		await runtime.dispose();
+	}
+});
+
+test("stopping a task's leftovers ends its children and stoppable work at once, naming what still ran", async () => {
+	const job = Promise.withResolvers<void>();
+	const stop = mock(() => {
+		job.resolve();
+		return true;
+	});
+	let stopped: string[] = [];
+	const parent = sessionStub({
+		prompt: async (text) => {
+			if (text !== "task") return reply(parent, text);
+			const child = runtime.start("1", "child task", context);
+			runtime.trackCompletion("1", job.promise, {
+				label: "PGID 42: job",
+				stop,
+			});
+			// Work that already ended, though it is still settling, was not cut short.
+			const ended = Promise.withResolvers<void>();
+			runtime.trackCompletion("1", ended.promise, {
+				label: "PGID 43: ended",
+				stop: () => {
+					ended.resolve();
+					return false;
+				},
+			});
+			stopped = runtime.stopLeftovers("1");
+			expect(await child.result).toMatchObject({
+				status: "aborted",
+				leftover: true,
+			});
+			// The task goes on: it may start new work, then report.
+			await runtime.start("1", "new child", context).result;
+			reply(parent, "parent report");
+		},
+	});
+	const runtime = runtimeWith({
+		createSession: async (_context, { id }, onCreated) => {
+			if (id === "1") return onCreated(parent);
+			// A child that works until stopped, unless its work is new.
+			const work = Promise.withResolvers<void>();
+			const child = sessionStub({
+				prompt: async (text) => {
+					if (text === "new child") return reply(child, "new work");
+					await work.promise;
+				},
+				abort: async () => work.resolve(),
+			});
+			onCreated(child);
+		},
+	});
+	try {
+		const result = await runtime.start(ROOT, "task", context).result;
+		expect(result).toMatchObject({ status: "done", output: "parent report" });
+		expect(result).not.toHaveProperty("leftover");
+		expect(stopped).toEqual(["subagent 1.1", "PGID 42: job"]);
+		expect(stop).toHaveBeenCalledTimes(1);
+		expect(runtime.get("1.2")?.status).toBe("done");
+	} finally {
+		await runtime.dispose();
+	}
+});
 
 test("failed binding revokes a published session and retry creates a fresh one", async () => {
 	const unsubscribe = mock(() => {});
@@ -444,7 +502,7 @@ test("terminal listeners can restart without the old run clearing their operatio
 	const session = sessionStub({
 		prompt: async (text: string) => {
 			if (text === "restart") await gate.promise;
-			session.sessionManager.appendMessage(response(text));
+			reply(session, text);
 		},
 	});
 	const runtime = runtimeFor(session);
@@ -522,7 +580,7 @@ test("liveTools retains full raw snapshots, authoritative terminal results, and 
 					isError: false,
 				});
 			} else expect(runtime.get("1")?.liveTools.size).toBe(0);
-			session.sessionManager.appendMessage(response("done"));
+			reply(session, "done");
 		},
 	});
 	const runtime = runtimeFor(session);

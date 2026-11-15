@@ -18,8 +18,8 @@ import {
 } from "../agent/index.ts";
 import {
 	COMMAND_EXIT_TYPE,
+	SUBAGENT_REMINDER_TYPE,
 	SUBAGENT_RESULT_TYPE,
-	SUBAGENT_RESUME_TYPE,
 	SUBAGENT_USAGE_TYPE,
 	type SubagentCompletionDetails,
 } from "../agent/protocol.ts";
@@ -36,6 +36,7 @@ import {
 	onCleanup,
 	parentSession,
 	replies,
+	report,
 	response,
 	rootSession,
 	stream,
@@ -85,9 +86,9 @@ const defaultDispatch = stream((context) => {
 		return response("parent available");
 	if (lastCustomMessage(context, SUBAGENT_RESULT_TYPE))
 		return response("completion accepted");
-	return response(
-		text === "child task" ? "child answer" : "another prompt accepted",
-	);
+	return text === "child task"
+		? report("child answer")
+		: response("another prompt accepted");
 });
 
 test("the tool starts the child with the requested effort and rejects unknown models", async () => {
@@ -104,7 +105,7 @@ test("the tool starts the child with the requested effort and rejects unknown mo
 	expect(tree.get("1")?.session?.thinkingLevel).toBe("low");
 });
 
-test("nohup completion notifies the parent once, with the child's last assistant message", async () => {
+test("nohup completion notifies the parent once, with the child's report", async () => {
 	let job: ReturnType<typeof backgroundJob> | undefined;
 	const { session, tree } = await setup(
 		stream((context) => {
@@ -117,11 +118,9 @@ test("nohup completion notifies the parent once, with the child's last assistant
 			}
 			if (lastCustomMessage(context, SUBAGENT_RESULT_TYPE))
 				return response("completion accepted");
+			// Answering the user is no report; the job's exit leads to one.
 			if (lastCustomMessage(context, COMMAND_EXIT_TYPE))
-				return response("child answer after exit");
-			// The user's input interrupted the task, so the child restates it.
-			if (lastCustomMessage(context, SUBAGENT_RESUME_TYPE))
-				return response("child result restated");
+				return report("child report after exit");
 			if (text === "final update") return response("last child answer");
 			return response("available while job runs");
 		}),
@@ -138,7 +137,7 @@ test("nohup completion notifies the parent once, with the child's last assistant
 	expect(existsSync(job.finished)).toBe(true);
 	const [completion] = completions(session);
 	if (!completion) throw new Error("Missing completion");
-	expect(completionOutput(completion)).toBe("child result restated");
+	expect(completionOutput(completion)).toBe("child report after exit");
 	expect(session.getLastAssistantText()).toBe("completion accepted");
 	await tree.settled(ROOT);
 	expect(completions(session)).toHaveLength(1);
@@ -261,7 +260,7 @@ test("completion is a follow-up to a busy parent's newer prompt, not an interrup
 		if (text === "child task") {
 			childRunning = true;
 			await Promise.race([child.promise, waiting(options?.signal)]);
-			return response("child answer");
+			return report("child answer");
 		}
 		if (text === "busy prompt") {
 			parentRunning = true;
@@ -369,7 +368,7 @@ test("interrupting the originating parent leaves the child running and still del
 		if (text === "child task") {
 			childRunning = true;
 			await Promise.race([child.promise, waiting(options?.signal)]);
-			return response("late child answer");
+			return report("late child answer");
 		}
 		if (context.messages.at(-1)?.role === "toolResult")
 			return waiting(options?.signal);
@@ -409,7 +408,7 @@ test("a result arriving during an interrupt is kept without restarting the turn"
 		if (text === "child task") {
 			childRunning = true;
 			await Promise.race([child.promise, waiting(options?.signal)]);
-			return response("child answer");
+			return report("child answer");
 		}
 		if (text === "newer root prompt") {
 			parentRunning = true;
@@ -471,7 +470,7 @@ test("a result waiting for a busy parent survives an interrupt", async () => {
 		if (text === "child task") {
 			childRunning = true;
 			await Promise.race([child.promise, waiting(options?.signal)]);
-			return response("child answer");
+			return report("child answer");
 		}
 		if (text === "busy prompt") {
 			parentRunning = true;
@@ -515,7 +514,7 @@ test("results held by a busy parent are released together, starting one turn", a
 			});
 		if (text === "first" || text === "second") {
 			children++;
-			return response(`${text} answer`);
+			return report(`${text} answer`);
 		}
 		if (context.messages.at(-1)?.role === "toolResult") {
 			parentRunning = true;
@@ -598,11 +597,9 @@ test.each([false, true])(
 				running = true;
 				await Promise.race([original.promise, waiting(options?.signal)]);
 			}
-			return response(
-				lastCustomMessage(context, SUBAGENT_RESUME_TYPE)
-					? "original finished"
-					: lastText(context),
-			);
+			return lastCustomMessage(context, SUBAGENT_REMINDER_TYPE)
+				? report("original finished")
+				: response(lastText(context));
 		});
 		const { session, tree } = await setup(dispatch, undefined, {
 			child: (pi) => {
@@ -638,7 +635,7 @@ test.each([false, true])(
 		if (!dispose) {
 			input.resolve();
 			await sent;
-			// Answering the input resumes the task, whose result is reported.
+			// Answering the input is no report, so the task is reminded.
 			expect(await started.result).toMatchObject({
 				status: "done",
 				output: "original finished",
@@ -777,7 +774,7 @@ test("completion output is bounded with full output saved, and rich usage is bil
 		cacheWrite1h: 1,
 	};
 	const dispatch = stream((context, options) => {
-		if (lastText(context) === "child task") return response(huge, { usage });
+		if (lastText(context) === "child task") return report(huge, { usage });
 		return defaultDispatch(model, context, options).result();
 	});
 	const { session } = await setup(dispatch);

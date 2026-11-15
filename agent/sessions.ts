@@ -18,7 +18,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { SessionOwner, SpawnContext } from "../runtime/index.ts";
 import { delegatedCommands } from "./commands.ts";
-import { SUBAGENT_RESUME_TYPE } from "./protocol.ts";
+import { SUBAGENT_REMINDER_TYPE } from "./protocol.ts";
 
 /** Each delegated session has its own event bus, which answers this request.
  * Unlike module state, the bus reaches every copy of this extension, including
@@ -174,15 +174,15 @@ export async function createChildSession(
 	});
 }
 
-/** Return a delegated run to its task once it has answered the user. The
- * promise settles with the turn, so startup failures fail the run.
+/** Remind an idle task with nothing left to wait for that it has not
+ * reported, e.g. after answering the user. The promise settles with the turn,
+ * so startup failures fail the run.
  */
-export function resumeChildSession(session: AgentSession): Promise<void> {
+export function remindChildSession(session: AgentSession): Promise<void> {
 	return session.sendCustomMessage(
 		{
-			customType: SUBAGENT_RESUME_TYPE,
-			content:
-				"You are a subagent. 1st chat msg was from parent, who can't see this chat; intervening msgs from user. Task incomplete → resume; done → report to parent.",
+			customType: SUBAGENT_REMINDER_TYPE,
+			content: "Not reported. Task incomplete → continue; done → report.",
 			display: true,
 		},
 		{ triggerTurn: true },

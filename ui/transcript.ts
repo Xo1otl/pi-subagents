@@ -4,6 +4,7 @@ import {
 	sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
 import { Markdown, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import { REPORT_TOOL, reportResult } from "../agent/protocol.ts";
 import type { Subagent, SubagentToolExecution } from "../runtime/index.ts";
 import { plain, singleLine, type UITheme } from "./text.ts";
 
@@ -80,12 +81,17 @@ function transcriptBlocks(node: Subagent): Block[] {
 		calls.add(id);
 		const result = results.get(id);
 		const live = node.liveTools.get(id);
+		// A report is the run's result, kept out of what the model read back.
+		const report =
+			name === REPORT_TOOL && !result?.isError
+				? reportResult(args ?? live?.args)
+				: undefined;
 		blocks.push({
 			id: `tool:${id}`,
 			kind: "tool",
 			label: name,
 			args: args ?? live?.args,
-			text: displayText(result?.content ?? live?.result?.content),
+			text: report ?? displayText(result?.content ?? live?.result?.content),
 			status: result
 				? result.isError
 					? "error"

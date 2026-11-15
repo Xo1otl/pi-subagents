@@ -1,5 +1,6 @@
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Usage } from "@earendil-works/pi-ai";
+import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { SubagentResult } from "../runtime/index.ts";
 
 /** What the integration emits and persists, shared with presentation.
@@ -7,18 +8,21 @@ import type { SubagentResult } from "../runtime/index.ts";
  */
 export const SUBAGENT_RESULT_TYPE = "subagent-result";
 export const SUBAGENT_USAGE_TYPE = "subagent-usage";
-export const SUBAGENT_RESUME_TYPE = "subagent-resume";
+export const SUBAGENT_REMINDER_TYPE = "subagent-reminder";
 export const COMMAND_EXIT_TYPE = "bg-exit";
 export const COMMAND_UNKNOWN_TYPE = "bg-unknown";
-export const COMMAND_RUNNING_TYPE = "bg-running";
-/** What command tracking tells an agent. None of them gives it work, so what it
- * said before one still stands.
- */
+/** What command tracking tells an agent. */
 export const COMMAND_NOTICE_TYPES = [
 	COMMAND_EXIT_TYPE,
 	COMMAND_UNKNOWN_TYPE,
-	COMMAND_RUNNING_TYPE,
 ] as const;
+/** The tool through which a subagent delivers its result and ends its task. */
+export const REPORT_TOOL = "report";
+
+/** A report is kept as the tool result's state, never shown to the model. */
+export interface ReportDetails {
+	result: string;
+}
 
 export interface SubagentReceipt {
 	id: string;
@@ -71,27 +75,8 @@ export interface CommandUnknownMessage {
 	details: CommandUnknownDetails;
 }
 
-export interface CommandRunningDetails {
-	pgid: number;
-	command: string;
-	cwd: string;
-	/** How long the group had been running. */
-	seconds: number;
-}
-
-/** A group that outlasts its idle agent, whose run cannot finish before it. */
-export interface CommandRunningMessage {
-	customType: typeof COMMAND_RUNNING_TYPE;
-	content: string;
-	display: boolean;
-	details: CommandRunningDetails;
-}
-
 /** What command tracking tells the conversation that ran the command. */
-export type CommandMessage =
-	| CommandExitMessage
-	| CommandUnknownMessage
-	| CommandRunningMessage;
+export type CommandMessage = CommandExitMessage | CommandUnknownMessage;
 
 /** Details may come from persisted sessions, so they are checked rather than trusted. */
 export function subagentId(details: unknown): string | undefined {
@@ -119,4 +104,25 @@ export function subagentReceipt(id: string): AgentToolResult<SubagentReceipt> {
 		details: receipt,
 		structuredContent: { ...receipt },
 	};
+}
+
+/** The result a report tool call carries, if its arguments are complete. */
+export function reportResult(args: unknown): string | undefined {
+	return args &&
+		typeof args === "object" &&
+		"result" in args &&
+		typeof args.result === "string"
+		? args.result
+		: undefined;
+}
+
+/** The report an entry records, if any: a successful report's stored result. */
+export function reportOf(entry: SessionEntry): string | undefined {
+	if (entry.type !== "message") return undefined;
+	const { message } = entry;
+	return message.role === "toolResult" &&
+		message.toolName === REPORT_TOOL &&
+		!message.isError
+		? reportResult(message.details)
+		: undefined;
 }

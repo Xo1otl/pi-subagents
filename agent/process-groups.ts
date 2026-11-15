@@ -11,8 +11,6 @@ export const UNKNOWN_STATUS_REPORT_MS = 60_000;
 
 export interface GroupWatch {
 	signal?: AbortSignal;
-	/** Told after every check that finds the group running. */
-	onRunning?: () => void;
 	/** Told once, when the status has stayed unknown for `unknownAfterMs`. */
 	onUnknown?: (error: unknown) => void | Promise<void>;
 	unknownAfterMs?: number;
@@ -30,7 +28,6 @@ export async function waitForGroupToFinish(
 	pgid: number,
 	{
 		signal,
-		onRunning,
 		onUnknown,
 		unknownAfterMs = UNKNOWN_STATUS_REPORT_MS,
 	}: GroupWatch = {},
@@ -52,7 +49,6 @@ export async function waitForGroupToFinish(
 			}
 		}
 		if (running === false) return;
-		if (running) onRunning?.();
 		await setTimeout(delay, undefined, { signal });
 	}
 }

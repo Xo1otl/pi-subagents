@@ -3,15 +3,15 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { normalizeContext } from "@earendil-works/pi-ai";
 import {
 	COMMAND_NOTICE_TYPES,
+	SUBAGENT_REMINDER_TYPE,
 	SUBAGENT_RESULT_TYPE,
-	SUBAGENT_RESUME_TYPE,
 } from "../agent/protocol.ts";
 import { lastCustomMessage, protocolMessages } from "./protocol.ts";
 
 test.each([
 	...COMMAND_NOTICE_TYPES,
 	SUBAGENT_RESULT_TYPE,
-	SUBAGENT_RESUME_TYPE,
+	SUBAGENT_REMINDER_TYPE,
 ])(
 	"test providers route %s by protocol type, regardless of wording",
 	(customType) => {

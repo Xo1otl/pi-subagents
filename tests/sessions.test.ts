@@ -10,10 +10,12 @@ import {
 	SessionManager,
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { REPORT_TOOL } from "../agent/protocol.ts";
 import { spawnContext } from "../agent/sessions.ts";
 import extension from "../index.ts";
 import { ROOT } from "../runtime/index.ts";
 import {
+	answer,
 	childExtension,
 	deferred,
 	hierarchyStream,
@@ -21,9 +23,11 @@ import {
 	lastText,
 	model,
 	onCleanup,
+	report,
 	response,
 	shared,
 	stream,
+	taskText,
 	spawnContext as testContext,
 	testProvider,
 	testRuntime,
@@ -39,7 +43,7 @@ function addedGuidance(guidelines: readonly string[] | undefined): string {
 }
 
 async function setup({
-	streamFn = stream(() => response("ok")),
+	streamFn = stream((context) => answer(context, "ok")),
 	settings = {},
 	persist = false,
 }: {
@@ -172,7 +176,7 @@ test("loads workspace resources into a fresh child of a persistent parent", asyn
 			transport: "sse",
 			shellCommandPrefix: "export STANDARD_ENV=on_disk;",
 		},
-		streamFn: stream((context) => response(lastText(context))),
+		streamFn: stream((context) => answer(context, lastText(context))),
 	});
 	await mkdir(join(agentDir, "skills", "standard"), { recursive: true });
 	await writeFile(
@@ -330,12 +334,22 @@ test.each(["inactive", "overridden"] as const)(
 );
 
 test("provides machine-facing delegation in children without loading UI registrations", async () => {
-	const { tree, context } = await setup();
+	const { parent, tree, context } = await setup();
 	await tree.start(ROOT, "child", context).result;
 	const child = tree.get("1")?.session;
 	if (!child) throw new Error("Missing child");
 	const tool = child.getToolDefinition("subagent");
 	expect(tool).toBeDefined();
+	// Only a child has a parent to report to: its system prompt gains the
+	// tool's one guideline, without listing the tool.
+	expect(child.getActiveToolNames()).toContain(REPORT_TOOL);
+	expect(parent.getToolDefinition(REPORT_TOOL)).toBeUndefined();
+	const guidelines =
+		child.getToolDefinition(REPORT_TOOL)?.promptGuidelines ?? [];
+	expect(guidelines).toHaveLength(1);
+	expect(child.systemPrompt).toContain(guidelines[0] ?? "missing");
+	expect(parent.systemPrompt).not.toContain(guidelines[0] ?? "missing");
+	expect(child.systemPrompt).not.toContain(`- ${REPORT_TOOL}:`);
 	expect(tool?.renderCall).toBeUndefined();
 	expect(tool?.renderResult).toBeUndefined();
 	const extensions = child.resourceLoader.getExtensions();
@@ -356,8 +370,11 @@ test("configured web search remains available throughout nested delegation", asy
 		streamFn: stream((context) => {
 			const text = lastText(context);
 			const completion = lastCompletion(context);
-			if (completion) return response(completion.output);
-			if (context.messages.at(-1)?.role === "toolResult") return response(text);
+			if (completion) return answer(context, completion.output);
+			if (context.messages.at(-1)?.role === "toolResult")
+				return taskText(context) === "delegate search"
+					? response("searching")
+					: answer(context, text);
 			return text === "delegate search"
 				? toolCall("subagent", { instructions: "search" })
 				: toolCall("web_search", { query: "pi" });
@@ -381,7 +398,7 @@ test("configured web search remains available throughout nested delegation", asy
 	expect(tree.tree()).toHaveLength(2);
 	for (const node of tree.tree()) {
 		expect(node.session?.getActiveToolNames().toSorted()).toEqual(
-			["read", "grep", "web_search", "subagent"].toSorted(),
+			["read", "grep", "web_search", "subagent", REPORT_TOOL].toSorted(),
 		);
 	}
 });
@@ -392,8 +409,11 @@ test("runs recursive delegation through pi's codemode extension", async () => {
 		streamFn: stream((context) => {
 			const text = lastText(context);
 			const completion = lastCompletion(context);
-			if (completion) return response(completion.output);
-			if (context.messages.at(-1)?.role === "toolResult") return response(text);
+			if (completion) return answer(context, completion.output);
+			if (context.messages.at(-1)?.role === "toolResult")
+				return taskText(context) === "delegate"
+					? response("delegated")
+					: answer(context, text);
 			return toolCall("codemode", {
 				code:
 					lastText(context) === "delegate"
@@ -413,9 +433,14 @@ test("runs recursive delegation through pi's codemode extension", async () => {
 test("uses configured MCP servers during nested delegation", async () => {
 	const { tree, context, cwd } = await setup({
 		streamFn: stream((context) => {
+			const completion = lastCompletion(context);
+			if (completion) return answer(context, completion.output);
+			const delegating = taskText(context) === "delegate";
 			if (context.messages.at(-1)?.role === "toolResult")
-				return response(lastText(context));
-			return lastText(context) === "delegate"
+				return delegating
+					? response("delegated")
+					: answer(context, lastText(context));
+			return delegating
 				? toolCall("subagent", { instructions: "echo" })
 				: toolCall("mcp__test__echo", { text: "MCP_MARKER" });
 		}),
@@ -468,7 +493,7 @@ test("runs standard extension permission and result hooks in the child's context
 	const { parent, tree, context, cwd } = await setup({
 		streamFn: stream((context) =>
 			context.messages.at(-1)?.role === "toolResult"
-				? response(lastText(context))
+				? answer(context, lastText(context))
 				: lastText(context) === "write"
 					? toolCall("write", { path: "blocked.txt", content: "blocked" })
 					: toolCall("read", { path: "AGENTS.md" }),
@@ -512,9 +537,10 @@ test("a normally installed subagents extension shares the explicit child ownersh
 	for (const node of tree.tree()) {
 		const extensions = node.session?.resourceLoader.getExtensions();
 		expect(extensions?.errors).toEqual([]);
-		expect(
-			extensions?.extensions.filter((entry) => entry.tools.has("subagent")),
-		).toHaveLength(1);
+		for (const tool of ["subagent", REPORT_TOOL])
+			expect(
+				extensions?.extensions.filter((entry) => entry.tools.has(tool)),
+			).toHaveLength(1);
 	}
 });
 
@@ -545,13 +571,13 @@ test("uses retries from standard settings and bills all attempts", async () => {
 				maxAgentDelayMs: 1,
 			},
 		},
-		streamFn: stream(() =>
+		streamFn: stream((context) =>
 			attempts++ === 0
 				? response("", {
 						stopReason: "error",
 						errorMessage: "500 server error",
 					})
-				: response("recovered"),
+				: answer(context, "recovered"),
 		),
 	});
 	const result = await tree.start(ROOT, "retry", context).result;
@@ -568,7 +594,7 @@ test("standard compaction preserves final output and summarization usage", async
 			compaction: { enabled: true, reserveTokens: 16384, keepRecentTokens: 10 },
 		},
 		streamFn: stream(() =>
-			response(output, {
+			report(output, {
 				usage: { ...response("").usage, input: 90000, totalTokens: 90002 },
 			}),
 		),
@@ -596,12 +622,12 @@ test("standard compaction preserves final output and summarization usage", async
 	expect(result.usage?.totalTokens).toBe(90005);
 });
 
-test("dispatches standard extension commands without sending them to the model", async () => {
-	let modelCalls = 0;
+test("dispatches standard extension commands without sending them to the model, which then reports", async () => {
+	const requests: string[] = [];
 	const { tree, context } = await setup({
-		streamFn: stream(() => {
-			modelCalls++;
-			return response("unused");
+		streamFn: stream((context) => {
+			requests.push(JSON.stringify(context.messages));
+			return report("pong");
 		}),
 	});
 	await configuredExtension(
@@ -613,11 +639,11 @@ test("dispatches standard extension commands without sending them to the model",
 	`,
 	);
 	const result = await tree.start(ROOT, "/ping", context).result;
-	expect(result.status).toBe("done");
-	expect(modelCalls).toBe(0);
-	expect(JSON.stringify(tree.get("1")?.session?.messages)).toContain(
-		"PING_MARKER",
-	);
+	// A task that the command handled is still reported, once reminded.
+	expect(result).toMatchObject({ status: "done", output: "pong" });
+	expect(requests).toHaveLength(1);
+	expect(requests[0]).toContain("PING_MARKER");
+	expect(requests[0]).not.toContain("/ping");
 });
 
 test("cancellation during async standard input hooks stops the later agent loop", async () => {

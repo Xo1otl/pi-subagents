@@ -11,7 +11,7 @@ import {
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { errorMessage, hasErrorCode } from "../runtime/errors.ts";
-import type { SessionOwner } from "../runtime/index.ts";
+import type { Leftover, SessionOwner } from "../runtime/index.ts";
 import {
 	isProcessGroupActive,
 	UNKNOWN_STATUS_REPORT_MS,
@@ -19,23 +19,15 @@ import {
 } from "./process-groups.ts";
 import {
 	COMMAND_EXIT_TYPE,
-	COMMAND_RUNNING_TYPE,
 	COMMAND_UNKNOWN_TYPE,
 	type CommandExitMessage,
 	type CommandMessage,
-	type CommandRunningMessage,
 	type CommandUnknownMessage,
 } from "./protocol.ts";
 
-/** How long a group may run before the idle agent whose run it holds open is
- * told. An agent awaiting a job goes idle soon after launching it; one that
- * goes idle later, or stays idle longer, may believe its run already finished.
- */
-export const STILL_RUNNING_REPORT_MS = 5 * 60_000;
-
-/** Tells the conversation that ran a command of its exit, that its status
- * stayed unknown, or that it holds the run open, waking it if idle. The signal
- * aborts once the command's messages must no longer be told.
+/** Tells the conversation that ran a command of its exit, or that its status
+ * stayed unknown, waking it if idle. The signal aborts once the command's
+ * messages must no longer be told.
  */
 export type CommandListener = (
 	message: CommandMessage,
@@ -49,9 +41,10 @@ export interface CommandHost {
 	 */
 	readonly ownsJobs: boolean;
 	/** Keep the session's settlement open until the work settles; a rejection
-	 * is a tracking failure.
+	 * is a tracking failure. A group's watch comes with its `leftover`, which
+	 * stops the group (when owned) and the watch.
 	 */
-	track(work: Promise<void>, ctx: ExtensionContext): void;
+	track(work: Promise<void>, ctx: ExtensionContext, leftover?: Leftover): void;
 	/** Capture the conversation running a command, unless it is already over. */
 	listener(ctx: ExtensionContext): CommandListener | undefined;
 }
@@ -103,28 +96,6 @@ function commandUnknown(
 		content: `PGID ${pgid} status unknown for ${seconds}s (${commandPreview(reason)}); not stopped, still watched, exit notified once seen: ${commandPreview(command)}`,
 		display: true,
 		details: { pgid, command, cwd, error: reason },
-	};
-}
-
-function elapsed(ms: number): string {
-	const seconds = Math.floor(ms / 1000);
-	const minutes = Math.floor(seconds / 60);
-	if (minutes < 1) return `${seconds}s`;
-	if (minutes < 60) return `${minutes}m`;
-	return `${Math.floor(minutes / 60)}h${String(minutes % 60).padStart(2, "0")}m`;
-}
-
-function commandRunning(
-	pgid: number,
-	command: string,
-	cwd: string,
-	ms: number,
-): CommandRunningMessage {
-	return {
-		customType: COMMAND_RUNNING_TYPE,
-		content: `PGID ${pgid} still running after ${elapsed(ms)}; your result isn't delivered until it exits: ${commandPreview(command)}`,
-		display: true,
-		details: { pgid, command, cwd, seconds: Math.floor(ms / 1000) },
 	};
 }
 
@@ -199,7 +170,10 @@ export function trackCommands(
 			end(pgid, ctx);
 			return;
 		}
-		const { signal } = scope;
+		// Stopping one group, e.g. one that a reporting run left over, ends
+		// its watch as stopping them all does.
+		const watch = new AbortController();
+		const signal = AbortSignal.any([scope.signal, watch.signal]);
 		groups.set(pgid, ctx);
 		const failed = (error: unknown) => {
 			if (signal.aborted) return;
@@ -208,35 +182,9 @@ export function trackCommands(
 			if (groups.delete(pgid)) end(pgid, ctx);
 			throw error;
 		};
-		const since = performance.now();
-		let reminded = !host.ownsJobs;
-		// A run cannot finish before the groups it owns, and its agent may have
-		// lost track of one: a stuck or forgotten job would hold back a result
-		// the agent believes it delivered. Only the agent knows whether it is
-		// waiting, so it is told, once per group, rather than the group stopped.
-		const remind = () => {
-			const ms = performance.now() - since;
-			if (reminded || ms < STILL_RUNNING_REPORT_MS) return;
-			try {
-				if (!ctx.isIdle()) return;
-			} catch {
-				// A stale context has no agent left to tell.
-				return;
-			}
-			reminded = true;
-			// The watch goes on: the agent may end the group in the very turn
-			// this starts.
-			host.track(
-				Promise.resolve(
-					notify(commandRunning(pgid, command, cwd, ms), signal),
-				).catch(failed),
-				ctx,
-			);
-		};
 		host.track(
 			waitForGroupToFinish(pgid, {
 				signal,
-				onRunning: remind,
 				// An unknown status is told, not taken for an end: the group stays
 				// owned and watched.
 				onUnknown: (error) =>
@@ -251,6 +199,15 @@ export function trackCommands(
 				})
 				.catch(failed),
 			ctx,
+			{
+				label: `PGID ${pgid}: ${commandPreview(command)}`,
+				stop() {
+					watch.abort();
+					if (!groups.delete(pgid)) return false;
+					end(pgid, ctx);
+					return true;
+				},
+			},
 		);
 		return pgid;
 	}
@@ -336,7 +293,7 @@ export function trackCommands(
 			...bash,
 			promptGuidelines: [
 				...(bash.promptGuidelines ?? []),
-				"BG jobs (`nohup`, etc.) tracked via bash PGID; exit → notify + resume if idle (no output/exit code reported; log to file). Awaited: launch (e.g. `nohup cmd > log 2>&1 &`) → notified on exit. Outliving session: leave the PGID, e.g. `setsid -f cmd`, not `… && setsid cmd &` (subshell keeps it). Avoid foreground sleep-poll.",
+				"BG jobs (e.g. `nohup cmd > log 2>&1 &`) notify you on exit, waking you if idle. No output/exit code reported—log to a file. To outlive the session, use `setsid -f cmd`, not `… && setsid cmd &` (tracking uses bash's PGID, which the subshell stays in).",
 			],
 			// Replace execution without enabling a tool excluded by defaultTools.
 			defaultActive: false,
@@ -355,7 +312,7 @@ export function trackCommands(
 }
 
 /** Track a delegated session's commands: their groups keep its run open,
- * resume it when they exit, and end with it.
+ * resume it when they exit, and end with it or with its report.
  */
 export function delegatedCommands({
 	runtime,
@@ -366,7 +323,8 @@ export function delegatedCommands({
 		const commands = trackCommands(pi, {
 			ownsJobs: true,
 			// A failure fails the run, even when the model handles the tool error.
-			track: (work) => runtime.trackCompletion(id, work),
+			track: (work, _ctx, leftover) =>
+				runtime.trackCompletion(id, work, leftover),
 			listener(ctx) {
 				const session = runtime.get(id)?.session;
 				if (!session) return undefined;

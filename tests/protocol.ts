@@ -3,8 +3,8 @@ import { contentText, type TranscriptContext } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	COMMAND_NOTICE_TYPES,
+	SUBAGENT_REMINDER_TYPE,
 	SUBAGENT_RESULT_TYPE,
-	SUBAGENT_RESUME_TYPE,
 	type SubagentCompletionDetails,
 } from "../agent/protocol.ts";
 
@@ -13,7 +13,7 @@ const prefix = "pi-subagents-test-event:";
 const types = new Set<string>([
 	...COMMAND_NOTICE_TYPES,
 	SUBAGENT_RESULT_TYPE,
-	SUBAGENT_RESUME_TYPE,
+	SUBAGENT_REMINDER_TYPE,
 ]);
 
 /** Pi converts custom messages to user text before calling a provider. Preserve
@@ -34,16 +34,38 @@ export default function protocolFixture(pi: ExtensionAPI): void {
 	pi.on("context", (event) => ({ messages: protocolMessages(event.messages) }));
 }
 
+type ProviderMessage = TranscriptContext["messages"][number];
+
+/** The protocol message a provider-facing user message encodes, if any. */
+function decode(
+	message: ProviderMessage | undefined,
+): CustomMessage | undefined {
+	if (message?.role !== "user") return undefined;
+	const text = contentText(message.content);
+	if (!text.startsWith(prefix)) return undefined;
+	return JSON.parse(text.slice(prefix.length)) as CustomMessage;
+}
+
+export function isProtocolMessage(message: ProviderMessage): boolean {
+	return decode(message) !== undefined;
+}
+
 export function lastCustomMessage(
 	context: TranscriptContext,
 	customType: string,
 ): CustomMessage | undefined {
-	const last = context.messages.at(-1);
-	if (last?.role !== "user") return undefined;
-	const text = contentText(last.content);
-	if (!text.startsWith(prefix)) return undefined;
-	const message = JSON.parse(text.slice(prefix.length)) as CustomMessage;
-	return message.customType === customType ? message : undefined;
+	const message = decode(context.messages.at(-1));
+	return message?.customType === customType ? message : undefined;
+}
+
+/** Whether a protocol message of this type has reached the agent. */
+export function hasCustomMessage(
+	context: TranscriptContext,
+	customType: string,
+): boolean {
+	return context.messages.some(
+		(message) => decode(message)?.customType === customType,
+	);
 }
 
 /** A completion's body follows its attribution block, independently of the

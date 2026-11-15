@@ -11,17 +11,20 @@ import {
 } from "../agent/process-groups.ts";
 import {
 	COMMAND_EXIT_TYPE,
+	SUBAGENT_REMINDER_TYPE,
 	SUBAGENT_RESULT_TYPE,
-	SUBAGENT_RESUME_TYPE,
 } from "../agent/protocol.ts";
 import { ROOT, type Subagents } from "../runtime/index.ts";
 import {
+	answer,
 	backgroundJob,
 	childExtension,
 	deferred,
+	hasCustomMessage,
 	lastCustomMessage,
 	lastText,
 	onCleanup,
+	report,
 	response,
 	testRuntime as runtime,
 	spawnContext,
@@ -43,6 +46,18 @@ function exits(tree: Subagents) {
 				(message) =>
 					message.role === "custom" && message.customType === COMMAND_EXIT_TYPE,
 			) ?? []
+	);
+}
+
+function hasResult(tree: Subagents): boolean {
+	return (
+		tree
+			.get("1")
+			?.session?.messages.some(
+				(message) =>
+					message.role === "custom" &&
+					message.customType === SUBAGENT_RESULT_TYPE,
+			) ?? false
 	);
 }
 
@@ -116,8 +131,9 @@ test.each(["nohup", ""])(
 					return toolCall("bash", { command: second.command });
 				if (lastCustomMessage(ctx, COMMAND_EXIT_TYPE))
 					return response("background checked");
-				if (lastCustomMessage(ctx, SUBAGENT_RESUME_TYPE))
-					return response("background checked, restated");
+				// Unreported once nothing is left to wait for, so reminded.
+				if (lastCustomMessage(ctx, SUBAGENT_REMINDER_TYPE))
+					return report("all background checked");
 				return response(
 					ctx.messages.at(-1)?.role === "toolResult" ? "latest reply" : text,
 				);
@@ -138,7 +154,7 @@ test.each(["nohup", ""])(
 		await second.release();
 		expect(await started.result).toMatchObject({
 			status: "done",
-			output: "background checked, restated",
+			output: "all background checked",
 		});
 		expect(existsSync(first.finished)).toBe(true);
 		expect(existsSync(second.finished)).toBe(true);
@@ -164,7 +180,7 @@ test.each(["nohup", ""])(
 	},
 );
 
-test("command completion does not report a busy session's previous reply", async () => {
+test("a job exit reaching a busy session is answered after its reply", async () => {
 	const tree = runtime();
 	const reply = deferred();
 	const context = await spawnContext(
@@ -174,9 +190,7 @@ test("command completion does not report a busy session's previous reply", async
 			if (text === "still thinking")
 				await Promise.race([reply.promise, waiting(options?.signal)]);
 			if (lastCustomMessage(ctx, COMMAND_EXIT_TYPE))
-				return response("verified after exit");
-			if (lastCustomMessage(ctx, SUBAGENT_RESUME_TYPE))
-				return response("verified after exit, restated");
+				return report("verified after exit");
 			return response(text);
 		}),
 	);
@@ -193,7 +207,7 @@ test("command completion does not report a busy session's previous reply", async
 	await sent;
 	expect(await started.result).toMatchObject({
 		status: "done",
-		output: "verified after exit, restated",
+		output: "verified after exit",
 	});
 });
 
@@ -202,11 +216,13 @@ test.each(["abort", "dispose"] as const)(
 	async (action) => {
 		const tree = runtime();
 		const context = await spawnContext(
-			stream((ctx) =>
-				lastText(ctx) === "start"
-					? toolCall("bash", { command: job.command })
-					: response(lastText(ctx)),
-			),
+			stream((ctx) => {
+				if (lastText(ctx) === "start")
+					return toolCall("bash", { command: job.command });
+				if (ctx.messages.at(-1)?.role === "toolResult")
+					return response("waiting for the job");
+				return answer(ctx, lastText(ctx));
+			}),
 		);
 		const job = backgroundJob(context.cwd, "stop");
 		const started = tree.start(ROOT, "start", context);
@@ -228,7 +244,7 @@ test.each(["abort", "dispose"] as const)(
 );
 
 test.each(["command", "child"] as const)(
-	"both commands and descendants must finish (%s finishes first)",
+	"an unreported task waits for both commands and descendants (%s finishes first)",
 	async (first) => {
 		const tree = runtime();
 		const child = deferred();
@@ -239,17 +255,15 @@ test.each(["command", "child"] as const)(
 				if (text === "start") return toolCall("bash", { command: job.command });
 				if (last?.role === "toolResult" && last.toolName === "bash")
 					return toolCall("subagent", { instructions: "child work" });
-				if (lastCustomMessage(ctx, COMMAND_EXIT_TYPE))
-					return response("checked background");
 				if (text === "child work") {
 					await Promise.race([child.promise, waiting(options?.signal)]);
-					return response("child finished");
+					return report("child finished");
 				}
-				return response(
-					lastCustomMessage(ctx, SUBAGENT_RESULT_TYPE)
-						? "final parent answer"
-						: "waiting for all",
-				);
+				// Reports once it has heard of both.
+				return hasCustomMessage(ctx, COMMAND_EXIT_TYPE) &&
+					hasCustomMessage(ctx, SUBAGENT_RESULT_TYPE)
+					? report("final parent answer")
+					: response("waiting for all");
 			}),
 		);
 		const job = backgroundJob(context.cwd, "nested");
@@ -263,21 +277,16 @@ test.each(["command", "child"] as const)(
 			child.resolve();
 			await until(
 				() =>
-					tree.get("1")?.session?.getLastAssistantText() ===
-					"final parent answer",
+					hasResult(tree) &&
+					tree.get("1")?.session?.getLastAssistantText() === "waiting for all",
 			);
 		}
 		expect(tree.get("1")?.status).toBe("running");
 		child.resolve();
 		await job.release();
-		// A child's result supersedes what was said before it; a command's exit
-		// does not.
 		expect(await started.result).toMatchObject({
 			status: "done",
-			output:
-				first === "command"
-					? "final parent answer"
-					: "final parent answer\n\nchecked background",
+			output: "final parent answer",
 		});
 	},
 );
@@ -290,7 +299,7 @@ test("foreground-only commands do not notify or cause extra model calls", async 
 			requests++;
 			return lastText(ctx) === "start"
 				? toolCall("bash", { command: "printf synchronous" })
-				: response(lastText(ctx));
+				: answer(ctx, lastText(ctx));
 		}),
 	);
 	expect(await tree.start(ROOT, "start", context).result).toMatchObject({
@@ -312,7 +321,7 @@ test("a command-exit wake can launch another background command before reporting
 				notifications++;
 				return notifications === 1
 					? toolCall("bash", { command: second.command })
-					: response("verified both jobs");
+					: report("verified both jobs");
 			}
 			return response("work remains");
 		}),
@@ -328,32 +337,95 @@ test("a command-exit wake can launch another background command before reporting
 	await second.release();
 	expect(await started.result).toMatchObject({
 		status: "done",
-		output: "work remains\n\nwork remains\n\nverified both jobs",
+		output: "verified both jobs",
 	});
 	expect(notifications).toBe(2);
 });
 
-test("a reply to a forgotten job's exit adds to the report instead of replacing it", async () => {
+test.each([false, true])(
+	"a report stops a job left running and tells the agent, which keeps its report or reports again (again: %s)",
+	async (again) => {
+		const tree = runtime();
+		let told = "";
+		let requests = 0;
+		const context = await spawnContext(
+			stream((ctx) => {
+				requests++;
+				const last = ctx.messages.at(-1);
+				if (lastText(ctx) === "start")
+					return toolCall("bash", { command: job.command });
+				if (last?.role === "toolResult" && last.toolName === "bash")
+					return report("first report");
+				told = lastText(ctx);
+				return again ? report("revised report") : response("fine as it is");
+			}),
+		);
+		const job = backgroundJob(context.cwd, "forgotten");
+		const result = await tree.start(ROOT, "start", context).result;
+		const pgid = await job.pgid();
+		expect(told).toContain(`PGID ${pgid}: `);
+		expect(result).toMatchObject({
+			status: "done",
+			output: again ? "revised report" : "first report",
+		});
+		// The job is never released: the report stopped it, telling no one else.
+		expect(await isProcessGroupActive(pgid)).toBe(false);
+		expect(existsSync(job.finished)).toBe(false);
+		expect(exits(tree)).toHaveLength(0);
+		// Nothing was left the second time, so that report ended the turn.
+		expect(requests).toBe(3);
+	},
+);
+
+test("a report with nothing left running ends the turn at once", async () => {
 	const tree = runtime();
+	let requests = 0;
 	const context = await spawnContext(
-		stream((ctx) => {
-			if (lastText(ctx) === "start")
-				return toolCall("bash", { command: job.command });
-			return response(
-				lastCustomMessage(ctx, COMMAND_EXIT_TYPE)
-					? "that was only my watcher"
-					: "final report",
-			);
+		stream(() => {
+			requests++;
+			return report("done at once");
 		}),
 	);
-	const job = backgroundJob(context.cwd, "forgotten");
+	expect(await tree.start(ROOT, "start", context).result).toMatchObject({
+		status: "done",
+		output: "done at once",
+	});
+	expect(requests).toBe(1);
+	const receipt = tree.get("1")?.session?.messages.at(-1);
+	expect(receipt?.role === "toolResult" && contentText(receipt.content)).toBe(
+		"Reported.",
+	);
+});
+
+test("a report waits for messages already queued, and a later report replaces it", async () => {
+	const tree = runtime();
+	const reply = deferred();
+	const context = await spawnContext(
+		stream(async (ctx, options) => {
+			if (lastText(ctx) === "start")
+				return toolCall("bash", { command: job.command });
+			if (lastCustomMessage(ctx, COMMAND_EXIT_TYPE))
+				return report("revised after exit");
+			if (lastText(ctx) === "report now") {
+				await Promise.race([reply.promise, waiting(options?.signal)]);
+				return report("first report");
+			}
+			return response("waiting");
+		}),
+	);
+	const job = backgroundJob(context.cwd, "queued");
 	const started = tree.start(ROOT, "start", context);
 	await until(() => idle(tree));
-	expect(tree.get("1")?.status).toBe("running");
+	const sent = tree.send("1", "report now");
+	await until(() => tree.get("1")?.session?.isIdle === false);
 	await job.release();
+	await waitForGroupToFinish(await job.pgid());
+	await until(() => tree.get("1")?.session?.agent.hasQueuedMessages() === true);
+	reply.resolve();
+	await sent;
 	expect(await started.result).toMatchObject({
 		status: "done",
-		output: "final report\n\nthat was only my watcher",
+		output: "revised after exit",
 	});
 });
 
@@ -387,7 +459,7 @@ test("configured bash overrides are not silently replaced with local execution",
 		stream((ctx) =>
 			lastText(ctx) === "start"
 				? toolCall("bash", { command: "remote command" })
-				: response(lastText(ctx)),
+				: answer(ctx, lastText(ctx)),
 		),
 	);
 	await childExtension(
@@ -413,11 +485,9 @@ test("failed commands still wait for jobs they already started and retain shell 
 				? toolCall("bash", {
 						command: `${job.command}\nprintf '%s' "$PREFIX_VALUE"; exit 7`,
 					})
-				: response(
-						lastCustomMessage(ctx, COMMAND_EXIT_TYPE)
-							? "checked after shell failure"
-							: lastText(ctx),
-					),
+				: lastCustomMessage(ctx, COMMAND_EXIT_TYPE)
+					? report("checked after shell failure")
+					: response(lastText(ctx)),
 		),
 	);
 	const job = backgroundJob(context.cwd, "failed");
@@ -435,9 +505,7 @@ test("failed commands still wait for jobs they already started and retain shell 
 	expect(tree.get("1")?.session?.getLastAssistantText()).toContain("preserved");
 	expect(tree.get("1")?.status).toBe("running");
 	await job.release();
-	expect((await started.result).output).toEndWith(
-		"\n\nchecked after shell failure",
-	);
+	expect((await started.result).output).toBe("checked after shell failure");
 	const event = exits(tree)[0];
 	if (event?.role !== "custom") throw new Error("Missing command notification");
 	expect(event.details).toMatchObject({ exitCode: null });

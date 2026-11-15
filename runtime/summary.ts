@@ -15,6 +15,8 @@ export interface RunSummary {
 	usage: Usage;
 }
 
+const UNREPORTED = "Subagent ended without a report.";
+
 const TOKEN_KEYS = [
 	"input",
 	"output",
@@ -72,59 +74,69 @@ export function summarizeOwnUsage(entries: readonly SessionEntry[]): Usage {
 	return summarizeUsage(entries, true);
 }
 
+export interface RunOutcome {
+	cancelled: boolean;
+	error?: string;
+	/** Present for a delegated task, whose result is its report: the report an
+	 * entry records, if any. A conversation the user continued has none; its
+	 * output is its last message.
+	 */
+	reportOf?: (entry: SessionEntry) => string | undefined;
+}
+
 /** Derive one run's result from the raw entries it appended.
- * Raw entries survive compaction and context edits, so neither final output
+ * Raw entries survive compaction and context edits, so neither the report
  * nor billing disappears when a full pi session repairs its model context.
  *
- * The output is the agent's last message, after any earlier ones that still
- * stand. A message that ended a turn stands when only notices (custom messages
- * of `noticeTypes`) started the next: a notice gives the agent no work, so its
- * reply may be a mere acknowledgement, which must not replace a report. Any
- * other input supersedes what was said before it.
+ * A delegated task's result is its last report, whatever followed it:
+ * neither a later failure nor a stop undoes it. Without one, a task that
+ * otherwise ended normally is `unreported`: its output is an error, followed
+ * by its last message for diagnosis.
  */
 export function summarizeRun(
 	entries: readonly SessionEntry[],
-	cancelled: boolean,
-	error: string | undefined,
-	noticeTypes: ReadonlySet<string> = new Set(),
-): RunSummary {
+	{ cancelled, error, reportOf }: RunOutcome,
+): RunSummary & { unreported: boolean } {
 	let final: AssistantMessage | undefined;
-	let standing: string[] = [];
-	/** Whether only notices have reached the agent since `final`, if anything. */
-	let noticesOnly: boolean | undefined;
+	let report: string | undefined;
 	for (const entry of entries) {
-		if (entry.type === "custom_message")
-			noticesOnly = noticesOnly !== false && noticeTypes.has(entry.customType);
-		if (entry.type !== "message") continue;
-		const { message } = entry;
-		if (message.role === "user") noticesOnly = false;
-		if (message.role !== "assistant") continue;
-		// Within a turn, messages lead up to its last one, which alone counts.
-		if (final?.stopReason === "stop") {
-			if (noticesOnly) standing.push(contentText(final.content));
-			else standing = [];
-		}
-		final = message;
-		noticesOnly = undefined;
+		report = reportOf?.(entry) ?? report;
+		if (entry.type === "message" && entry.message.role === "assistant")
+			final = entry.message;
 	}
 	const usage = summarizeUsage(entries);
+	if (report !== undefined)
+		return {
+			status: "done",
+			output: report || "(no output)",
+			usage,
+			unreported: false,
+		};
 	let status: RunSummary["status"];
+	let unreported = false;
 	if (cancelled || final?.stopReason === "aborted") {
 		status = "aborted";
 		error = "Subagent was aborted.";
-	} else if (error || (final && final.stopReason !== "stop")) {
+	} else if (
+		error ||
+		// A turn may end on tools that terminate it, such as a report.
+		(final && final.stopReason !== "stop" && final.stopReason !== "toolUse")
+	) {
 		status = "error";
 		error ??=
 			final?.errorMessage ??
 			`Subagent ended without a complete response (${final?.stopReason ?? "no response"}).`;
+	} else if (reportOf) {
+		status = "error";
+		error = UNREPORTED;
+		unreported = true;
 	} else {
 		status = "done";
 	}
+	const last = final ? contentText(final.content) : "";
 	const output =
-		error ||
-		[...standing, final ? contentText(final.content) : ""]
-			.filter(Boolean)
-			.join("\n\n") ||
-		"(no output)";
-	return { status, error, output, usage };
+		unreported && last
+			? `${UNREPORTED} Its last message:\n\n${last}`
+			: error || last || "(no output)";
+	return { status, error, output, usage, unreported };
 }

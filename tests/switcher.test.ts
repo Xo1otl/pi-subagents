@@ -4,10 +4,12 @@ import { ROOT } from "../runtime/index.ts";
 import { createSubagentSwitcher } from "../ui/switcher.ts";
 import {
 	blockingTool,
+	chatting,
 	fullscreen,
 	lastText,
 	onCleanup,
 	paused,
+	report,
 	response,
 	spawnContext,
 	stream,
@@ -258,13 +260,16 @@ test("context usage is unknown during startup, then shows the latest request in 
 		totalTokens: 50_000,
 	};
 	const context = await spawnContext(
-		stream((context) =>
-			lastText(context) === "monitor"
-				? { ...toolCall("blocking", {}), usage }
-				: response(lastText(context), {
-						usage: { ...usage, input: 31_000, totalTokens: 61_000 },
-					}),
-		),
+		stream((context) => {
+			if (lastText(context) === "monitor")
+				return { ...toolCall("blocking", {}), usage };
+			const overrides = {
+				usage: { ...usage, input: 31_000, totalTokens: 61_000 },
+			};
+			return chatting(context)
+				? response(lastText(context), overrides)
+				: report(lastText(context), overrides);
+		}),
 	);
 	const release = await blockingTool(context);
 	const result = tree.start(ROOT, "monitor", context).result;

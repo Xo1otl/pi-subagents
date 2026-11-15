@@ -8,6 +8,7 @@ import {
 	type AssistantMessage,
 	contentText,
 	createAssistantMessageEventStream,
+	getCurrentTools,
 	type JsonObject,
 	type Model,
 	type Provider,
@@ -37,17 +38,19 @@ import {
 	createSubagentRuntime,
 	type SubagentView,
 } from "../agent/index.ts";
-import { SUBAGENT_RESUME_TYPE } from "../agent/protocol.ts";
+import { REPORT_TOOL, SUBAGENT_REMINDER_TYPE } from "../agent/protocol.ts";
 import { errorMessage } from "../runtime/errors.ts";
 import type { SpawnContext, Subagents } from "../runtime/index.ts";
 import { SWITCHER_OVERLAY } from "../ui/switcher.ts";
 import protocolFixture, {
+	isProtocolMessage,
 	lastCompletion,
 	lastCustomMessage,
 } from "./protocol.ts";
 
 export {
 	completionOutput,
+	hasCustomMessage,
 	lastCompletion,
 	lastCustomMessage,
 } from "./protocol.ts";
@@ -165,9 +168,51 @@ export function toolCall(name: string, args: JsonObject): AssistantMessage {
 	});
 }
 
+/** A subagent's report, which delivers `text` and ends its task. */
+export function report(
+	text: string,
+	overrides: Partial<AssistantMessage> = {},
+): AssistantMessage {
+	return { ...toolCall(REPORT_TOOL, { result: text }), ...overrides };
+}
+
+/** Whether the agent answering has a parent to report to. */
+export function canReport(context: TranscriptContext): boolean {
+	return getCurrentTools(context.messages).some(
+		(tool) => tool.name === REPORT_TOOL,
+	);
+}
+
+/** A final answer: a subagent reports it, the root replies with it. */
+export function answer(
+	context: TranscriptContext,
+	text: string,
+): AssistantMessage {
+	return canReport(context) ? report(text) : response(text);
+}
+
 export function lastText(context: TranscriptContext): string {
 	const message = context.messages.at(-1);
 	return message ? contentText(message.content) : "";
+}
+
+/** The session's first input: a subagent's task. */
+export function taskText(context: TranscriptContext): string {
+	const message = context.messages.find((message) => message.role === "user");
+	return message ? contentText(message.content) : "";
+}
+
+/** Whether the agent is answering the user's input rather than its task or
+ * a protocol message: a reply that the task does not end with.
+ */
+export function chatting(context: TranscriptContext): boolean {
+	const last = context.messages.at(-1);
+	return (
+		last?.role === "user" &&
+		!isProtocolMessage(last) &&
+		context.messages.findIndex((message) => message.role === "user") <
+			context.messages.length - 1
+	);
 }
 
 /** Every text block that the assistant wrote, in order. */
@@ -247,18 +292,18 @@ export const hierarchyStream = stream((context) => {
 	const completion = lastCompletion(context);
 	if (completion) {
 		return completion.status === "done"
-			? response(completion.output)
+			? answer(context, completion.output)
 			: response("", {
 					stopReason: "error",
 					errorMessage: completion.error ?? completion.output,
 				});
 	}
-	// A resumed task restates its result.
-	if (lastCustomMessage(context, SUBAGENT_RESUME_TYPE)) {
+	// A reminded task reports what it last said.
+	if (lastCustomMessage(context, SUBAGENT_REMINDER_TYPE)) {
 		const previous = context.messages.findLast(
 			(message) => message.role === "assistant",
 		);
-		return response(previous ? contentText(previous.content) : "");
+		return report(previous ? contentText(previous.content) : "");
 	}
 	const match = /^nest:(\d+)$/.exec(text);
 	if (match && Number(match[1]) > 0) {
@@ -266,7 +311,9 @@ export const hierarchyStream = stream((context) => {
 			instructions: `nest:${Number(match[1]) - 1}`,
 		});
 	}
-	return response(text === "nest:0" || text === "say hello" ? "hello" : text);
+	const reply = text === "nest:0" || text === "say hello" ? "hello" : text;
+	// The user's input is answered; the task is reported.
+	return chatting(context) ? response(reply) : answer(context, reply);
 });
 
 /** A stream that runs until aborted. */

@@ -2,7 +2,7 @@ import { describe, expect, mock, test } from "bun:test";
 import { readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
-	SUBAGENT_RESUME_TYPE,
+	SUBAGENT_REMINDER_TYPE,
 	type SubagentCompletionDetails,
 } from "../agent/protocol.ts";
 import { ROOT, type Subagent, type Subagents } from "../runtime/index.ts";
@@ -16,6 +16,7 @@ import {
 	model,
 	onCleanup,
 	replies,
+	report,
 	response,
 	testRuntime as runtime,
 	shared,
@@ -26,14 +27,13 @@ import {
 	waiting,
 } from "./fixtures.ts";
 
-/** Echoes its input, except that a resumed task reports its result. */
+/** Echoes its input, and reports only when reminded. */
 const echo = stream((context) => {
 	const text = lastText(context);
-	return text === "monitor"
-		? toolCall("blocking", {})
-		: response(
-				lastCustomMessage(context, SUBAGENT_RESUME_TYPE) ? "task result" : text,
-			);
+	if (text === "monitor") return toolCall("blocking", {});
+	return lastCustomMessage(context, SUBAGENT_REMINDER_TYPE)
+		? report("task result")
+		: response(text);
 });
 
 function removeOnCleanup(outputFile: string): void {
@@ -46,7 +46,7 @@ function hasRunningTool(node: Subagent | undefined): boolean {
 	);
 }
 
-function resumptions(tree: Subagents, id: string): number {
+function reminders(tree: Subagents, id: string): number {
 	return (
 		tree
 			.get(id)
@@ -54,7 +54,7 @@ function resumptions(tree: Subagents, id: string): number {
 			.filter(
 				(entry) =>
 					entry.type === "custom_message" &&
-					entry.customType === SUBAGENT_RESUME_TYPE,
+					entry.customType === SUBAGENT_REMINDER_TYPE,
 			).length ?? 0
 	);
 }
@@ -84,7 +84,7 @@ describe("runtime factory", () => {
 		const context = await spawnContext(
 			stream(() => {
 				requests++;
-				return response("done", {
+				return report("done", {
 					usage: {
 						...response("").usage,
 						input: 100_000,
@@ -183,14 +183,14 @@ describe("silent hierarchy", () => {
 		expect(node.session?.getLastAssistantText()).toBe("live continuation");
 		expect([...node.liveTools.keys()]).toEqual(tools);
 		gate.resolve();
-		// The continuation interrupted the task, so the parent restates its result.
+		// The reply to the continuation was no report; the child's result is.
 		expect(await started.result).toMatchObject({
 			status: "done",
 			output: "hello",
-			usage: { totalTokens: 18 },
+			usage: { totalTokens: 15 },
 		});
-		expect(resumptions(tree, "1")).toBe(1);
-		expect(node.session?.getSessionStats().tokens.total).toBe(18);
+		expect(reminders(tree, "1")).toBe(0);
+		expect(node.session?.getSessionStats().tokens.total).toBe(15);
 	});
 
 	test("stopping an idle parent that drains a child stops both and keeps billed work", async () => {
@@ -226,7 +226,7 @@ describe("task results", () => {
 			if (lastText(context) === "nest:0") {
 				leafStarted = true;
 				await Promise.race([gate.promise, waiting(options?.signal)]);
-				return response("large output\n".repeat(3000));
+				return report("large output\n".repeat(3000));
 			}
 			return hierarchyStream(model, context, options).result();
 		});
@@ -265,7 +265,7 @@ describe("task results", () => {
 			if (lastText(context) === "nest:0") {
 				childRunning = true;
 				await Promise.race([child.promise, waiting(options?.signal)]);
-				return response("large output\n".repeat(3000));
+				return report("large output\n".repeat(3000));
 			}
 			if (lastText(context) === "busy parent") {
 				parentRunning = true;
@@ -304,24 +304,79 @@ describe("task results", () => {
 		expect(session?.agent.peekQueuedMessages()).toHaveLength(0);
 	});
 
-	test("joins all final text blocks and returns full output without presentation hints", async () => {
+	test("a report stops the children still running and tells only the agent, whose report stands unless it reports again", async () => {
 		const tree = runtime();
-		const huge = "日本語".repeat(20_000);
-		const combined = await tree.start(
+		let told = "";
+		const result = await tree.start(
 			ROOT,
-			"blocks",
+			"delegate, then report",
 			await spawnContext(
-				stream(() =>
-					response("", {
-						content: [
-							{ type: "text", text: "one" },
-							{ type: "text", text: huge },
-						],
-					}),
-				),
+				stream((context, options) => {
+					if (lastText(context) === "endless") return waiting(options?.signal);
+					const last = context.messages.at(-1);
+					if (last?.role !== "toolResult")
+						return toolCall("subagent", { instructions: "endless" });
+					if (last.toolName === "subagent") return report("parent done");
+					told = lastText(context);
+					return response("fine as it is");
+				}),
 			),
 		).result;
-		expect(combined.output).toBe(`one\n${huge}`);
+		expect(told).toContain("subagent 1.1");
+		expect(result).toMatchObject({ status: "done", output: "parent done" });
+		expect(tree.get("1.1")?.status).toBe("aborted");
+		// The stopped child's result does not wake its parent.
+		expect(
+			tree
+				.get("1")
+				?.session?.messages.some((message) => message.role === "custom"),
+		).toBe(false);
+	});
+
+	test("a report in a conversation the user continued is not delivered, and says so", async () => {
+		const tree = runtime();
+		await tree.start(ROOT, "say hello", await spawnContext()).result;
+		const session = tree.get("1")?.session;
+		if (!session) throw new Error("Missing child");
+		session.agent.streamFunction = stream(() => report("again"));
+		await tree.send("1", "report again");
+		expect(tree.get("1")?.status).toBe("done");
+		const receipt = session.messages.at(-1);
+		expect(receipt).toMatchObject({ role: "toolResult", isError: true });
+		expect(JSON.stringify(receipt)).toContain("Not delivered");
+	});
+
+	test("returns the full report, without bounds or presentation hints", async () => {
+		const tree = runtime();
+		const huge = `one\n${"日本語".repeat(20_000)}`;
+		const result = await tree.start(
+			ROOT,
+			"large",
+			await spawnContext(stream(() => report(huge))),
+		).result;
+		expect(result.output).toBe(huge);
+	});
+
+	test("an unreported task is reminded once, then fails with its last message", async () => {
+		const tree = runtime();
+		let requests = 0;
+		const result = await tree.start(
+			ROOT,
+			"question",
+			await spawnContext(
+				stream(() => {
+					requests++;
+					return response("Should I proceed?");
+				}),
+			),
+		).result;
+		expect(result).toMatchObject({
+			status: "error",
+			error: "Subagent ended without a report.",
+		});
+		expect(result.output).toContain("Should I proceed?");
+		expect(reminders(tree, "1")).toBe(1);
+		expect(requests).toBe(2);
 	});
 });
 
@@ -346,12 +401,12 @@ describe("interaction and cleanup", () => {
 		expect(replies(tree.get("1")?.session?.messages)).toEqual([
 			"initial",
 			"late steering",
-			"task result",
 		]);
+		expect(reminders(tree, "1")).toBe(1);
 		expect(tree.get("1")?.session?.pendingMessageCount).toBe(0);
 	});
 
-	test("input sent during a long-running tool stays queued and visible, then steers; its answer resumes the task instead of ending the run", async () => {
+	test("input sent during a long-running tool stays queued and visible, then steers; its answer is no report, so the task is reminded", async () => {
 		const tree = runtime();
 		const context = await spawnContext(echo);
 		const release = await blockingTool(context);
@@ -375,9 +430,8 @@ describe("interaction and cleanup", () => {
 		});
 		expect(replies(tree.get("1")?.session?.messages)).toEqual([
 			"are you there?",
-			"task result",
 		]);
-		expect(resumptions(tree, "1")).toBe(1);
+		expect(reminders(tree, "1")).toBe(1);
 		expect(statuses).toEqual(["running", "done"]);
 		expect(node?.queuedInput).toEqual([]);
 	});

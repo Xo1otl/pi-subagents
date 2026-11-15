@@ -6,7 +6,7 @@ import { createSubagentSwitcher } from "../ui/switcher.ts";
 import {
 	fullscreen,
 	onCleanup,
-	response,
+	report,
 	spawnContext,
 	stream,
 	testRuntime,
@@ -95,7 +95,7 @@ test("a real bash tool streams logs before exit; clicking its header toggles it 
 	const context = await spawnContext(
 		stream((transcript) =>
 			transcript.messages.at(-1)?.role === "toolResult"
-				? response("command finished")
+				? report("command finished")
 				: call,
 		),
 	);
