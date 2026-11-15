@@ -5,15 +5,21 @@ import { existsSync, readFileSync } from "node:fs";
 import { chmod, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { STILL_RUNNING_REPORT_MS } from "../agent/commands.ts";
 import {
 	isProcessGroupActive,
 	UNKNOWN_STATUS_REPORT_MS,
 	waitForGroupToFinish,
 } from "../agent/process-groups.ts";
-import { COMMAND_EXIT_TYPE, COMMAND_UNKNOWN_TYPE } from "../agent/protocol.ts";
+import {
+	COMMAND_EXIT_TYPE,
+	COMMAND_RUNNING_TYPE,
+	COMMAND_UNKNOWN_TYPE,
+} from "../agent/protocol.ts";
 import { ROOT } from "../runtime/index.ts";
 import {
 	backgroundJob,
+	deferred,
 	lastCustomMessage,
 	lastText,
 	onCleanup,
@@ -24,6 +30,7 @@ import {
 	stream,
 	toolCall,
 	until,
+	waiting,
 } from "./fixtures.ts";
 
 const STATUS_ERROR = "Command failed: ps -A -o pgid=,stat=";
@@ -67,15 +74,15 @@ function groupOf(job: ReturnType<typeof backgroundJob>) {
 		existsSync(job.group) ? Number(readFileSync(job.group, "utf8")) : undefined;
 }
 
-/** Make status that is already unknown look unknown for the reporting delay. */
+/** Make time pass for the reporting delays, without waiting for them. */
 function clock() {
 	const now = performance.now.bind(performance);
 	let skew = 0;
 	const spy = spyOn(performance, "now").mockImplementation(() => now() + skew);
 	onCleanup(() => spy.mockRestore());
 	return {
-		elapse: () => {
-			skew += UNKNOWN_STATUS_REPORT_MS;
+		elapse: (ms = UNKNOWN_STATUS_REPORT_MS) => {
+			skew += ms;
 		},
 	};
 }
@@ -126,14 +133,12 @@ test("a status that stays unknown is told once, and watching continues", async (
 	const checks = failChecks(() => pgid);
 	const told: unknown[] = [];
 	let finished = false;
-	const waiting = waitForGroupToFinish(
-		pgid,
-		undefined,
-		(error) => {
+	const waiting = waitForGroupToFinish(pgid, {
+		onUnknown: (error) => {
 			told.push(error);
 		},
-		250,
-	).then(() => {
+		unknownAfterMs: 250,
+	}).then(() => {
 		finished = true;
 	});
 	await until(() => told.length === 1);
@@ -153,14 +158,12 @@ test("a failure to tell of an unknown status ends the wait", async () => {
 	const { pgid } = sleeper();
 	failChecks(() => pgid);
 	await expect(
-		waitForGroupToFinish(
-			pgid,
-			undefined,
-			() => {
+		waitForGroupToFinish(pgid, {
+			onUnknown: () => {
 				throw new Error("telling failed");
 			},
-			0,
-		),
+			unknownAfterMs: 0,
+		}),
 	).rejects.toThrow("telling failed");
 });
 
@@ -217,7 +220,7 @@ test("transient status-check failures neither stop a subagent's job nor lose its
 	await job.release();
 	expect(await started.result).toMatchObject({
 		status: "done",
-		output: "checked after exit",
+		output: "waiting\n\nchecked after exit",
 	});
 	expect(existsSync(job.finished)).toBe(true);
 	const messages = tree.get("1")?.session?.messages;
@@ -263,7 +266,7 @@ test("a subagent told its job's status stays unknown keeps the job and still lea
 	await job.release();
 	expect(await started.result).toMatchObject({
 		status: "done",
-		output: "checked after exit",
+		output: "waiting\n\nnoted unknown\n\nchecked after exit",
 	});
 	expect(existsSync(job.finished)).toBe(true);
 	expect(
@@ -306,4 +309,133 @@ test("a parent told its job's status stays unknown still learns of its exit", as
 		1,
 	);
 	expect(customMessages(session.messages, COMMAND_EXIT_TYPE)).toHaveLength(1);
+});
+
+/** A subagent that reports right after launching a job, as if it were done. */
+async function reportsEarly(
+	name: string,
+	reply: (
+		running: ReturnType<typeof lastCustomMessage>,
+	) => ReturnType<typeof response> | undefined,
+	beforeReport: () => Promise<void> = async () => {},
+) {
+	const tree = runtime();
+	let reminded = false;
+	const context = await spawnContext(
+		stream(async (ctx, options) => {
+			if (lastText(ctx) === "start")
+				return toolCall("bash", { command: job.command });
+			if (lastCustomMessage(ctx, COMMAND_EXIT_TYPE))
+				return response("noted exit");
+			const answer = reply(lastCustomMessage(ctx, COMMAND_RUNNING_TYPE));
+			if (answer) {
+				reminded = true;
+				return answer;
+			}
+			if (reminded) return response("stopped the job");
+			await Promise.race([beforeReport(), waiting(options?.signal)]);
+			return response("final report");
+		}),
+	);
+	const job = backgroundJob(context.cwd, name);
+	const started = tree.start(ROOT, "start", context);
+	const node = () => tree.get("1");
+	return {
+		job,
+		started,
+		node,
+		said: (text: string) =>
+			node()?.session?.isIdle === true &&
+			node()?.session?.getLastAssistantText() === text,
+		reminders: () =>
+			customMessages(node()?.session?.messages, COMMAND_RUNNING_TYPE),
+	};
+}
+
+test("an idle subagent is told of the job holding back its result, and can end it to deliver", async () => {
+	const time = clock();
+	const { job, started, node, said, reminders } = await reportsEarly(
+		"forgotten",
+		(running) =>
+			running &&
+			toolCall("bash", {
+				command: `kill -KILL -- -${(running.details as { pgid: number }).pgid}`,
+			}),
+	);
+	await until(() => said("final report"));
+	// Several checks: an agent that goes idle right after a launch is waiting.
+	await Bun.sleep(400);
+	expect(reminders()).toHaveLength(0);
+	expect(node()?.status).toBe("running");
+	time.elapse(STILL_RUNNING_REPORT_MS);
+	// The job is never released: only the agent's decision ends the wait.
+	const result = await started.result;
+	const pgid = await job.pgid();
+	expect(reminders()).toMatchObject([
+		{ details: { pgid, command: job.command } },
+	]);
+	const [reminder] = reminders();
+	if (reminder?.role !== "custom") throw new Error("Missing reminder");
+	expect(
+		(reminder.details as { seconds: number }).seconds,
+	).toBeGreaterThanOrEqual(STILL_RUNNING_REPORT_MS / 1000);
+	expect(result.status).toBe("done");
+	// What the agent says about the job adds to its report.
+	expect(result.output).toMatch(
+		/^final report\n\n(stopped the job|noted exit)/,
+	);
+	expect(existsSync(job.finished)).toBe(false);
+});
+
+test("a job that outlasts its subagent is reported once, when the agent is idle", async () => {
+	const time = clock();
+	const report = deferred();
+	let working = false;
+	const { job, started, node, said, reminders } = await reportsEarly(
+		"awaited",
+		(running) => running && response("still needed"),
+		() => {
+			working = true;
+			return report.promise;
+		},
+	);
+	await until(() => working);
+	time.elapse(STILL_RUNNING_REPORT_MS);
+	// A working agent has not yet said whether it is done.
+	await Bun.sleep(1100);
+	expect(reminders()).toHaveLength(0);
+	report.resolve();
+	await until(() => said("still needed"));
+	expect(reminders()).toHaveLength(1);
+	time.elapse(STILL_RUNNING_REPORT_MS);
+	await Bun.sleep(1100);
+	expect(reminders()).toHaveLength(1);
+	expect(node()?.status).toBe("running");
+	await job.release();
+	expect(await started.result).toMatchObject({
+		status: "done",
+		output: "final report\n\nstill needed\n\nnoted exit",
+	});
+	expect(existsSync(job.finished)).toBe(true);
+});
+
+test("a parent is not told of its own long-running jobs", async () => {
+	const time = clock();
+	let job: ReturnType<typeof backgroundJob> | undefined;
+	const { session } = await rootSession({
+		streamFn: stream((context) =>
+			lastText(context) === "start job" && job
+				? toolCall("bash", { command: job.command })
+				: response("job started"),
+		),
+	});
+	job = backgroundJob(session.sessionManager.getCwd(), "parent-long");
+	onCleanup(job.release);
+	await session.prompt("start job");
+	await until(() => session.isIdle);
+	time.elapse(STILL_RUNNING_REPORT_MS);
+	await Bun.sleep(1100);
+	expect(customMessages(session.messages, COMMAND_RUNNING_TYPE)).toHaveLength(
+		0,
+	);
 });

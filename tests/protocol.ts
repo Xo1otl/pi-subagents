@@ -2,8 +2,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { contentText, type TranscriptContext } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
-	COMMAND_EXIT_TYPE,
-	COMMAND_UNKNOWN_TYPE,
+	COMMAND_NOTICE_TYPES,
 	SUBAGENT_RESULT_TYPE,
 	SUBAGENT_RESUME_TYPE,
 	type SubagentCompletionDetails,
@@ -11,9 +10,8 @@ import {
 
 type CustomMessage = Extract<AgentMessage, { role: "custom" }>;
 const prefix = "pi-subagents-test-event:";
-const types = new Set([
-	COMMAND_EXIT_TYPE,
-	COMMAND_UNKNOWN_TYPE,
+const types = new Set<string>([
+	...COMMAND_NOTICE_TYPES,
 	SUBAGENT_RESULT_TYPE,
 	SUBAGENT_RESUME_TYPE,
 ]);

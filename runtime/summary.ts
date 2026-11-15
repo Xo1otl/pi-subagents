@@ -75,16 +75,38 @@ export function summarizeOwnUsage(entries: readonly SessionEntry[]): Usage {
 /** Derive one run's result from the raw entries it appended.
  * Raw entries survive compaction and context edits, so neither final output
  * nor billing disappears when a full pi session repairs its model context.
+ *
+ * The output is the agent's last message, after any earlier ones that still
+ * stand. A message that ended a turn stands when only notices (custom messages
+ * of `noticeTypes`) started the next: a notice gives the agent no work, so its
+ * reply may be a mere acknowledgement, which must not replace a report. Any
+ * other input supersedes what was said before it.
  */
 export function summarizeRun(
 	entries: readonly SessionEntry[],
 	cancelled: boolean,
 	error: string | undefined,
+	noticeTypes: ReadonlySet<string> = new Set(),
 ): RunSummary {
 	let final: AssistantMessage | undefined;
-	for (const entry of entries)
-		if (entry.type === "message" && entry.message.role === "assistant")
-			final = entry.message;
+	let standing: string[] = [];
+	/** Whether only notices have reached the agent since `final`, if anything. */
+	let noticesOnly: boolean | undefined;
+	for (const entry of entries) {
+		if (entry.type === "custom_message")
+			noticesOnly = noticesOnly !== false && noticeTypes.has(entry.customType);
+		if (entry.type !== "message") continue;
+		const { message } = entry;
+		if (message.role === "user") noticesOnly = false;
+		if (message.role !== "assistant") continue;
+		// Within a turn, messages lead up to its last one, which alone counts.
+		if (final?.stopReason === "stop") {
+			if (noticesOnly) standing.push(contentText(final.content));
+			else standing = [];
+		}
+		final = message;
+		noticesOnly = undefined;
+	}
 	const usage = summarizeUsage(entries);
 	let status: RunSummary["status"];
 	if (cancelled || final?.stopReason === "aborted") {
@@ -99,6 +121,10 @@ export function summarizeRun(
 		status = "done";
 	}
 	const output =
-		error || (final && contentText(final.content)) || "(no output)";
+		error ||
+		[...standing, final ? contentText(final.content) : ""]
+			.filter(Boolean)
+			.join("\n\n") ||
+		"(no output)";
 	return { status, error, output, usage };
 }

@@ -23,6 +23,7 @@ import {
 	subagentCompletionMessage,
 } from "./completions.ts";
 import {
+	COMMAND_NOTICE_TYPES,
 	type CommandMessage,
 	SUBAGENT_RESULT_TYPE,
 	SUBAGENT_USAGE_TYPE,
@@ -57,6 +58,7 @@ export function createSubagentRuntime(
 			createChildSession(context, owner, onCreated, onError, headlessExtension),
 		resumeSession: resumeChildSession,
 		disposeSession: disposeChildSession,
+		noticeTypes: COMMAND_NOTICE_TYPES,
 	});
 }
 

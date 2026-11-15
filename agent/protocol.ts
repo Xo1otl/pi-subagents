@@ -10,6 +10,15 @@ export const SUBAGENT_USAGE_TYPE = "subagent-usage";
 export const SUBAGENT_RESUME_TYPE = "subagent-resume";
 export const COMMAND_EXIT_TYPE = "bg-exit";
 export const COMMAND_UNKNOWN_TYPE = "bg-unknown";
+export const COMMAND_RUNNING_TYPE = "bg-running";
+/** What command tracking tells an agent. None of them gives it work, so what it
+ * said before one still stands.
+ */
+export const COMMAND_NOTICE_TYPES = [
+	COMMAND_EXIT_TYPE,
+	COMMAND_UNKNOWN_TYPE,
+	COMMAND_RUNNING_TYPE,
+] as const;
 
 export interface SubagentReceipt {
 	id: string;
@@ -62,8 +71,27 @@ export interface CommandUnknownMessage {
 	details: CommandUnknownDetails;
 }
 
+export interface CommandRunningDetails {
+	pgid: number;
+	command: string;
+	cwd: string;
+	/** How long the group had been running. */
+	seconds: number;
+}
+
+/** A group that outlasts its idle agent, whose run cannot finish before it. */
+export interface CommandRunningMessage {
+	customType: typeof COMMAND_RUNNING_TYPE;
+	content: string;
+	display: boolean;
+	details: CommandRunningDetails;
+}
+
 /** What command tracking tells the conversation that ran the command. */
-export type CommandMessage = CommandExitMessage | CommandUnknownMessage;
+export type CommandMessage =
+	| CommandExitMessage
+	| CommandUnknownMessage
+	| CommandRunningMessage;
 
 /** Details may come from persisted sessions, so they are checked rather than trusted. */
 export function subagentId(details: unknown): string | undefined {

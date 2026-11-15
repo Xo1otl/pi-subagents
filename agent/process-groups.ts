@@ -9,26 +9,39 @@ const exec = promisify(execFile);
 /** How long a group's status may stay unknown before its watcher says so. */
 export const UNKNOWN_STATUS_REPORT_MS = 60_000;
 
+export interface GroupWatch {
+	signal?: AbortSignal;
+	/** Told after every check that finds the group running. */
+	onRunning?: () => void;
+	/** Told once, when the status has stayed unknown for `unknownAfterMs`. */
+	onUnknown?: (error: unknown) => void | Promise<void>;
+	unknownAfterMs?: number;
+}
+
 /** Wait independently of the shell/tool, without blocking the agent's turn.
  * Polling backs off, as a job may be a server that runs for days.
  *
  * A check can fail, e.g. `ps` timing out under load, while the group runs on:
  * failures neither end the wait nor pass for the group's end. Once the status
  * has stayed unknown for `unknownAfterMs`, `onUnknown` is told, once; waiting
- * continues, and only rejects on abort or when `onUnknown` fails.
+ * continues, and only rejects on abort or when a callback fails.
  */
 export async function waitForGroupToFinish(
 	pgid: number,
-	signal?: AbortSignal,
-	onUnknown?: (error: unknown) => void | Promise<void>,
-	unknownAfterMs = UNKNOWN_STATUS_REPORT_MS,
+	{
+		signal,
+		onRunning,
+		onUnknown,
+		unknownAfterMs = UNKNOWN_STATUS_REPORT_MS,
+	}: GroupWatch = {},
 ): Promise<void> {
 	assertProcessGroup(pgid);
 	let unknownSince: number | undefined;
 	let told = false;
 	for (let delay = 100; ; delay = Math.min(delay * 2, 1000)) {
+		let running: boolean | undefined;
 		try {
-			if (!(await isProcessGroupActive(pgid, signal))) return;
+			running = await isProcessGroupActive(pgid, signal);
 			unknownSince = undefined;
 		} catch (error) {
 			signal?.throwIfAborted();
@@ -38,6 +51,8 @@ export async function waitForGroupToFinish(
 				await onUnknown?.(error);
 			}
 		}
+		if (running === false) return;
+		if (running) onRunning?.();
 		await setTimeout(delay, undefined, { signal });
 	}
 }

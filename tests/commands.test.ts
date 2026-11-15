@@ -98,7 +98,7 @@ test("group waiting can be cancelled", async () => {
 		await exited;
 	});
 	const controller = new AbortController();
-	const waiting = waitForGroupToFinish(pgid, controller.signal);
+	const waiting = waitForGroupToFinish(pgid, { signal: controller.signal });
 	controller.abort();
 	await expect(waiting).rejects.toThrow();
 });
@@ -270,10 +270,14 @@ test.each(["command", "child"] as const)(
 		expect(tree.get("1")?.status).toBe("running");
 		child.resolve();
 		await job.release();
+		// A child's result supersedes what was said before it; a command's exit
+		// does not.
 		expect(await started.result).toMatchObject({
 			status: "done",
 			output:
-				first === "command" ? "final parent answer" : "checked background",
+				first === "command"
+					? "final parent answer"
+					: "final parent answer\n\nchecked background",
 		});
 	},
 );
@@ -324,9 +328,33 @@ test("a command-exit wake can launch another background command before reporting
 	await second.release();
 	expect(await started.result).toMatchObject({
 		status: "done",
-		output: "verified both jobs",
+		output: "work remains\n\nwork remains\n\nverified both jobs",
 	});
 	expect(notifications).toBe(2);
+});
+
+test("a reply to a forgotten job's exit adds to the report instead of replacing it", async () => {
+	const tree = runtime();
+	const context = await spawnContext(
+		stream((ctx) => {
+			if (lastText(ctx) === "start")
+				return toolCall("bash", { command: job.command });
+			return response(
+				lastCustomMessage(ctx, COMMAND_EXIT_TYPE)
+					? "that was only my watcher"
+					: "final report",
+			);
+		}),
+	);
+	const job = backgroundJob(context.cwd, "forgotten");
+	const started = tree.start(ROOT, "start", context);
+	await until(() => idle(tree));
+	expect(tree.get("1")?.status).toBe("running");
+	await job.release();
+	expect(await started.result).toMatchObject({
+		status: "done",
+		output: "final report\n\nthat was only my watcher",
+	});
 });
 
 test("notification startup failures fail the run instead of delivering a stale final answer", async () => {
@@ -407,7 +435,9 @@ test("failed commands still wait for jobs they already started and retain shell 
 	expect(tree.get("1")?.session?.getLastAssistantText()).toContain("preserved");
 	expect(tree.get("1")?.status).toBe("running");
 	await job.release();
-	expect((await started.result).output).toBe("checked after shell failure");
+	expect((await started.result).output).toEndWith(
+		"\n\nchecked after shell failure",
+	);
 	const event = exits(tree)[0];
 	if (event?.role !== "custom") throw new Error("Missing command notification");
 	expect(event.details).toMatchObject({ exitCode: null });

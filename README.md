@@ -10,7 +10,7 @@ pi -e ./tools/pi-subagents/index.ts   # or: pi install ./tools/pi-subagents
 
 - `subagent` starts a headless session in the same workspace (current model/effort unless `model`/`effort` given) and returns a receipt at once.
 - Result arrives later as `subagent-result`; while the parent is busy, results wait and arrive together. Interrupts never drop them.
-- A run finishes when it is idle with no running children or command groups; its last message goes to the parent. Long output is truncated, with a path to the full text.
+- A run finishes when it is idle with no running children or command groups; its last message goes to the parent, after any earlier ones that only background-job notices followed: a reply to a notice adds to a report, never replaces it. Long output is truncated, with a path to the full text.
 - If you talk to a running agent, it answers, then `subagent-resume` returns it to its task or has it restate its result, whatever happened after your message, so the parent never gets a reply meant for you. A finished conversation you continue is yours: no resume, no new result; usage still bills ancestors.
 - One-shot modes (`pi -p`, `--mode json`) are unsupported: pi exits after its reply, cancelling delegated runs.
 - Each subagent's session is saved beside its parent's file, in a directory named after it (`<parent>.jsonl` → `<parent>/<child>.jsonl`, nesting likewise), out of `/resume` lists. A parent without a file (`--no-session`) keeps children in memory. Saved sessions are records only: runs are not restored after a restart.
@@ -20,7 +20,7 @@ pi -e ./tools/pi-subagents/index.ts   # or: pi install ./tools/pi-subagents
 
 - Bash process groups are tracked, including `&`/`nohup` jobs that outlive their shell. On exit, `bg-exit` wakes the agent if idle, or queues for its next turn. It holds no output or exit code.
 - A group whose status cannot be read for a minute gets one `bg-unknown`, delivered the same way. It is neither stopped nor dropped: its `bg-exit` still follows.
-- Subagents own their jobs: Ctrl+C and shutdown stop them.
+- Subagents own their jobs: Ctrl+C and shutdown stop them, and a run waits for them. An idle subagent whose job has run for five minutes gets one `bg-running` per job, as only it knows whether it is waiting or has forgotten a job that withholds its result.
 - The root watches its own jobs and your `!` commands (`!!` stays private), never stopping them.
 - Untracked: `setsid`/`setpgid` (detach with `setsid -f cmd`), bash overrides, and other tools' processes. On Windows, nothing is tracked.
 

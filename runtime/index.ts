@@ -51,6 +51,11 @@ export interface SubagentsOptions {
 	 */
 	resumeSession: (session: AgentSession) => Promise<void>;
 	disposeSession: (session: AgentSession) => Promise<void>;
+	/** Custom messages that tell an agent of an event without giving it work,
+	 * such as a command's exit. A reply to one adds to the run's output rather
+	 * than replacing it (see summarizeRun).
+	 */
+	noticeTypes?: readonly string[];
 	/** Captured root ledger; billing never follows session replacement. */
 	rootSessionManager?: SessionManager;
 }
@@ -213,8 +218,10 @@ export function createSubagents({
 	createSession,
 	resumeSession,
 	disposeSession,
+	noticeTypes,
 	rootSessionManager,
 }: SubagentsOptions): Subagents {
+	const notices = new Set(noticeTypes);
 	const rootLedger = rootSessionManager && usageLedger(rootSessionManager);
 	const nodes = new Map<string, SubagentNode>();
 	/** Outstanding work by the parent whose settlement includes it. */
@@ -462,7 +469,7 @@ export function createSubagents({
 				entries =
 					node.session?.sessionManager.getEntries().slice(firstEntry ?? 0) ??
 					[];
-				summary = summarizeRun(entries, node.cancelled, node.error);
+				summary = summarizeRun(entries, node.cancelled, node.error, notices);
 				// The parent receives a delegated run's last message, so a reply to
 				// the user must not be it. Whatever followed the user's input (tool
 				// calls, extension messages, results, command exits), the run returns

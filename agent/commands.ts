@@ -19,15 +19,23 @@ import {
 } from "./process-groups.ts";
 import {
 	COMMAND_EXIT_TYPE,
+	COMMAND_RUNNING_TYPE,
 	COMMAND_UNKNOWN_TYPE,
 	type CommandExitMessage,
 	type CommandMessage,
+	type CommandRunningMessage,
 	type CommandUnknownMessage,
 } from "./protocol.ts";
 
-/** Tells the conversation that ran a command of its exit, or that its status
- * stayed unknown, waking it if idle. The signal aborts once the command's
- * messages must no longer be told.
+/** How long a group may run before the idle agent whose run it holds open is
+ * told. An agent awaiting a job goes idle soon after launching it; one that
+ * goes idle later, or stays idle longer, may believe its run already finished.
+ */
+export const STILL_RUNNING_REPORT_MS = 5 * 60_000;
+
+/** Tells the conversation that ran a command of its exit, that its status
+ * stayed unknown, or that it holds the run open, waking it if idle. The signal
+ * aborts once the command's messages must no longer be told.
  */
 export type CommandListener = (
 	message: CommandMessage,
@@ -36,7 +44,9 @@ export type CommandListener = (
 
 /** The session whose local bash commands are tracked. */
 export interface CommandHost {
-	/** A delegated run's jobs end with it; the user's own outlive Pi. */
+	/** A delegated run's jobs end with it, so it cannot finish before them; the
+	 * user's own outlive Pi.
+	 */
 	readonly ownsJobs: boolean;
 	/** Keep the session's settlement open until the work settles; a rejection
 	 * is a tracking failure.
@@ -93,6 +103,28 @@ function commandUnknown(
 		content: `PGID ${pgid} status unknown for ${seconds}s (${commandPreview(reason)}); not stopped, still watched, exit notified once seen: ${commandPreview(command)}`,
 		display: true,
 		details: { pgid, command, cwd, error: reason },
+	};
+}
+
+function elapsed(ms: number): string {
+	const seconds = Math.floor(ms / 1000);
+	const minutes = Math.floor(seconds / 60);
+	if (minutes < 1) return `${seconds}s`;
+	if (minutes < 60) return `${minutes}m`;
+	return `${Math.floor(minutes / 60)}h${String(minutes % 60).padStart(2, "0")}m`;
+}
+
+function commandRunning(
+	pgid: number,
+	command: string,
+	cwd: string,
+	ms: number,
+): CommandRunningMessage {
+	return {
+		customType: COMMAND_RUNNING_TYPE,
+		content: `PGID ${pgid} still running after ${elapsed(ms)}; your result isn't delivered until it exits: ${commandPreview(command)}`,
+		display: true,
+		details: { pgid, command, cwd, seconds: Math.floor(ms / 1000) },
 	};
 }
 
@@ -169,12 +201,47 @@ export function trackCommands(
 		}
 		const { signal } = scope;
 		groups.set(pgid, ctx);
+		const failed = (error: unknown) => {
+			if (signal.aborted) return;
+			// Telling failed, which fails the run: it no longer waits for a
+			// group that may still be running, so the group ends with it.
+			if (groups.delete(pgid)) end(pgid, ctx);
+			throw error;
+		};
+		const since = performance.now();
+		let reminded = !host.ownsJobs;
+		// A run cannot finish before the groups it owns, and its agent may have
+		// lost track of one: a stuck or forgotten job would hold back a result
+		// the agent believes it delivered. Only the agent knows whether it is
+		// waiting, so it is told, once per group, rather than the group stopped.
+		const remind = () => {
+			const ms = performance.now() - since;
+			if (reminded || ms < STILL_RUNNING_REPORT_MS) return;
+			try {
+				if (!ctx.isIdle()) return;
+			} catch {
+				// A stale context has no agent left to tell.
+				return;
+			}
+			reminded = true;
+			// The watch goes on: the agent may end the group in the very turn
+			// this starts.
+			host.track(
+				Promise.resolve(
+					notify(commandRunning(pgid, command, cwd, ms), signal),
+				).catch(failed),
+				ctx,
+			);
+		};
 		host.track(
-			// An unknown status is told, not taken for an end: the group stays
-			// owned and watched.
-			waitForGroupToFinish(pgid, signal, (error) =>
-				notify(commandUnknown(pgid, command, cwd, error), signal),
-			)
+			waitForGroupToFinish(pgid, {
+				signal,
+				onRunning: remind,
+				// An unknown status is told, not taken for an end: the group stays
+				// owned and watched.
+				onUnknown: (error) =>
+					notify(commandUnknown(pgid, command, cwd, error), signal),
+			})
 				.then(async () => {
 					if (signal.aborted) return;
 					// Never signal a finished (and possibly reused) PGID while the
@@ -182,13 +249,7 @@ export function trackCommands(
 					groups.delete(pgid);
 					await notify(commandExit(pgid, command, cwd), signal);
 				})
-				.catch((error: unknown) => {
-					if (signal.aborted) return;
-					// Telling failed, which fails the run: it no longer waits for a
-					// group that may still be running, so the group ends with it.
-					if (groups.delete(pgid)) end(pgid, ctx);
-					throw error;
-				}),
+				.catch(failed),
 			ctx,
 		);
 		return pgid;
