@@ -5,5 +5,10 @@ export function errorMessage(error: unknown): string {
 
 /** Whether a Node system call failed with this errno code, e.g. `ENOENT`. */
 export function hasErrorCode(error: unknown, code: string): boolean {
-	return (error as NodeJS.ErrnoException | undefined)?.code === code;
+	return (
+		typeof error === "object" &&
+		error !== null &&
+		"code" in error &&
+		error.code === code
+	);
 }

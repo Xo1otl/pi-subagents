@@ -1,3 +1,4 @@
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import {
 	getMarkdownTheme,
@@ -44,7 +45,8 @@ function displayText(
 		.join("\n");
 }
 
-function transcriptBlocks(node: Subagent): Block[] {
+/** The agent's conversation, ending with the response it is still streaming. */
+function transcriptMessages(node: Subagent): AgentMessage[] {
 	const messages =
 		node.session?.sessionManager
 			.getBranch()
@@ -59,7 +61,11 @@ function transcriptBlocks(node: Subagent): Block[] {
 		)
 	)
 		messages.push(streaming);
+	return messages;
+}
 
+function transcriptBlocks(node: Subagent): Block[] {
+	const messages = transcriptMessages(node);
 	const results = new Map(
 		messages.flatMap((message) =>
 			message.role === "toolResult"
@@ -196,29 +202,14 @@ function sameBlock(a: Block, b: Block): boolean {
 	return BLOCK_FIELDS.every((field) => a[field] === b[field]);
 }
 
-function renderBlock(
+function renderTool(
 	block: Block,
+	text: string,
 	width: number,
 	theme: UITheme,
 	expanded: boolean,
 ): string[] {
-	const text = plain(block.text);
-	if (block.kind === "queued")
-		return [
-			truncateToWidth(theme.fg("dim", singleLine(block.label)), width),
-			...new Text(theme.fg("dim", text), 0, 0).render(width),
-		];
-	if (block.kind !== "tool") {
-		const header = theme.fg(
-			block.label === "user" ? "accent" : "muted",
-			singleLine(block.label),
-		);
-		const body =
-			block.label === "user"
-				? new Text(text, 0, 0)
-				: new Markdown(text, 0, 0, getMarkdownTheme());
-		return [truncateToWidth(header, width), ...body.render(width)];
-	}
+	const dim = (line: string) => truncateToWidth(theme.fg("dim", line), width);
 	const color =
 		block.status === "error" || block.status === "aborted"
 			? "error"
@@ -236,30 +227,41 @@ function renderBlock(
 			).render(width),
 		);
 	const output = text ? new Text(text, 0, 0).render(width) : [];
-	const limit = block.status === "running" ? 3 : 4;
-	const preview = expanded ? output : output.slice(-limit);
-	if (!expanded && output.length > preview.length)
-		lines.push(
-			truncateToWidth(
-				theme.fg(
-					"dim",
-					`… ${output.length - preview.length} more lines · expand for full output`,
-				),
-				width,
-			),
-		);
+	const preview = expanded
+		? output
+		: output.slice(block.status === "running" ? -3 : -4);
+	const hidden = output.length - preview.length;
+	if (hidden)
+		lines.push(dim(`… ${hidden} more lines · expand for full output`));
 	lines.push(...preview.map((line) => theme.fg("toolOutput", line)));
 	if (!output.length)
-		lines.push(
-			truncateToWidth(
-				theme.fg(
-					"dim",
-					block.status === "running" ? "Running…" : "(no output)",
-				),
-				width,
-			),
-		);
+		lines.push(dim(block.status === "running" ? "Running…" : "(no output)"));
 	return lines;
+}
+
+function renderBlock(
+	block: Block,
+	width: number,
+	theme: UITheme,
+	expanded: boolean,
+): string[] {
+	const text = plain(block.text);
+	if (block.kind === "tool")
+		return renderTool(block, text, width, theme, expanded);
+	if (block.kind === "queued")
+		return [
+			truncateToWidth(theme.fg("dim", singleLine(block.label)), width),
+			...new Text(theme.fg("dim", text), 0, 0).render(width),
+		];
+	const fromUser = block.label === "user";
+	const header = theme.fg(
+		fromUser ? "accent" : "muted",
+		singleLine(block.label),
+	);
+	const body = fromUser
+		? new Text(text, 0, 0)
+		: new Markdown(text, 0, 0, getMarkdownTheme());
+	return [truncateToWidth(header, width), ...body.render(width)];
 }
 
 /** Cache each block independently so a live log does not re-render old Markdown. */

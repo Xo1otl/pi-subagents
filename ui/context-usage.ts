@@ -46,22 +46,31 @@ function formatTokens(count: number): string {
 	return `${Math.round(count / 1_000_000)}M`;
 }
 
+/** `ctx 50k/100k (50.0%)`, with `?` for whatever pi cannot estimate yet. */
+function describeUsage(
+	usage: ContextUsage | undefined,
+	percentage: string | undefined,
+): string {
+	if (!usage) return "ctx ?";
+	const tokens = usage.tokens === null ? "?" : formatTokens(usage.tokens);
+	const share = percentage ? ` (${percentage})` : "";
+	return `ctx ${tokens}/${formatTokens(usage.contextWindow)}${share}`;
+}
+
 /** Use pi's context estimate, never cumulative or delegated token charges. */
 export function renderContextUsage(
 	usage: ContextUsage | undefined,
 	theme: UITheme,
 	compact = false,
 ): string {
-	const percent = usage?.percent;
-	const percentage = percent == null ? "?" : `${percent.toFixed(1)}%`;
-	const text = compact
-		? percentage
-		: usage
-			? `ctx ${usage.tokens === null ? "?" : formatTokens(usage.tokens)}/${formatTokens(usage.contextWindow)}${percent == null ? "" : ` (${percentage})`}`
-			: "ctx ?";
+	const percent = usage?.percent ?? undefined;
+	const percentage =
+		percent === undefined ? undefined : `${percent.toFixed(1)}%`;
+	const text = compact ? (percentage ?? "?") : describeUsage(usage, percentage);
 	// Match the root footer's pressure thresholds, including values over 100%.
+	const pressure = percent ?? 0;
 	return theme.fg(
-		(percent ?? 0) > 90 ? "error" : (percent ?? 0) > 70 ? "warning" : "dim",
+		pressure > 90 ? "error" : pressure > 70 ? "warning" : "dim",
 		text,
 	);
 }

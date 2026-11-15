@@ -33,7 +33,7 @@ const STATUS_ERROR = "Command failed: ps -A -o pgid=,stat=";
 /** Count status checks of a group, failing the first `failures` of them, as
  * an overloaded `ps` did, until recovery.
  */
-function statusChecks(pgid: () => number | undefined, failures = 0) {
+function statusChecks(pgid: () => number | undefined, failures: number) {
 	const kill = process.kill.bind(process);
 	let calls = 0;
 	let failed = 0;
@@ -93,7 +93,7 @@ function sleeper() {
 }
 
 test.each([0, 1, -123, Number.NaN, 1.5, Number.MAX_SAFE_INTEGER + 1])(
-	"rejects unsafe process group %s",
+	"rejects unsafe process group %p",
 	async (pgid) => {
 		await expect(waitForGroupToFinish(pgid)).rejects.toThrow(
 			"Invalid process group",
@@ -113,16 +113,12 @@ test("waits past shell exit for nohup and resolves when only zombies remain", as
 	if (!pgid) throw new Error("Missing shell pid");
 	onCleanup(() => killGroup(pgid));
 	await exited;
-	const checks = statusChecks(() => pgid);
-	let finished = false;
-	const waiting = waitForGroupToFinish(pgid).then(() => {
-		finished = true;
-	});
-	// A second check means the first found the job outliving its shell.
-	await until(() => checks.calls() >= 2);
-	expect(finished).toBe(false);
+	// The job outlives its shell, and so does their group.
+	expect(await isProcessGroupActive(pgid)).toBe(true);
+	const waiting = waitForGroupToFinish(pgid);
 	await job.release();
 	await waiting;
+	// The wait lasted until the job itself had finished.
 	expect(existsSync(job.finished)).toBe(true);
 });
 

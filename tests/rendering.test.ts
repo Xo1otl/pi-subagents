@@ -11,7 +11,7 @@ const renderOptions = {
 };
 
 test.each([false, true])(
-	"other extensions can wrap subagent renderers regardless of load order (%s)",
+	"other extensions can wrap subagent renderers regardless of load order (wrapper first: %p)",
 	async (wrapperFirst) => {
 		let visits = 0;
 		const wrapper: ExtensionFactory = (pi) => {

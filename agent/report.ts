@@ -27,6 +27,9 @@ export function registerReporting(pi: ExtensionAPI, owner: SessionOwner): void {
 	});
 }
 
+/** What the reporting agent reads back. */
+const reply = (text: string) => [{ type: "text" as const, text }];
+
 /** How a subagent delivers its result. The report is kept as the tool
  * result's state, not picked from the chat; the latest one reaches the parent
  * once the agent is idle with nothing left to wait for. What it left running
@@ -46,28 +49,20 @@ function reportTool({ runtime, id }: SessionOwner) {
 			const details: ReportDetails = { result };
 			// A conversation the user continued is theirs: the parent already
 			// has the task's result.
-			if (runtime.get(id)?.delegated !== true)
+			if (!runtime.get(id)?.delegated)
 				return {
-					content: [
-						{
-							type: "text",
-							text: "Not delivered: your parent already has your report.",
-						},
-					],
+					content: reply("Not delivered: your parent already has your report."),
 					details,
 					isError: true,
 					terminate: true,
 				};
 			const stopped = runtime.stopLeftovers(id);
 			return {
-				content: [
-					{
-						type: "text",
-						text: stopped.length
-							? `Report recorded; stopped leftovers: ${stopped.join("; ")}. This report stands unless you report again.`
-							: "Report recorded.",
-					},
-				],
+				content: reply(
+					stopped.length
+						? `Report recorded; stopped leftovers: ${stopped.join("; ")}. This report stands unless you report again.`
+						: "Report recorded.",
+				),
 				details,
 				// Nothing left: skip the follow-up request. Otherwise the agent
 				// judges what it cut short.

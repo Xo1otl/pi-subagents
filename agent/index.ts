@@ -5,15 +5,14 @@ import {
 	defineTool,
 	type ExtensionAPI,
 	type ExtensionContext,
-	type SessionBoundaryDraft,
 	type SessionManager,
+	type SessionShutdownEvent,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { errorMessage } from "../runtime/errors.ts";
 import {
 	createSubagents,
 	ROOT,
-	type SessionOwner,
 	type SubagentResult,
 	type Subagents,
 } from "../runtime/index.ts";
@@ -22,6 +21,7 @@ import {
 	discardSubagentCompletion,
 	subagentCompletionMessage,
 } from "./completions.ts";
+import { servesSession } from "./context.ts";
 import {
 	type CommandMessage,
 	reportOf,
@@ -74,6 +74,9 @@ export interface SubagentView {
 /** What reaches the root's context without having been asked for in its turn. */
 type Notice = SubagentCompletionMessage | CommandMessage;
 
+/** What a finished run leaves in its parent's session, delivered or not. */
+type CompletionRecord = Pick<SubagentResult, "id" | "status" | "usage">;
+
 interface SessionBinding {
 	runtime: Subagents;
 	/** Pi's public SessionManager behind the context's read-only view. */
@@ -82,7 +85,8 @@ interface SessionBinding {
 	/** Only cancellation aborts a headless session; it fences that session's older children. */
 	abortEpoch: number;
 	stopWatchingAbort: () => void;
-	accounting: SessionBoundaryDraft[];
+	/** Records awaiting a boundary at which they can be persisted. */
+	accounting: CompletionRecord[];
 	/** Formatting artifacts remain ours until the queued message is persisted. */
 	pendingCompletions: Set<SubagentCompletionMessage>;
 	/** Root notices wait here while it is busy: an interrupt clears pi's queue. */
@@ -133,9 +137,7 @@ export function createSubagentIntegration(
 					const source = current(ctx);
 					if (!source) return undefined;
 					return (message) => {
-						if (!isCurrent(source, ctx)) return;
-						source.held.push(message);
-						releaseIfIdle(source, ctx);
+						if (isCurrent(source, ctx)) hold(source, ctx, message);
 					};
 				},
 			});
@@ -152,11 +154,13 @@ export function createSubagentIntegration(
 		return cleanup;
 	}
 
-	/** Release presentation, fence deliveries, then stop the session's work:
-	 * a root disposes its runtime, a delegated session runs `stopDelegated`.
+	/** Release presentation, fence deliveries, then stop the session's work.
+	 * A root disposes its runtime. A delegated session, whose runtime is its
+	 * root's, stops work only when shut down: quitting ends its own run, while
+	 * replacing its conversation only cancels its children.
 	 */
 	async function teardown(
-		stopDelegated: (owner: SessionOwner) => void = () => {},
+		shutdown?: SessionShutdownEvent["reason"],
 	): Promise<void> {
 		const source = binding;
 		try {
@@ -168,23 +172,19 @@ export function createSubagentIntegration(
 			commands?.stop();
 			binding = undefined;
 			const cleanup = source ? discardPending(source) : Promise.resolve();
-			if (owner) stopDelegated(owner);
-			else await source?.runtime.dispose();
+			if (!owner) await source?.runtime.dispose();
+			else if (shutdown === "quit") owner.runtime.abort(owner.id);
+			else if (shutdown)
+				for (const child of owner.runtime.tree())
+					if (child.parentId === owner.id) owner.runtime.abort(child.id);
 			await cleanup;
 		}
 	}
 
 	function isCurrent(source: SessionBinding, ctx: ExtensionContext): boolean {
-		if (binding !== source) return false;
-		try {
-			// This guarded getter also detects dispose/replacement without a shutdown event.
-			return (
-				ctx.sessionManager === source.manager &&
-				source.manager.getSessionId() === source.sessionId
-			);
-		} catch {
-			return false;
-		}
+		return (
+			binding === source && servesSession(ctx, source.manager, source.sessionId)
+		);
 	}
 
 	/** The binding, while it still belongs to the context's session. */
@@ -211,7 +211,17 @@ export function createSubagentIntegration(
 		if (isCurrent(source, ctx) && ctx.isIdle()) release(source, true);
 	}
 
-	function takeAccounting(ctx: ExtensionContext): SessionBoundaryDraft[] {
+	/** Keep a notice for the root, which receives it at once if idle. */
+	function hold(
+		source: SessionBinding,
+		ctx: ExtensionContext,
+		notice: Notice,
+	): void {
+		source.held.push(notice);
+		releaseIfIdle(source, ctx);
+	}
+
+	function takeAccounting(ctx: ExtensionContext): CompletionRecord[] {
 		return current(ctx)?.accounting.splice(0) ?? [];
 	}
 
@@ -221,16 +231,19 @@ export function createSubagentIntegration(
 		event: BoundaryState,
 		ctx: ExtensionContext,
 	): BoundaryResult | undefined {
-		const drafts = takeAccounting(ctx);
+		const drafts = takeAccounting(ctx).map((data) => ({
+			type: "custom" as const,
+			customType: SUBAGENT_USAGE_TYPE,
+			data,
+		}));
 		if (drafts.length) return { entries: [...event.entries, ...drafts] };
 	}
 	pi.on("turn_end", appendAccounting);
 	pi.on("agent_before_settle", appendAccounting);
 
 	function flushAccounting(ctx: ExtensionContext): void {
-		for (const draft of takeAccounting(ctx)) {
-			if (draft.type === "custom") pi.appendEntry(draft.customType, draft.data);
-		}
+		for (const record of takeAccounting(ctx))
+			pi.appendEntry(SUBAGENT_USAGE_TYPE, record);
 	}
 
 	/** Add one result to its parent's context, or only record it when fenced.
@@ -242,7 +255,11 @@ export function createSubagentIntegration(
 		result: SubagentResult,
 		canDeliver: () => boolean,
 	): Promise<void> {
-		const data = { id: result.id, status: result.status, usage: result.usage };
+		const record: CompletionRecord = {
+			id: result.id,
+			status: result.status,
+			usage: result.usage,
+		};
 		const message = canDeliver()
 			? await subagentCompletionMessage(result)
 			: undefined;
@@ -250,22 +267,17 @@ export function createSubagentIntegration(
 			try {
 				// Cancellation suppresses context delivery, not already-incurred billing.
 				if (source.manager.getSessionId() === source.sessionId)
-					source.manager.appendCustomEntry(SUBAGENT_USAGE_TYPE, data);
+					source.manager.appendCustomEntry(SUBAGENT_USAGE_TYPE, record);
 			} finally {
 				if (message) await discardSubagentCompletion(message);
 			}
 			return;
 		}
 		source.pendingCompletions.add(message);
-		source.accounting.push({
-			type: "custom",
-			customType: SUBAGENT_USAGE_TYPE,
-			data,
-		});
+		source.accounting.push(record);
 		try {
 			if (!owner) {
-				source.held.push(message);
-				releaseIfIdle(source, ctx);
+				hold(source, ctx, message);
 				return;
 			}
 			const parent = source.runtime.get(owner.id)?.session;
@@ -316,14 +328,13 @@ export function createSubagentIntegration(
 		const source = current(ctx);
 		if (source) {
 			source.stopWatchingAbort();
-			if (owner) {
-				if (event.aborted) source.abortEpoch++;
+			// After an interrupt, the root keeps its results without restarting the turn.
+			if (!owner) release(source, !event.aborted);
+			else if (event.aborted) {
+				source.abortEpoch++;
 				// Core subtree cancellation clears this headless session's queues.
-				if (event.aborted && source.runtime.get(owner.id)?.cancelled)
+				if (source.runtime.get(owner.id)?.cancelled)
 					await discardPending(source);
-			} else {
-				// After an interrupt, keep the results without restarting the turn.
-				release(source, !event.aborted);
 			}
 		}
 		// Aborted runs may skip the final actionable boundary.
@@ -359,14 +370,7 @@ export function createSubagentIntegration(
 	});
 	pi.on("session_shutdown", async (event, ctx) => {
 		flushAccounting(ctx);
-		await teardown(({ runtime, id }) => {
-			// Quitting ends this subagent's run; replacing its conversation only
-			// cancels its children.
-			if (event.reason === "quit") runtime.abort(id);
-			else
-				for (const child of runtime.tree())
-					if (child.parentId === id) runtime.abort(child.id);
-		});
+		await teardown(event.reason);
 	});
 
 	return defineTool({

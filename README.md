@@ -40,7 +40,7 @@ Open with `/subagents [id]`, **Ctrl+Shift+A**, or **Left Left** at the start of 
 - `runtime/`: execution, hierarchy, cancellation, input, reports and reminders, billing. Session lifecycle is injected; no imports from `agent/` or `ui/`.
 - `agent/`: Pi sessions, command tracking, the `subagent` and `report_to_parent` tools, and `protocol.ts` (shared with the UI).
 - `ui/`: switcher, indicator, shortcuts. Reaches `agent/` only via `protocol.ts`.
-- `tests/`: `architecture.test.ts` enforces layering.
+- `biome.json` enforces the layering and forbids import cycles, type-only imports included.
 
 ```sh
 bun install && bun run test && bun run typecheck && bun run lint

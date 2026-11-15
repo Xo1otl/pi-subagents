@@ -18,6 +18,7 @@ import {
 	lastCustomMessage,
 	lastText,
 	onCleanup,
+	remoteBash,
 	response,
 	rootSession,
 	stream,
@@ -139,22 +140,7 @@ test("shutdown stops watching a parent's job without ending it", async () => {
 });
 
 test("a configured bash override in the parent is neither replaced nor tracked", async () => {
-	const remote: ExtensionFactory = (pi) => {
-		pi.registerTool({
-			name: "bash",
-			label: "Remote bash",
-			description: "Remote execution",
-			parameters: { type: "object", properties: {} },
-			promptGuidelines: ["REMOTE_BASH_MARKER"],
-			async execute() {
-				return {
-					content: [{ type: "text", text: "remote result" }],
-					details: undefined,
-				};
-			},
-		});
-	};
-	const { session, job } = await setup(checked, [remote]);
+	const { session, job } = await setup(checked, [remoteBash]);
 	expect(session.getToolDefinition("bash")?.promptGuidelines).toEqual([
 		"REMOTE_BASH_MARKER",
 	]);

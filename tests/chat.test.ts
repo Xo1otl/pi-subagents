@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ROOT } from "../runtime/index.ts";
@@ -141,7 +141,7 @@ test("a real bash tool streams logs before exit; clicking its header toggles it 
 test("a late send failure stays with its own agent and keeps the message", async () => {
 	const { tree, terminal, header } = await setup();
 	const send = Promise.withResolvers<void>();
-	tree.send = () => send.promise;
+	spyOn(tree, "send").mockReturnValue(send.promise);
 	terminal.input("message");
 	terminal.input("\r");
 	terminal.input("\t");

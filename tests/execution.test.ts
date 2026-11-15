@@ -1,4 +1,4 @@
-import { expect, mock, test } from "bun:test";
+import { expect, mock, spyOn, test } from "bun:test";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import {
 	type AgentSession,
@@ -6,13 +6,15 @@ import {
 	type SessionEntry,
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
+import { errorMessage } from "../runtime/errors.ts";
 import {
 	createSubagents,
 	ROOT,
 	type SpawnContext,
+	type SubagentResult,
 	type SubagentsOptions,
 } from "../runtime/index.ts";
-import { deferred, model, response, until } from "./fixtures.ts";
+import { deferred, model, onCleanup, response, until } from "./fixtures.ts";
 
 const context: SpawnContext = { cwd: "/unused", model, projectTrusted: false };
 
@@ -46,15 +48,18 @@ function sessionStub(overrides: Partial<AgentSession> = {}): AgentSession {
 	return session;
 }
 
+/** A runtime shut down after the test, unless the test did so itself. */
 function runtimeWith(
 	options: Pick<SubagentsOptions, "createSession"> & Partial<SubagentsOptions>,
 ) {
-	return createSubagents({
+	const runtime = createSubagents({
 		remindSession: async () => {},
 		disposeSession: async () => {},
 		reportOf,
 		...options,
 	});
+	onCleanup(() => (runtime.closed ? undefined : runtime.dispose()));
+	return runtime;
 }
 
 function runtimeFor(
@@ -65,6 +70,17 @@ function runtimeFor(
 		createSession: async (_context, _owner, onCreated) => onCreated(session),
 		...options,
 	});
+}
+
+/** The failures that a shutdown reports, in no particular order. */
+async function cleanupErrors(closing: Promise<void>): Promise<string[]> {
+	const failure = await closing.then(
+		() => undefined,
+		(error: unknown) => error,
+	);
+	if (!(failure instanceof AggregateError))
+		throw new Error("Shutdown reported no cleanup errors");
+	return failure.errors.map(errorMessage).toSorted();
 }
 
 test("runtime owns execution but delegates session creation and disposal", async () => {
@@ -78,54 +94,46 @@ test("runtime owns execution but delegates session creation and disposal", async
 		async (_context, _owner, onCreated) => onCreated(session),
 	);
 	const runtime = runtimeFor(session, { createSession, disposeSession });
-	try {
-		expect(createSession).not.toHaveBeenCalled();
-		const result = await runtime.start(ROOT, "task instructions", context)
-			.result;
-		expect(createSession).toHaveBeenCalledWith(
-			context,
-			{ runtime, id: "1" },
-			expect.any(Function),
-			expect.any(Function),
-		);
-		expect(prompt).toHaveBeenCalledWith("task instructions", {
-			streamingBehavior: "steer",
-			preflightResult: expect.any(Function),
-		});
-		expect(result).toMatchObject({
-			id: "1",
-			status: "done",
-			output: "complete output",
-			usage: { totalTokens: 3 },
-		});
-	} finally {
-		await runtime.dispose();
-		await runtime.dispose();
-	}
-	expect(disposeSession).toHaveBeenCalledTimes(1);
-	expect(disposeSession).toHaveBeenCalledWith(session);
+	expect(createSession).not.toHaveBeenCalled();
+	const result = await runtime.start(ROOT, "task instructions", context).result;
+	// One session, created for the node from the context given.
+	expect(createSession).toHaveBeenCalledTimes(1);
+	expect(createSession.mock.calls[0]?.slice(0, 2)).toEqual([
+		context,
+		{ runtime, id: "1" },
+	]);
+	expect(prompt.mock.calls.map(([instructions]) => instructions)).toEqual([
+		"task instructions",
+	]);
+	expect(result).toMatchObject({
+		id: "1",
+		status: "done",
+		output: "complete output",
+		usage: { totalTokens: 3 },
+	});
+	// Shutdowns requested together or again clean up once.
+	await Promise.all([runtime.dispose(), runtime.dispose()]);
+	await runtime.dispose();
+	expect(disposeSession.mock.calls).toEqual([[session]]);
 	expect(unsubscribe).toHaveBeenCalledTimes(1);
 });
 
 test("ledger write failures do not leave completed runs stuck running or prevent reuse", async () => {
 	const rootSessionManager = SessionManager.inMemory();
-	const appendUsage = rootSessionManager.appendUsage.bind(rootSessionManager);
-	rootSessionManager.appendUsage = () => {
-		throw new Error("ledger unavailable");
-	};
+	const ledger = spyOn(rootSessionManager, "appendUsage").mockImplementation(
+		() => {
+			throw new Error("ledger unavailable");
+		},
+	);
 	const runtime = runtimeFor(sessionStub(), { rootSessionManager });
-	try {
-		await expect(
-			runtime.start(ROOT, "initial", context).result,
-		).rejects.toThrow("ledger unavailable");
-		expect(runtime.get("1")?.status).toBe("done");
-		rootSessionManager.appendUsage = appendUsage;
-		await runtime.send("1", "resume");
-		expect(runtime.get("1")?.status).toBe("done");
-		expect(rootSessionManager.getEntries()).toHaveLength(1);
-	} finally {
-		await runtime.dispose();
-	}
+	await expect(runtime.start(ROOT, "initial", context).result).rejects.toThrow(
+		"ledger unavailable",
+	);
+	expect(runtime.get("1")?.status).toBe("done");
+	ledger.mockRestore();
+	await runtime.send("1", "resume");
+	expect(runtime.get("1")?.status).toBe("done");
+	expect(rootSessionManager.getEntries()).toHaveLength(1);
 });
 
 test("start reserves a running receipt synchronously, before session initialization", async () => {
@@ -144,34 +152,28 @@ test("start reserves a running receipt synchronously, before session initializat
 		},
 	);
 	const runtime = runtimeFor(session, { createSession });
-	try {
-		const started = runtime.start(ROOT, "delayed child", context);
-		expect(started.id).toBe("1");
-		expect(createSession).not.toHaveBeenCalled();
-		// A resolved tool-receipt promise also beats the factory's synchronous work.
-		await Promise.resolve(started);
-		expect(createSession).not.toHaveBeenCalled();
-		expect(runtime.get("1")?.status).toBe("running");
-		expect(runtime.get("1")?.session).toBeUndefined();
-		let settled = false;
-		void started.result.then(() => {
-			settled = true;
-		});
-		await until(() => createSession.mock.calls.length === 1);
-		expect(settled).toBe(false);
-		initialized.resolve();
-		await until(() => Boolean(runtime.get("1")?.session));
-		expect(settled).toBe(false);
-		finished.resolve();
-		expect(await started.result).toMatchObject({
-			status: "done",
-			output: "child finished",
-		});
-	} finally {
-		initialized.resolve();
-		finished.resolve();
-		await runtime.dispose();
-	}
+	const started = runtime.start(ROOT, "delayed child", context);
+	expect(started.id).toBe("1");
+	expect(createSession).not.toHaveBeenCalled();
+	// A resolved tool-receipt promise also beats the factory's synchronous work.
+	await Promise.resolve(started);
+	expect(createSession).not.toHaveBeenCalled();
+	expect(runtime.get("1")?.status).toBe("running");
+	expect(runtime.get("1")?.session).toBeUndefined();
+	let settled = false;
+	void started.result.then(() => {
+		settled = true;
+	});
+	await until(() => createSession.mock.calls.length === 1);
+	expect(settled).toBe(false);
+	initialized.resolve();
+	await until(() => runtime.get("1")?.session !== undefined);
+	expect(settled).toBe(false);
+	finished.resolve();
+	expect(await started.result).toMatchObject({
+		status: "done",
+		output: "child finished",
+	});
 });
 
 test("start validates synchronously without reserving nodes, and shutdown rejects new work", async () => {
@@ -230,9 +232,7 @@ test("initialization failures are run data, and orphaned completion failures are
 		error: "session unavailable",
 		output: "session unavailable",
 	});
-	await expect(runtime.dispose()).rejects.toMatchObject({
-		errors: [expect.objectContaining({ message: "delivery failed" })],
-	});
+	expect(await cleanupErrors(runtime.dispose())).toEqual(["delivery failed"]);
 	expect(disposeSession).not.toHaveBeenCalled();
 });
 
@@ -247,15 +247,11 @@ test("rejected completion work remains an error even when it drains before waitF
 		},
 	});
 	const runtime = runtimeFor(session);
-	try {
-		expect(await runtime.start(ROOT, "task", context).result).toMatchObject({
-			status: "error",
-			error: "delivery failed",
-			usage: { totalTokens: 3 },
-		});
-	} finally {
-		await runtime.dispose();
-	}
+	expect(await runtime.start(ROOT, "task", context).result).toMatchObject({
+		status: "error",
+		error: "delivery failed",
+		usage: { totalTokens: 3 },
+	});
 });
 
 test("a send arriving as the run's last work settles is drained and billed", async () => {
@@ -271,19 +267,15 @@ test("a send arriving as the run's last work settles is drained and billed", asy
 		},
 	});
 	const runtime = runtimeFor(session);
-	try {
-		expect(await runtime.start(ROOT, "initial", context).result).toMatchObject({
-			output: "late input",
-			usage: { totalTokens: 6 },
-		});
-		await sent;
-	} finally {
-		await runtime.dispose();
-	}
+	expect(await runtime.start(ROOT, "initial", context).result).toMatchObject({
+		output: "late input",
+		usage: { totalTokens: 6 },
+	});
+	await sent;
 });
 
 test.each([true, false])(
-	"an idle task with nothing left to wait for is reminded once to report (reports when reminded: %s)",
+	"an idle task with nothing left to wait for is reminded once to report (reports when reminded: %p)",
 	async (heard) => {
 		const session = sessionStub({
 			prompt: async (text) => reply(session, `re: ${text}`, false),
@@ -292,26 +284,22 @@ test.each([true, false])(
 			reply(reminded, "task result", heard);
 		});
 		const runtime = runtimeFor(session, { remindSession });
-		try {
-			const result = await runtime.start(ROOT, "task", context).result;
-			if (heard)
-				expect(result).toMatchObject({ status: "done", output: "task result" });
-			else {
-				expect(result).toMatchObject({
-					status: "error",
-					error: expect.any(String),
-				});
-				// The last message tells the parent what the agent was saying.
-				expect(result.output).toContain("task result");
-			}
-			expect(remindSession).toHaveBeenCalledTimes(1);
-			// A conversation the user continues is theirs: no report, no reminder.
-			await runtime.send("1", "continue");
-			expect(runtime.get("1")?.status).toBe("done");
-			expect(remindSession).toHaveBeenCalledTimes(1);
-		} finally {
-			await runtime.dispose();
+		const result = await runtime.start(ROOT, "task", context).result;
+		if (heard)
+			expect(result).toMatchObject({ status: "done", output: "task result" });
+		else {
+			expect(result).toMatchObject({
+				status: "error",
+				error: expect.any(String),
+			});
+			// The last message tells the parent what the agent was saying.
+			expect(result.output).toContain("task result");
 		}
+		expect(remindSession).toHaveBeenCalledTimes(1);
+		// A conversation the user continues is theirs: no report, no reminder.
+		await runtime.send("1", "continue");
+		expect(runtime.get("1")?.status).toBe("done");
+		expect(remindSession).toHaveBeenCalledTimes(1);
 	},
 );
 
@@ -326,17 +314,13 @@ test("an ignored reminder is repeated only once the task's work changes, e.g. wi
 		if (first) sent = runtime.send("1", "question");
 	});
 	const runtime = runtimeFor(session, { remindSession });
-	try {
-		expect(await runtime.start(ROOT, "task", context).result).toMatchObject({
-			status: "done",
-			output: "task result",
-			usage: { totalTokens: 12 },
-		});
-		await sent;
-		expect(remindSession).toHaveBeenCalledTimes(2);
-	} finally {
-		await runtime.dispose();
-	}
+	expect(await runtime.start(ROOT, "task", context).result).toMatchObject({
+		status: "done",
+		output: "task result",
+		usage: { totalTokens: 12 },
+	});
+	await sent;
+	expect(remindSession).toHaveBeenCalledTimes(2);
 });
 
 test("stopping a task's leftovers ends its children and stoppable work at once, naming what still ran", async () => {
@@ -346,6 +330,7 @@ test("stopping a task's leftovers ends its children and stoppable work at once, 
 		return true;
 	});
 	let stopped: string[] = [];
+	let leftover: SubagentResult | undefined;
 	const parent = sessionStub({
 		prompt: async (text) => {
 			if (text !== "task") return reply(parent, text);
@@ -364,10 +349,7 @@ test("stopping a task's leftovers ends its children and stoppable work at once, 
 				},
 			});
 			stopped = runtime.stopLeftovers("1");
-			expect(await child.result).toMatchObject({
-				status: "aborted",
-				leftover: true,
-			});
+			leftover = await child.result;
 			// The task goes on: it may start new work, then report.
 			await runtime.start("1", "new child", context).result;
 			reply(parent, "parent report");
@@ -388,16 +370,13 @@ test("stopping a task's leftovers ends its children and stoppable work at once, 
 			onCreated(child);
 		},
 	});
-	try {
-		const result = await runtime.start(ROOT, "task", context).result;
-		expect(result).toMatchObject({ status: "done", output: "parent report" });
-		expect(result).not.toHaveProperty("leftover");
-		expect(stopped).toEqual(["subagent 1.1", "PGID 42: job"]);
-		expect(stop).toHaveBeenCalledTimes(1);
-		expect(runtime.get("1.2")?.status).toBe("done");
-	} finally {
-		await runtime.dispose();
-	}
+	const result = await runtime.start(ROOT, "task", context).result;
+	expect(result).toMatchObject({ status: "done", output: "parent report" });
+	expect(result).not.toHaveProperty("leftover");
+	expect(leftover).toMatchObject({ status: "aborted", leftover: true });
+	expect(stopped).toEqual(["subagent 1.1", "PGID 42: job"]);
+	expect(stop).toHaveBeenCalledTimes(1);
+	expect(runtime.get("1.2")?.status).toBe("done");
 });
 
 test("failed binding revokes a published session and retry creates a fresh one", async () => {
@@ -420,22 +399,19 @@ test("failed binding revokes a published session and retry creates a fresh one",
 		},
 		disposeSession,
 	});
-	try {
-		expect(await runtime.start(ROOT, "initial", context).result).toMatchObject({
-			status: "error",
-			error: "binding failed",
-		});
-		expect(runtime.get("1")?.session).toBeUndefined();
-		expect(disposeSession).toHaveBeenCalledTimes(1);
-		expect(unsubscribe).toHaveBeenCalledTimes(1);
-		await runtime.send("1", "retry");
-		expect(runtime.get("1")?.session).toBe(good);
-		expect(runtime.get("1")?.status).toBe("done");
-		expect(creates).toBe(2);
-		expect(failedPrompt).not.toHaveBeenCalled();
-	} finally {
-		await runtime.dispose();
-	}
+	expect(await runtime.start(ROOT, "initial", context).result).toMatchObject({
+		status: "error",
+		error: "binding failed",
+	});
+	expect(runtime.get("1")?.session).toBeUndefined();
+	expect(disposeSession).toHaveBeenCalledTimes(1);
+	expect(unsubscribe).toHaveBeenCalledTimes(1);
+	await runtime.send("1", "retry");
+	expect(runtime.get("1")?.session).toBe(good);
+	expect(runtime.get("1")?.status).toBe("done");
+	expect(creates).toBe(2);
+	expect(failedPrompt).not.toHaveBeenCalled();
+	await runtime.dispose();
 	expect(disposeSession.mock.calls.map(([session]) => session)).toEqual([
 		failed,
 		good,
@@ -458,15 +434,10 @@ test("disposal attempts every session and unsubscribe before reporting cleanup e
 	});
 	await runtime.start(ROOT, "one", context).result;
 	await runtime.start(ROOT, "two", context).result;
-	const closing = runtime.dispose();
-	expect(runtime.dispose()).toBe(closing);
-	await expect(closing).rejects.toMatchObject({
-		errors: [
-			expect.objectContaining({ message: "cleanup failed" }),
-			expect.objectContaining({ message: "unsubscribe failed" }),
-			expect.objectContaining({ message: "unsubscribe failed" }),
-		],
-	});
+	const errors = ["cleanup failed", "unsubscribe failed", "unsubscribe failed"];
+	expect(await cleanupErrors(runtime.dispose())).toEqual(errors);
+	// Shutting down again reports the same outcome, without repeating cleanup.
+	expect(await cleanupErrors(runtime.dispose())).toEqual(errors);
 	expect(disposeSession).toHaveBeenCalledTimes(2);
 	expect(unsubscribe).toHaveBeenCalledTimes(2);
 	expect(runtime.closed).toBe(true);
@@ -484,13 +455,11 @@ test("abort failures are observed and reported at shutdown without skipping disp
 	const disposeSession = mock(async () => {});
 	const runtime = runtimeFor(session, { disposeSession });
 	const started = runtime.start(ROOT, "task", context);
-	await until(() => Boolean(runtime.get("1")?.session));
+	await until(() => runtime.get("1")?.session !== undefined);
 	runtime.abort("1");
 	gate.resolve();
 	expect((await started.result).status).toBe("aborted");
-	await expect(runtime.dispose()).rejects.toMatchObject({
-		errors: [expect.objectContaining({ message: "abort failed" })],
-	});
+	expect(await cleanupErrors(runtime.dispose())).toEqual(["abort failed"]);
 	expect(disposeSession).toHaveBeenCalledTimes(1);
 });
 
@@ -508,19 +477,14 @@ test("terminal listeners can restart without the old run clearing their operatio
 		if (runtime.get("1")?.status === "done" && !restarted)
 			restarted = runtime.send("1", "restart");
 	});
-	try {
-		expect((await runtime.start(ROOT, "initial", context).result).output).toBe(
-			"initial",
-		);
-		expect(restarted).toBeDefined();
-		expect(runtime.get("1")?.status).toBe("running");
-		gate.resolve();
-		await restarted;
-		expect(runtime.get("1")?.status).toBe("done");
-	} finally {
-		gate.resolve();
-		await runtime.dispose();
-	}
+	expect((await runtime.start(ROOT, "initial", context).result).output).toBe(
+		"initial",
+	);
+	expect(restarted).toBeDefined();
+	expect(runtime.get("1")?.status).toBe("running");
+	gate.resolve();
+	await restarted;
+	expect(runtime.get("1")?.status).toBe("done");
 });
 
 test("liveTools retains full raw snapshots, authoritative terminal results, and nested parent IDs until the next run", async () => {
@@ -533,6 +497,10 @@ test("liveTools retains full raw snapshots, authoritative terminal results, and 
 		content: [{ type: "text", text: "\u001b[31mraw tool output\u001b[0m" }],
 		details: { complete: true },
 	};
+	const outer = () => runtime.get("1")?.liveTools.get("call");
+	/** What the outer call's snapshot showed as its events arrived. */
+	const seen: unknown[] = [];
+	let toolsInNextRun: number | undefined;
 	let runs = 0;
 	const session = sessionStub({
 		subscribe: (handler) => {
@@ -540,68 +508,68 @@ test("liveTools retains full raw snapshots, authoritative terminal results, and 
 			return () => {};
 		},
 		prompt: async () => {
-			if (runs++ === 0) {
-				listener({
-					type: "tool_execution_start",
-					toolCallId: "call",
-					toolName: "outer",
-					args: { value: 1 },
-				});
-				expect(runtime.get("1")?.liveTools.get("call")?.status).toBe("running");
-				listener({
-					type: "tool_execution_update",
-					toolCallId: "call",
-					toolName: "outer",
-					args: { value: 1 },
-					partialResult: first,
-				});
-				expect(runtime.get("1")?.liveTools.get("call")?.result).toBe(first);
-				listener({
-					type: "tool_execution_start",
-					toolCallId: "call/1",
-					toolName: "nested",
-					args: { nested: true },
-					parentToolCallId: "call",
-				});
-				listener({
-					type: "tool_execution_end",
-					toolCallId: "call/1",
-					toolName: "nested",
-					result: first,
-					isError: true,
-				});
-				listener({
-					type: "tool_execution_end",
-					toolCallId: "call",
-					toolName: "outer",
-					result: final,
-					isError: false,
-				});
-			} else expect(runtime.get("1")?.liveTools.size).toBe(0);
+			if (runs++ > 0) {
+				toolsInNextRun = runtime.get("1")?.liveTools.size;
+				return reply(session, "done");
+			}
+			listener({
+				type: "tool_execution_start",
+				toolCallId: "call",
+				toolName: "outer",
+				args: { value: 1 },
+			});
+			seen.push(outer()?.status);
+			listener({
+				type: "tool_execution_update",
+				toolCallId: "call",
+				toolName: "outer",
+				args: { value: 1 },
+				partialResult: first,
+			});
+			seen.push(outer()?.result);
+			listener({
+				type: "tool_execution_start",
+				toolCallId: "call/1",
+				toolName: "nested",
+				args: { nested: true },
+				parentToolCallId: "call",
+			});
+			listener({
+				type: "tool_execution_end",
+				toolCallId: "call/1",
+				toolName: "nested",
+				result: first,
+				isError: true,
+			});
+			listener({
+				type: "tool_execution_end",
+				toolCallId: "call",
+				toolName: "outer",
+				result: final,
+				isError: false,
+			});
 			reply(session, "done");
 		},
 	});
 	const runtime = runtimeFor(session);
-	try {
-		expect((await runtime.start(ROOT, "tools", context).result).status).toBe(
-			"done",
-		);
-		const tools = runtime.get("1")?.liveTools;
-		expect(tools?.get("call")).toMatchObject({
-			args: { value: 1 },
-			status: "done",
-			result: final,
-		});
-		expect(tools?.get("call/1")).toMatchObject({
-			args: { nested: true },
-			status: "error",
-			result: first,
-			parentToolCallId: "call",
-		});
-		await runtime.send("1", "next run");
-		expect(runtime.get("1")?.liveTools).toBe(tools);
-		expect(tools?.size).toBe(0);
-	} finally {
-		await runtime.dispose();
-	}
+	expect((await runtime.start(ROOT, "tools", context).result).status).toBe(
+		"done",
+	);
+	expect(seen).toEqual(["running", first]);
+	const tools = runtime.get("1")?.liveTools;
+	expect(tools?.get("call")).toMatchObject({
+		args: { value: 1 },
+		status: "done",
+		result: final,
+	});
+	expect(tools?.get("call/1")).toMatchObject({
+		args: { nested: true },
+		status: "error",
+		result: first,
+		parentToolCallId: "call",
+	});
+	await runtime.send("1", "next run");
+	// Cleared as the next run starts, not once it ends.
+	expect(toolsInNextRun).toBe(0);
+	expect(runtime.get("1")?.liveTools.size).toBe(0);
 });

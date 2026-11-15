@@ -22,6 +22,7 @@ import {
 	hasCustomMessage,
 	lastCustomMessage,
 	lastText,
+	remoteBash,
 	report,
 	response,
 	spawnContext,
@@ -265,7 +266,7 @@ test("a command-exit wake can launch another background command before reporting
 });
 
 test.each([false, true])(
-	"a report stops a job left running and tells the agent, which keeps its report or reports again (again: %s)",
+	"a report stops a job left running and tells the agent, which keeps its report or reports again (again: %p)",
 	async (again) => {
 		const tree = testRuntime();
 		let told = "";
@@ -366,8 +367,12 @@ test("notification startup failures fail the run instead of delivering a stale f
 	await until(() => idle(tree));
 	const session = tree.get("1")?.session;
 	if (!session) throw new Error("Missing child session");
-	spyOn(session, "sendCustomMessage").mockRejectedValue(
-		new Error("wake failed"),
+	// Only the exit notice fails: a reminder would otherwise fail the run too.
+	const send = session.sendCustomMessage.bind(session);
+	spyOn(session, "sendCustomMessage").mockImplementation((message, options) =>
+		message.customType === COMMAND_EXIT_TYPE
+			? Promise.reject(new Error("wake failed"))
+			: send(message, options),
 	);
 	await job.release();
 	expect(await started.result).toMatchObject({
@@ -385,15 +390,7 @@ test("configured bash overrides are not silently replaced with local execution",
 				: answer(ctx, lastText(ctx)),
 		),
 	);
-	await childExtension(
-		context,
-		"remote",
-		`pi.registerTool({
-			name: "bash", label: "Remote bash", description: "Remote execution",
-			parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] },
-			async execute() { return { content: [{ type: "text", text: "remote result" }], details: undefined }; }
-		});`,
-	);
+	await childExtension(context, "remote", remoteBash);
 	expect(await tree.start(ROOT, "start", context).result).toMatchObject({
 		status: "done",
 		output: "remote result",

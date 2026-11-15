@@ -10,7 +10,6 @@ import { errorMessage } from "../runtime/errors.ts";
 import type { SubagentResult } from "../runtime/index.ts";
 import {
 	SUBAGENT_RESULT_TYPE,
-	type SubagentCompletionDetails,
 	type SubagentCompletionMessage,
 } from "./protocol.ts";
 
@@ -26,24 +25,25 @@ async function boundedOutput(
 ): Promise<{ text: string; fullOutputPath?: string }> {
 	const truncated = truncateHead(output, LIMITS);
 	if (!truncated.truncated) return { text: truncated.content };
+	let directory: string | undefined;
 	try {
-		const directory = await mkdtemp(join(tmpdir(), "pi-subagents-output-"));
+		directory = await mkdtemp(join(tmpdir(), "pi-subagents-output-"));
 		const fullOutputPath = join(directory, "output.txt");
-		try {
-			await writeFile(fullOutputPath, output, "utf8");
-		} catch (error) {
-			await rm(directory, { recursive: true, force: true }).catch(() => {});
-			throw error;
-		}
+		await writeFile(fullOutputPath, output, "utf8");
 		return {
 			text: `${truncated.content}\n[Output truncated. Full output saved to: ${fullOutputPath}]`,
 			fullOutputPath,
 		};
 	} catch (error) {
 		// A failed temp-file write must not lose completion or usage accounting.
-		const reason = errorMessage(error);
+		if (directory)
+			await rm(directory, { recursive: true, force: true }).catch(() => {});
+		const reason = truncateHead(errorMessage(error), {
+			maxBytes: 256,
+			maxLines: 1,
+		}).content;
 		return {
-			text: `${truncated.content}\n[Could not save full output: ${truncateHead(reason, { maxBytes: 256, maxLines: 1 }).content}]`,
+			text: `${truncated.content}\n[Could not save full output: ${reason}]`,
 		};
 	}
 }
@@ -53,21 +53,15 @@ export async function subagentCompletionMessage(
 	result: SubagentResult,
 ): Promise<SubagentCompletionMessage> {
 	const { text, fullOutputPath } = await boundedOutput(result.output);
-	const details: SubagentCompletionDetails = {
-		id: result.id,
-		status: result.status,
-		error: result.error,
-		usage: result.usage,
-	};
-	if (fullOutputPath) details.fullOutputPath = fullOutputPath;
+	const { id, status, error, usage } = result;
 	return {
 		customType: SUBAGENT_RESULT_TYPE,
 		content: [
-			{ type: "text", text: `Subagent ${result.id} ${result.status}.` },
+			{ type: "text", text: `Subagent ${id} ${status}.` },
 			{ type: "text", text },
 		],
 		display: true,
-		details,
+		details: { id, status, error, usage, fullOutputPath },
 	};
 }
 
@@ -75,10 +69,7 @@ export async function subagentCompletionMessage(
 export async function discardSubagentCompletion(
 	message: SubagentCompletionMessage,
 ): Promise<void> {
-	if (message.details.fullOutputPath) {
-		await rm(dirname(message.details.fullOutputPath), {
-			recursive: true,
-			force: true,
-		});
-	}
+	const { fullOutputPath } = message.details;
+	if (fullOutputPath)
+		await rm(dirname(fullOutputPath), { recursive: true, force: true });
 }

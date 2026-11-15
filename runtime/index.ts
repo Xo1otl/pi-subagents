@@ -3,7 +3,7 @@ import type {
 	AgentToolResult,
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import type { Api, Model, Usage } from "@earendil-works/pi-ai";
 import type {
 	AgentSession,
 	AgentSessionEvent,
@@ -193,17 +193,43 @@ function subagentTree(nodes: Iterable<Subagent>): Subagent[] {
 	return visit(ROOT);
 }
 
-function belongsTo(
+/** A node's ancestors, nearest first. */
+function* ancestors<Node extends Subagent>(
+	nodes: ReadonlyMap<string, Node>,
+	node: Subagent,
+): Generator<Node> {
+	for (
+		let parent = nodes.get(node.parentId);
+		parent;
+		parent = nodes.get(parent.parentId)
+	)
+		yield parent;
+}
+
+/** Whether a node is `id` or descends from it, as every node does from ROOT. */
+function isWithin(
 	nodes: ReadonlyMap<string, Subagent>,
 	node: Subagent,
-	ancestor: string,
+	id: string,
 ): boolean {
-	let current: Subagent | undefined = node;
-	while (current) {
-		if (current.id === ancestor || current.parentId === ancestor) return true;
-		current = nodes.get(current.parentId);
-	}
-	return false;
+	return (
+		id === ROOT ||
+		[node, ...ancestors(nodes, node)].some((member) => member.id === id)
+	);
+}
+
+/** Charge a run's own usage to every ledger that still records the session
+ * it was captured for.
+ */
+function bill(
+	ledgers: readonly UsageLedger[],
+	node: Subagent,
+	usage: Usage,
+): void {
+	const { provider, id } = node.context.model;
+	for (const { manager, sessionId } of ledgers)
+		if (manager.getSessionId() === sessionId)
+			manager.appendUsage(SUBAGENT_USAGE_KIND, provider, id, usage, node.id);
 }
 
 function recordError(node: SubagentNode, error: unknown): void {
@@ -261,6 +287,10 @@ export function createSubagents({
 		if (closing) throw new Error("Subagents have been shut down.");
 	}
 
+	function childrenOf(id: string): SubagentNode[] {
+		return [...nodes.values()].filter((node) => node.parentId === id);
+	}
+
 	function start(
 		parentId: string,
 		instructions: string,
@@ -274,9 +304,8 @@ export function createSubagents({
 			throw new Error(`Unknown parent: ${parentId}`);
 		if (parent?.cancelled) throw new Error(`Parent ${parentId} was aborted.`);
 		// Nodes are only removed at shutdown, so sibling counts yield stable IDs.
-		let count = 1;
-		for (const node of nodes.values()) if (node.parentId === parentId) count++;
-		const id = parentId === ROOT ? String(count) : `${parentId}.${count}`;
+		const index = childrenOf(parentId).length + 1;
+		const id = parentId === ROOT ? `${index}` : `${parentId}.${index}`;
 		const node: SubagentNode = {
 			id,
 			parentId,
@@ -348,16 +377,17 @@ export function createSubagents({
 		node: SubagentNode,
 		active: ActiveRun,
 		instructions: string,
-		sent: boolean,
+		fromUser: boolean,
 	): Promise<void> {
 		const previous = active.preflight;
 		const preflight = Promise.withResolvers<void>();
 		active.preflight = preflight.promise;
-		// Sent input is queued until the session queues, starts or handles it.
+		// The user's input is pending until the session queues, starts or
+		// handles it; the parent's task is never handed back.
 		const input = { text: instructions };
-		if (sent) node.pendingInput.add(input);
+		if (fromUser) node.pendingInput.add(input);
 		const accepted = (disposition?: string) => {
-			const withdrawn = sent && !node.pendingInput.delete(input);
+			const withdrawn = fromUser && !node.pendingInput.delete(input);
 			// Stopping already handed this input back; it must not reach the agent too.
 			if (withdrawn && disposition === "queued") node.session?.clearQueue();
 			preflight.resolve();
@@ -420,7 +450,7 @@ export function createSubagents({
 	async function run(
 		node: SubagentNode,
 		instructions: string,
-		sent = false,
+		userLed = false,
 	): Promise<SubagentResult> {
 		node.cancelled = false;
 		node.status = "running";
@@ -430,7 +460,7 @@ export function createSubagents({
 		const settlement = Promise.withResolvers<void>();
 		// Track the whole delegated run before any lifecycle callback can request shutdown.
 		const active: ActiveRun = {
-			userLed: sent,
+			userLed,
 			leftover: false,
 			reminded: false,
 			preflight: initialization.promise,
@@ -440,21 +470,17 @@ export function createSubagents({
 		const ledgers: UsageLedger[] = rootLedger ? [rootLedger] : [];
 		// Resumed descendants belong to any active ancestors too, even when their
 		// immediate parent has already completed. Idle ancestors receive billing only.
-		for (
-			let parent = nodes.get(node.parentId);
-			parent;
-			parent = nodes.get(parent.parentId)
-		) {
-			if (parent.session)
-				ledgers.push(usageLedger(parent.session.sessionManager));
-			if (parent.run) trackCompletion(parent.id, active.settled);
+		for (const ancestor of ancestors(nodes, node)) {
+			if (ancestor.session)
+				ledgers.push(usageLedger(ancestor.session.sessionManager));
+			if (ancestor.run) trackCompletion(ancestor.id, active.settled);
 		}
 		trackCompletion(ROOT, active.settled);
 		// Capture reused history before any initialization listeners can bill this run.
 		let firstEntry = node.session?.sessionManager.getEntries().length;
 		// Reserve the original input ahead of sends made by initialization listeners;
 		// the drain below awaits it with the rest of the run's tracked work.
-		void submit(node, active, instructions, sent);
+		void submit(node, active, instructions, userLed);
 		const finish = () => {
 			if (node.run === active) node.run = undefined;
 			settlement.resolve();
@@ -520,20 +546,11 @@ export function createSubagents({
 				active.reminder = Promise.resolve(node.session).then(remindSession);
 				trackCompletion(node.id, active.reminder);
 			}
-			const usage = summarizeOwnUsage(entries);
 			// Bill before terminal listeners can restart a conversation. Each run's
 			// local delta reaches every captured ancestor exactly once, without a turn
 			// or result notification, and regardless of cancellation or delivery failure.
 			try {
-				for (const { manager, sessionId } of ledgers)
-					if (manager.getSessionId() === sessionId)
-						manager.appendUsage(
-							SUBAGENT_USAGE_KIND,
-							node.context.model.provider,
-							node.context.model.id,
-							usage,
-							node.id,
-						);
+				bill(ledgers, node, summarizeOwnUsage(entries));
 			} finally {
 				// Even a ledger write failure must leave a reusable terminal node.
 				node.status = summary.status;
@@ -543,13 +560,13 @@ export function createSubagents({
 				finish();
 				changed();
 			}
-			const { status, error, output } = summary;
+			const { status, error, output, usage } = summary;
 			return {
 				id: node.id,
 				status,
 				error,
 				output,
-				usage: summary.usage,
+				usage,
 				...(active.leftover && { leftover: true }),
 			};
 		} finally {
@@ -561,13 +578,8 @@ export function createSubagents({
 	function stopLeftovers(id: string): string[] {
 		const stopped: string[] = [];
 		// A child the user continues is theirs, and reports nothing anyway.
-		for (const child of nodes.values())
-			if (
-				child.parentId === id &&
-				child.run &&
-				!child.run.userLed &&
-				!child.cancelled
-			) {
+		for (const child of childrenOf(id))
+			if (child.run && !child.run.userLed && !child.cancelled) {
 				child.run.leftover = true;
 				stopped.push(`subagent ${child.id}`);
 				abort(child.id);
@@ -637,7 +649,7 @@ export function createSubagents({
 	function abort(id = ROOT): Map<string, string[]> {
 		const discarded = new Map<string, string[]>();
 		for (const node of nodes.values()) {
-			if (!belongsTo(nodes, node, id) || node.status !== "running") continue;
+			if (!isWithin(nodes, node, id) || node.status !== "running") continue;
 			node.cancelled = true;
 			// Pending prompts observe cancellation and are never submitted.
 			const input = Array.from(node.pendingInput, ({ text }) => text);

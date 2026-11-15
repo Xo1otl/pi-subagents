@@ -1,5 +1,5 @@
-import { expect, mock, test } from "bun:test";
-import type { OverlayHandle, TUI } from "@earendil-works/pi-tui";
+import { expect, mock, spyOn, test } from "bun:test";
+import type { OverlayHandle } from "@earendil-works/pi-tui";
 import { ROOT } from "../runtime/index.ts";
 import { createSubagentSwitcher } from "../ui/switcher.ts";
 import {
@@ -60,12 +60,6 @@ async function setup({
 		return lines.slice(top + 1, -2).join("\n");
 	};
 	return { tree, terminal, switcher, done, header, composer };
-}
-
-function spyRenders(tui: TUI) {
-	const spy = mock(tui.requestRender.bind(tui));
-	tui.requestRender = spy;
-	return spy;
 }
 
 test("the compact picker lists every descendant's status, task and context below the root, and arrows walk the tree", async () => {
@@ -301,7 +295,7 @@ test("closing unsubscribes at once, and cleanup is idempotent", async () => {
 	terminal.input("\x1b");
 	expect(done).toHaveBeenCalledTimes(1);
 	expect(terminal.text()).toContain("ROOT_TRANSCRIPT");
-	const renders = spyRenders(terminal.tui);
+	const renders = spyOn(terminal.tui, "requestRender");
 	await tree.send("1", "continues after closing the switcher");
 	expect(renders).not.toHaveBeenCalled();
 	switcher.dispose();

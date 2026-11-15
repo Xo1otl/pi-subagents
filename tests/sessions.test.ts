@@ -10,6 +10,7 @@ import {
 	SessionManager,
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import {
 	REPORT_TOOL,
 	SUBAGENT_REMINDER_TYPE,
@@ -28,9 +29,9 @@ import {
 	lastText,
 	model,
 	onCleanup,
+	remoteBash,
 	report,
 	response,
-	shared,
 	stream,
 	taskText,
 	spawnContext as testContext,
@@ -305,18 +306,7 @@ test.each(["inactive", "overridden"] as const)(
 		const guidelines = parent.getToolDefinition("bash")?.promptGuidelines;
 		const backgroundGuidance = addedGuidance(guidelines);
 		if (mode === "overridden")
-			await childExtension(
-				context,
-				"behavior",
-				`
-				pi.registerTool({
-					name: "bash", label: "Remote bash", description: "Remote execution",
-					parameters: { type: "object", properties: {} },
-					promptGuidelines: ["REMOTE_BASH_MARKER"],
-					async execute() { return { content: [{ type: "text", text: "remote" }], details: undefined }; }
-				});
-				`,
-			);
+			await childExtension(context, "behavior", remoteBash);
 		await tree.start(ROOT, "child", context).result;
 		const child = tree.get("1")?.session;
 		if (!child) throw new Error("Missing child");
@@ -349,7 +339,7 @@ test("provides machine-facing delegation in children without loading UI registra
 	// not list.
 	expect(child.getActiveToolNames()).toContain(REPORT_TOOL);
 	expect(parent.getToolDefinition(REPORT_TOOL)).toBeUndefined();
-	expect(child.systemPrompt).not.toContain(`- ${REPORT_TOOL}:`);
+	expect(child.systemPrompt).not.toContain(REPORT_TOOL);
 	expect(tool?.renderCall).toBeUndefined();
 	expect(tool?.renderResult).toBeUndefined();
 	const extensions = child.resourceLoader.getExtensions();
@@ -415,19 +405,18 @@ test("configured web search remains available throughout nested delegation", asy
 				: toolCall("web_search", { query: "pi" });
 		}),
 	});
-	await childExtension(
-		context,
-		"behavior",
-		`
+	await childExtension(context, "behavior", (pi) => {
 		pi.registerTool({
-			name: "web_search", label: "Web search", description: "Test search tool",
-			parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
-			async execute(_id, args, _signal, _onUpdate, ctx) {
-				return { content: [{ type: "text", text: args.query + ":" + ctx.sessionManager.getSessionId() }], details: undefined };
-			}
+			name: "web_search",
+			label: "Web search",
+			description: "Test search tool",
+			parameters: Type.Object({ query: Type.String() }),
+			async execute(_id, { query }, _signal, _onUpdate, ctx) {
+				const text = `${query}:${ctx.sessionManager.getSessionId()}`;
+				return { content: [{ type: "text", text }], details: undefined };
+			},
 		});
-	`,
-	);
+	});
 	const result = await tree.start(ROOT, "delegate search", context).result;
 	expect(result.status).toBe("done");
 	expect(result.output).toBe(`pi:${tree.get("1.1")?.session?.sessionId}`);
@@ -501,7 +490,7 @@ test("uses configured MCP servers during nested delegation", async () => {
 });
 
 test.each([false, true])(
-	"respects the project-trust decision (%s) when discovering project settings and resources",
+	"respects the project-trust decision (%p) when discovering project settings and resources",
 	async (projectTrusted) => {
 		const { tree, context, cwd } = await setup({
 			settings: { transport: "sse" },
@@ -535,18 +524,22 @@ test("runs standard extension permission and result hooks in the child's context
 					: toolCall("read", { path: "AGENTS.md" }),
 		),
 	});
-	await childExtension(
-		context,
-		"behavior",
-		`
-		pi.on("tool_call", (event) => {
-			if (event.toolName === "write") return { block: true, reason: "POLICY_BLOCKED" };
-		});
-		pi.on("tool_result", (event, ctx) => {
-			if (event.toolName === "read") return { content: [{ type: "text", text: ctx.sessionManager.getSessionId() }] };
-		});
-	`,
-	);
+	await childExtension(context, "behavior", (pi) => {
+		pi.on("tool_call", (event) =>
+			event.toolName === "write"
+				? { block: true, reason: "POLICY_BLOCKED" }
+				: undefined,
+		);
+		pi.on("tool_result", (event, ctx) =>
+			event.toolName === "read"
+				? {
+						content: [
+							{ type: "text", text: ctx.sessionManager.getSessionId() },
+						],
+					}
+				: undefined,
+		);
+	});
 	const blocked = await tree.start(ROOT, "write", context).result;
 	expect(blocked.output).toBe("POLICY_BLOCKED");
 	expect(await Bun.file(join(cwd, "blocked.txt")).exists()).toBe(false);
@@ -636,18 +629,16 @@ test("standard compaction preserves final output and summarization usage", async
 			}),
 		),
 	});
-	await childExtension(
-		context,
-		"behavior",
-		`
-		pi.on("session_before_compact", (event) => ({ compaction: {
-			summary: "COMPACTION_MARKER",
-			firstKeptEntryId: event.preparation.firstKeptEntryId,
-			tokensBefore: event.preparation.tokensBefore,
-			usage: ${JSON.stringify(response("summary").usage)},
-		} }));
-	`,
-	);
+	await childExtension(context, "behavior", (pi) => {
+		pi.on("session_before_compact", ({ preparation }) => ({
+			compaction: {
+				summary: "COMPACTION_MARKER",
+				firstKeptEntryId: preparation.firstKeptEntryId,
+				tokensBefore: preparation.tokensBefore,
+				usage: response("summary").usage,
+			},
+		}));
+	});
 	const result = await tree.start(ROOT, "compact", context).result;
 	expect(result.status).toBe("done");
 	expect(result.output).toBe(output);
@@ -668,15 +659,18 @@ test("dispatches standard extension commands without sending them to the model, 
 			return report("pong");
 		}),
 	});
-	await childExtension(
-		context,
-		"behavior",
-		`
-		pi.registerCommand("ping", { description: "Ping", handler: async () => {
-			pi.sendMessage({ customType: "ping", content: "PING_MARKER", display: false });
-		} });
-	`,
-	);
+	await childExtension(context, "behavior", (pi) => {
+		pi.registerCommand("ping", {
+			description: "Ping",
+			handler: async () => {
+				pi.sendMessage({
+					customType: "ping",
+					content: "PING_MARKER",
+					display: false,
+				});
+			},
+		});
+	});
 	const result = await tree.start(ROOT, "/ping", context).result;
 	// A task that the command handled is still reported, once reminded.
 	expect(result).toMatchObject({ status: "done", output: "pong" });
@@ -695,11 +689,12 @@ test("cancellation during async standard input hooks stops the later agent loop"
 			return response("must not run");
 		}),
 	});
-	const hook = async () => {
-		entered.resolve();
-		await gate.promise;
-	};
-	await childExtension(context, "behavior", `pi.on("input", ${shared(hook)});`);
+	await childExtension(context, "behavior", (pi) => {
+		pi.on("input", async () => {
+			entered.resolve();
+			await gate.promise;
+		});
+	});
 	const result = tree.start(ROOT, "wait", context).result;
 	await entered.promise;
 	tree.abort("1");

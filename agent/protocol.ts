@@ -43,10 +43,14 @@ export interface SubagentCompletionMessage {
 	details: SubagentCompletionDetails;
 }
 
-interface CommandExitDetails {
+/** A process group that outlived the command that started it. */
+export interface CommandJob {
 	pgid: number;
 	command: string;
 	cwd: string;
+}
+
+interface CommandExitDetails extends CommandJob {
 	/** A job that outlived its shell has no known status, not an implied success. */
 	exitCode: null;
 }
@@ -58,10 +62,7 @@ export interface CommandExitMessage {
 	details: CommandExitDetails;
 }
 
-interface CommandUnknownDetails {
-	pgid: number;
-	command: string;
-	cwd: string;
+interface CommandUnknownDetails extends CommandJob {
 	/** Why the group's status could not be read. */
 	error: string;
 }

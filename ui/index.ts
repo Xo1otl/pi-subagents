@@ -78,9 +78,7 @@ export function createSubagentUI(pi: ExtensionAPI) {
 	);
 	pi.registerCommand("subagents", {
 		description: "Pick a subagent, or chat with one: /subagents [id]",
-		handler: async (args, ctx) => {
-			await showSwitcher(ctx, args.trim() || undefined);
-		},
+		handler: (args, ctx) => showSwitcher(ctx, args.trim() || undefined),
 	});
 	pi.registerShortcut("ctrl+shift+a", {
 		description: "Pick a subagent to view (also while the root is running)",

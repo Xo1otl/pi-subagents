@@ -1,5 +1,101 @@
 {
 	"$schema": "https://biomejs.dev/schemas/2.5.15/schema.json",
 	"vcs": { "enabled": true, "clientKind": "git", "useIgnoreFile": true },
-	"linter": { "enabled": true, "rules": { "preset": "recommended" } }
+	"linter": {
+		"enabled": true,
+		"rules": {
+			"preset": "recommended",
+			"suspicious": {
+				"noImportCycles": {
+					"level": "error",
+					"options": { "ignoreTypes": false }
+				}
+			}
+		}
+	},
+	"overrides": [
+		{
+			"includes": ["runtime/**"],
+			"linter": {
+				"rules": {
+					"style": {
+						"noRestrictedImports": {
+							"level": "error",
+							"options": {
+								"paths": { "@earendil-works/pi-tui": "runtime/ is headless." },
+								"patterns": [
+									{
+										"group": ["../**"],
+										"message": "runtime/ imports nothing from the other layers."
+									}
+								]
+							}
+						}
+					}
+				}
+			}
+		},
+		{
+			"includes": ["agent/**"],
+			"linter": {
+				"rules": {
+					"style": {
+						"noRestrictedImports": {
+							"level": "error",
+							"options": {
+								"paths": { "@earendil-works/pi-tui": "agent/ is headless." },
+								"patterns": [
+									{
+										"group": ["../**", "!../runtime/**"],
+										"message": "agent/ builds on runtime/ alone."
+									}
+								]
+							}
+						}
+					}
+				}
+			}
+		},
+		{
+			"includes": ["agent/protocol.ts"],
+			"linter": {
+				"rules": {
+					"style": {
+						"noRestrictedImports": {
+							"level": "error",
+							"options": {
+								"paths": { "@earendil-works/pi-tui": "agent/ is headless." },
+								"patterns": [
+									{
+										"group": ["node:*", "./**", "../**", "!../runtime/**"],
+										"message": "protocol.ts is pure data and parsing, shared with ui/."
+									}
+								]
+							}
+						}
+					}
+				}
+			}
+		},
+		{
+			"includes": ["ui/**"],
+			"linter": {
+				"rules": {
+					"style": {
+						"noRestrictedImports": {
+							"level": "error",
+							"options": {
+								"patterns": [
+									{
+										"group": ["../agent/**", "!../agent/protocol.ts"],
+										"message": "ui/ reaches agent/ only through protocol.ts."
+									}
+								]
+							}
+						}
+					}
+				}
+			}
+		}
+	]
 }

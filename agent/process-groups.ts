@@ -31,9 +31,8 @@ export async function waitForGroupToFinish(
 	let unknownSince: number | undefined;
 	let told = false;
 	for (let delay = 100; ; delay = Math.min(delay * 2, 1000)) {
-		let running: boolean | undefined;
 		try {
-			running = await isProcessGroupActive(pgid, signal);
+			if (!(await isProcessGroupActive(pgid, signal))) return;
 			unknownSince = undefined;
 		} catch (error) {
 			signal?.throwIfAborted();
@@ -46,7 +45,6 @@ export async function waitForGroupToFinish(
 				await onUnknown?.(error);
 			}
 		}
-		if (running === false) return;
 		await setTimeout(delay, undefined, { signal });
 	}
 }

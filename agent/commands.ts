@@ -12,6 +12,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { errorMessage, hasErrorCode } from "../runtime/errors.ts";
 import type { Leftover, SessionOwner } from "../runtime/index.ts";
+import { servesSession } from "./context.ts";
 import {
 	isProcessGroupActive,
 	UNKNOWN_STATUS_REPORT_MS,
@@ -21,6 +22,7 @@ import {
 	COMMAND_EXIT_TYPE,
 	COMMAND_UNKNOWN_TYPE,
 	type CommandExitMessage,
+	type CommandJob,
 	type CommandMessage,
 	type CommandUnknownMessage,
 } from "./protocol.ts";
@@ -70,32 +72,26 @@ function commandPreview(command: string): string {
 	return first.length > 200 || lines.length > 1 ? `${preview} …` : preview;
 }
 
-function commandExit(
-	pgid: number,
-	command: string,
-	cwd: string,
-): CommandExitMessage {
+function commandExit(job: CommandJob): CommandExitMessage {
 	return {
 		customType: COMMAND_EXIT_TYPE,
-		content: `PGID ${pgid} exited: ${commandPreview(command)}`,
+		content: `PGID ${job.pgid} exited: ${commandPreview(job.command)}`,
 		display: true,
-		details: { pgid, command, cwd, exitCode: null },
+		details: { ...job, exitCode: null },
 	};
 }
 
 function commandUnknown(
-	pgid: number,
-	command: string,
-	cwd: string,
+	job: CommandJob,
 	error: unknown,
 ): CommandUnknownMessage {
 	const reason = errorMessage(error).replace(/\s+/g, " ").trim();
 	const seconds = UNKNOWN_STATUS_REPORT_MS / 1000;
 	return {
 		customType: COMMAND_UNKNOWN_TYPE,
-		content: `PGID ${pgid} status unknown for ${seconds}s (${commandPreview(reason)}); not stopped, still tracked; notifies once exit is seen: ${commandPreview(command)}`,
+		content: `PGID ${job.pgid} status unknown for ${seconds}s (${commandPreview(reason)}); not stopped, still tracked; notifies once exit is seen: ${commandPreview(job.command)}`,
 		display: true,
-		details: { pgid, command, cwd, error: reason },
+		details: { ...job, error: reason },
 	};
 }
 
@@ -148,6 +144,52 @@ export function trackCommands(
 		for (const [pgid, ctx] of running) end(pgid, ctx);
 	}
 
+	/** Watch a running group until it finishes, telling its conversation.
+	 * Stopping this one group, e.g. one that a reporting run left over, ends
+	 * its watch as stopping them all does.
+	 */
+	function watch(
+		job: CommandJob,
+		ctx: ExtensionContext,
+		notify: CommandListener,
+	): void {
+		const { pgid } = job;
+		const stopped = new AbortController();
+		const signal = AbortSignal.any([scope.signal, stopped.signal]);
+		groups.set(pgid, ctx);
+		const follow = async () => {
+			try {
+				await waitForGroupToFinish(pgid, {
+					signal,
+					// An unknown status is told, not taken for an end: the group stays
+					// owned and watched.
+					onUnknown: (error) => notify(commandUnknown(job, error), signal),
+				});
+				if (signal.aborted) return;
+				// Never signal a finished (and possibly reused) PGID while the
+				// model handles its exit; the tracked work still gates settlement.
+				groups.delete(pgid);
+				await notify(commandExit(job), signal);
+			} catch (error) {
+				if (signal.aborted) return;
+				// Telling failed, which fails the run: it no longer waits for a
+				// group that may still be running, so the group ends with it.
+				if (groups.delete(pgid)) end(pgid, ctx);
+				throw error;
+			}
+		};
+		host.track(follow(), ctx, {
+			label: `PGID ${pgid}: ${commandPreview(job.command)}`,
+			stop() {
+				stopped.abort();
+				if (!groups.delete(pgid)) return false;
+				end(pgid, ctx);
+				return true;
+			},
+		});
+	}
+
+	/** Watch the group a command left running, if any, returning its PGID. */
 	async function record(
 		from: TrackedSession,
 		path: string,
@@ -163,52 +205,14 @@ export function trackCommands(
 			pgid === undefined ||
 			!(await isProcessGroupActive(pgid).catch(() => true))
 		)
-			return;
+			return undefined;
 		const { ctx } = from;
 		const notify = aborted || from !== session ? undefined : host.listener(ctx);
 		if (!notify) {
 			end(pgid, ctx);
-			return;
+			return undefined;
 		}
-		// Stopping one group, e.g. one that a reporting run left over, ends
-		// its watch as stopping them all does.
-		const watch = new AbortController();
-		const signal = AbortSignal.any([scope.signal, watch.signal]);
-		groups.set(pgid, ctx);
-		const failed = (error: unknown) => {
-			if (signal.aborted) return;
-			// Telling failed, which fails the run: it no longer waits for a
-			// group that may still be running, so the group ends with it.
-			if (groups.delete(pgid)) end(pgid, ctx);
-			throw error;
-		};
-		host.track(
-			waitForGroupToFinish(pgid, {
-				signal,
-				// An unknown status is told, not taken for an end: the group stays
-				// owned and watched.
-				onUnknown: (error) =>
-					notify(commandUnknown(pgid, command, cwd, error), signal),
-			})
-				.then(async () => {
-					if (signal.aborted) return;
-					// Never signal a finished (and possibly reused) PGID while the
-					// model handles its exit; the tracked work still gates settlement.
-					groups.delete(pgid);
-					await notify(commandExit(pgid, command, cwd), signal);
-				})
-				.catch(failed),
-			ctx,
-			{
-				label: `PGID ${pgid}: ${commandPreview(command)}`,
-				stop() {
-					watch.abort();
-					if (!groups.delete(pgid)) return false;
-					end(pgid, ctx);
-					return true;
-				},
-			},
-		);
+		watch({ pgid, command, cwd }, ctx, notify);
 		return pgid;
 	}
 
@@ -223,7 +227,7 @@ export function trackCommands(
 			// The bash tool keeps accepting output until exec settles.
 			let endsLine = true;
 			const onData = (data: Buffer) => {
-				if (data.length) endsLine = data[data.length - 1] === 0x0a;
+				if (data.length) endsLine = data.at(-1) === 0x0a;
 				options.onData(data);
 			};
 			try {
@@ -331,22 +335,13 @@ export function delegatedCommands({
 				const { sessionId } = session;
 				const running = () => {
 					const node = runtime.get(id);
-					if (
-						runtime.closed ||
-						node?.cancelled ||
-						node?.status !== "running" ||
-						node.session !== session
-					)
-						return false;
-					try {
-						// This guarded getter also detects disposal and replacement.
-						return (
-							ctx.sessionManager === session.sessionManager &&
-							ctx.sessionManager.getSessionId() === sessionId
-						);
-					} catch {
-						return false;
-					}
+					return (
+						!runtime.closed &&
+						node?.status === "running" &&
+						!node.cancelled &&
+						node.session === session &&
+						servesSession(ctx, session.sessionManager, sessionId)
+					);
 				};
 				if (!running()) return undefined;
 				return async (message, signal) => {

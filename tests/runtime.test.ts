@@ -1,8 +1,9 @@
-import { describe, expect, mock, test } from "bun:test";
+import { describe, expect, mock, spyOn, test } from "bun:test";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
 	SUBAGENT_REMINDER_TYPE,
+	SUBAGENT_RESULT_TYPE,
 	type SubagentCompletionDetails,
 } from "../agent/protocol.ts";
 import { ROOT, type Subagents } from "../runtime/index.ts";
@@ -19,7 +20,6 @@ import {
 	replies,
 	report,
 	response,
-	shared,
 	spawnContext,
 	stream,
 	testRuntime,
@@ -230,11 +230,11 @@ describe("task results", () => {
 		const parent = tree.get("1")?.session;
 		if (!parent) throw new Error("Missing parent");
 		let path: string | undefined;
-		parent.sendCustomMessage = async (message) => {
+		spyOn(parent, "sendCustomMessage").mockImplementation(async (message) => {
 			path = (message.details as SubagentCompletionDetails).fullOutputPath;
 			if (path) removeOutputOnCleanup(path);
 			throw new Error("completion sender failed");
-		};
+		});
 		gate.resolve();
 		expect(await result).toMatchObject({
 			status: "error",
@@ -327,13 +327,12 @@ describe("task results", () => {
 
 	test("a report in a conversation the user continued is not delivered, and says so", async () => {
 		const tree = testRuntime();
-		await tree.start(ROOT, "say hello", await spawnContext()).result;
-		const session = tree.get("1")?.session;
-		if (!session) throw new Error("Missing child");
-		session.agent.streamFunction = stream(() => report("again"));
+		// Reports its task, then again whatever the user says.
+		const context = await spawnContext(stream(() => report("again")));
+		await tree.start(ROOT, "task", context).result;
 		await tree.send("1", "report again");
 		expect(tree.get("1")?.status).toBe("done");
-		expect(session.messages.at(-1)).toMatchObject({
+		expect(tree.get("1")?.session?.messages.at(-1)).toMatchObject({
 			role: "toolResult",
 			isError: true,
 		});
@@ -473,16 +472,13 @@ describe("interaction and cleanup", () => {
 		await blockingTool(context);
 		const hook = deferred();
 		const entered = deferred();
-		await childExtension(
-			context,
-			"input",
-			`pi.on("input", async (event) => {
+		await childExtension(context, "input", (pi) => {
+			pi.on("input", async (event) => {
 				if (event.text !== "in flight") return;
-				const shared = ${shared({ hook: hook.promise, entered })};
-				shared.entered.resolve();
-				await shared.hook;
-			});`,
-		);
+				entered.resolve();
+				await hook.promise;
+			});
+		});
 		const result = tree.start(ROOT, "monitor", context).result;
 		const node = tree.get("1");
 		await until(() => hasRunningTool(node));
@@ -523,22 +519,64 @@ describe("interaction and cleanup", () => {
 		await sibling;
 	});
 
+	test.each(["quit", "new"] as const)(
+		"a subagent whose own session ends (%s) stops its children, and its run only when quitting",
+		async (reason) => {
+			const tree = testRuntime();
+			const context = await spawnContext(
+				stream((context, options) => {
+					const text = lastText(context);
+					if (text === "parent")
+						return toolCall("subagent", { instructions: "waiting" });
+					if (text === "waiting") return waiting(options?.signal);
+					return lastCustomMessage(context, SUBAGENT_REMINDER_TYPE)
+						? report("parent carried on")
+						: response("waiting for the child");
+				}),
+			);
+			const parent = tree.start(ROOT, "parent", context).result;
+			await until(() => tree.get("1.1")?.session?.isStreaming === true);
+			await tree.get("1")?.session?.extensionRunner.emit({
+				type: "session_shutdown",
+				reason,
+			});
+			expect(await parent).toMatchObject(
+				reason === "quit"
+					? { status: "aborted" }
+					: { status: "done", output: "parent carried on" },
+			);
+			expect(tree.get("1.1")?.status).toBe("aborted");
+			// The stopped child's result does not reach a conversation that moved on.
+			expect(
+				tree
+					.get("1")
+					?.session?.messages.some(
+						(message) =>
+							message.role === "custom" &&
+							message.customType === SUBAGENT_RESULT_TYPE,
+					),
+			).toBe(false);
+		},
+	);
+
 	test("UI subtree abort covers restarted descendants and supports restarting after stop", async () => {
 		const tree = testRuntime();
-		await tree.start(ROOT, "nest:1", await spawnContext()).result;
-		const leaf = tree.get("1.1");
-		if (!leaf?.session) throw new Error("Missing leaf");
-		leaf.session.agent.streamFunction = stream((_context, options) =>
-			waiting(options?.signal),
+		const context = await spawnContext(
+			stream((context, options) =>
+				lastText(context) === "wait"
+					? waiting(options?.signal)
+					: hierarchyStream(model, context, options).result(),
+			),
 		);
+		await tree.start(ROOT, "nest:1", context).result;
+		const leaf = tree.get("1.1");
 		const restarted = tree.send("1.1", "wait");
-		await until(() => Boolean(leaf.session?.isStreaming));
+		await until(() => leaf?.session?.isStreaming === true);
 		tree.abort("1");
 		await restarted;
-		expect(leaf.status).toBe("aborted");
-		leaf.session.agent.streamFunction = hierarchyStream;
+		expect(leaf?.status).toBe("aborted");
 		await tree.send("1.1", "say hello");
-		expect(leaf.status).toBe("done");
+		expect(leaf?.status).toBe("done");
 	});
 
 	test("shutdown requested by lifecycle listeners waits for the whole run and is reentrant", async () => {

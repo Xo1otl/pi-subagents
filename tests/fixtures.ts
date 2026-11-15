@@ -21,6 +21,7 @@ import {
 	DefaultResourceLoader,
 	type ExtensionContext,
 	type ExtensionFactory,
+	initTheme,
 	ModelRuntime,
 	SessionManager,
 	SettingsManager,
@@ -28,19 +29,22 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import {
 	type Component,
+	CURSOR_MARKER,
 	KeybindingsManager,
 	stripTerminalSequences,
 	type Terminal,
 	Text,
 	TUI_KEYBINDINGS,
 	TuiAltScreen,
+	visibleWidth,
 } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
 import {
 	createSubagentIntegration,
 	createSubagentRuntime,
 	type SubagentView,
 } from "../agent/index.ts";
-import { REPORT_TOOL, SUBAGENT_REMINDER_TYPE } from "../agent/protocol.ts";
+import { REPORT_TOOL } from "../agent/protocol.ts";
 import { errorMessage } from "../runtime/errors.ts";
 import type { SpawnContext, Subagent, Subagents } from "../runtime/index.ts";
 import { SUBAGENT_USAGE_KIND } from "../runtime/summary.ts";
@@ -48,7 +52,6 @@ import { SWITCHER_OVERLAY } from "../ui/switcher.ts";
 import protocolFixture, {
 	isProtocolMessage,
 	lastCompletion,
-	lastCustomMessage,
 } from "./protocol.ts";
 
 export {
@@ -64,12 +67,16 @@ export {
 const root = mkdtempSync(join(tmpdir(), "pi-subagents-test-"));
 afterAll(() => rmSync(root, { recursive: true, force: true }));
 
+// Markdown follows Pi's active theme, which is global: set it once for every
+// file rather than leaving it to whichever test happens to run first.
+initTheme("dark");
+
 /** Gates left closed by a test, opened first so that no cleanup waits on them. */
 const gates: (() => void)[] = [];
 /** Resources, released in reverse order of acquisition. */
 const cleanups: (() => unknown)[] = [];
-/** Globals read by generated extensions, which may run until their session ends. */
-const sharedKeys: symbol[] = [];
+/** Globals through which generated modules reach the test's own extensions. */
+const extensionKeys: symbol[] = [];
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 
 afterEach(async () => {
@@ -82,7 +89,7 @@ afterEach(async () => {
 			errors.push(error);
 		}
 	}
-	for (const key of sharedKeys.splice(0))
+	for (const key of extensionKeys.splice(0))
 		Reflect.deleteProperty(globalThis, key);
 	if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 	else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
@@ -99,16 +106,6 @@ export function deferred() {
 	const gate = Promise.withResolvers<void>();
 	gates.push(() => gate.resolve());
 	return gate;
-}
-
-/** Expose a value to generated extension sources, which Pi loads as separate
- * modules, for the current test. Returns the source expression that reads it.
- */
-export function shared(value: unknown): string {
-	const key = Symbol.for(`pi-subagents.test.${crypto.randomUUID()}`);
-	sharedKeys.push(key);
-	Reflect.set(globalThis, key, value);
-	return `globalThis[Symbol.for(${JSON.stringify(Symbol.keyFor(key))})]`;
 }
 
 /** Remove a completion's full-output file after the test. */
@@ -347,13 +344,6 @@ export const hierarchyStream = stream((context) => {
 					errorMessage: completion.error ?? completion.output,
 				});
 	}
-	// A reminded task reports what it last said.
-	if (lastCustomMessage(context, SUBAGENT_REMINDER_TYPE)) {
-		const previous = context.messages.findLast(
-			(message) => message.role === "assistant",
-		);
-		return report(previous ? contentText(previous.content) : "");
-	}
 	const match = /^nest:(\d+)$/.exec(text);
 	if (match && Number(match[1]) > 0) {
 		return toolCall("subagent", {
@@ -427,17 +417,41 @@ export async function spawnContext(
 	};
 }
 
-/** Install an extension, given as its default export's body, for children. */
+/** Install an extension for children. Pi loads it from their agent directory
+ * as a separate module, which exports the factory given, for the current test.
+ */
 export async function childExtension(
 	{ agentDir }: { agentDir: string },
 	name: string,
-	body: string,
+	factory: ExtensionFactory,
 ): Promise<void> {
+	const key = Symbol.for(`pi-subagents.test.${crypto.randomUUID()}`);
+	extensionKeys.push(key);
+	Reflect.set(globalThis, key, factory);
 	await writeFile(
 		join(agentDir, "extensions", `${name}.js`),
-		`export default function(pi) {\n${body}\n}`,
+		`export default globalThis[Symbol.for(${JSON.stringify(Symbol.keyFor(key))})];`,
 	);
 }
+
+/** A configured bash override, e.g. remote execution, which tracking must
+ * leave alone.
+ */
+export const remoteBash: ExtensionFactory = (pi) => {
+	pi.registerTool({
+		name: "bash",
+		label: "Remote bash",
+		description: "Remote execution",
+		parameters: Type.Object({ command: Type.Optional(Type.String()) }),
+		promptGuidelines: ["REMOTE_BASH_MARKER"],
+		async execute() {
+			return {
+				content: [{ type: "text", text: "remote result" }],
+				details: undefined,
+			};
+		},
+	});
+};
 
 export interface ParentOptions {
 	streamFn?: Provider["streamSimple"];
@@ -459,19 +473,12 @@ export async function parentSession({
 	onChildLoad,
 }: ParentOptions = {}) {
 	const context = await spawnContext(streamFn);
-	const child = shared({
-		provider: testProvider(streamFn),
-		onChildStart,
-		onChildLoad,
+	await childExtension(context, "provider", (pi) => {
+		pi.registerProvider(testProvider(streamFn));
+		onChildLoad?.(pi);
+		if (onChildStart)
+			pi.on("session_start", (_event, ctx) => onChildStart(ctx));
 	});
-	await childExtension(
-		context,
-		"provider",
-		`const shared = ${child};
-		pi.registerProvider(shared.provider);
-		shared.onChildLoad?.(pi);
-		if (shared.onChildStart) pi.on("session_start", (_event, ctx) => shared.onChildStart(ctx));`,
-	);
 	const settingsManager = SettingsManager.inMemory(QUIET_SETTINGS);
 	const resourceLoader = new DefaultResourceLoader({
 		cwd: context.cwd,
@@ -569,21 +576,21 @@ export async function rootSession({
 /** A child tool that blocks its step until released or cancelled. */
 export async function blockingTool(context: { agentDir: string }) {
 	const release = deferred();
-	await childExtension(
-		context,
-		"blocking",
-		`pi.registerTool({
-			name: "blocking", label: "Blocking", description: "Blocks until released",
-			parameters: { type: "object", properties: {} },
+	await childExtension(context, "blocking", (pi) => {
+		pi.registerTool({
+			name: "blocking",
+			label: "Blocking",
+			description: "Blocks until released",
+			parameters: Type.Object({}),
 			async execute(_id, _args, signal) {
-				await Promise.race([
-					${shared(release.promise)},
-					new Promise((_resolve, reject) => signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true })),
-				]);
-				return { content: [{ type: "text", text: "tool done" }], details: undefined };
+				await Promise.race([release.promise, waiting(signal)]);
+				return {
+					content: [{ type: "text", text: "tool done" }],
+					details: undefined,
+				};
 			},
-		});`,
-	);
+		});
+	});
 	return release;
 }
 
@@ -613,6 +620,7 @@ export function waiting(signal?: AbortSignal): Promise<never> {
 	});
 }
 
+/** Wait for a state that events lead to, however long they take to arrive. */
 export async function until(
 	predicate: () => boolean,
 	timeoutMs = 5000,
@@ -622,7 +630,7 @@ export async function until(
 		if (predicate()) return;
 		await Bun.sleep(1);
 	}
-	throw new Error("Timed out waiting for test state");
+	throw new Error(`Timed out waiting until ${predicate}`);
 }
 
 /** pi's fullscreen renderer on a fake terminal, below a long root transcript.
@@ -630,7 +638,7 @@ export async function until(
  */
 export function fullscreen({ columns = 100, rows = 24 } = {}) {
 	let send = (_data: string) => {};
-	let lastWrite = "";
+	let mounted: Component | undefined;
 	const terminal: Terminal = {
 		columns,
 		rows,
@@ -640,9 +648,7 @@ export function fullscreen({ columns = 100, rows = 24 } = {}) {
 		},
 		stop() {},
 		drainInput: async () => {},
-		write(data) {
-			lastWrite = data;
-		},
+		write() {},
 		moveBy() {},
 		hideCursor() {},
 		showCursor() {},
@@ -674,6 +680,7 @@ export function fullscreen({ columns = 100, rows = 24 } = {}) {
 		}),
 		/** Like ctx.ui.custom() with the switcher's overlay options. */
 		mount(component: Component) {
+			mounted = component;
 			const overlay = tui.showOverlay(component, SWITCHER_OVERLAY);
 			tui.renderNow();
 			return overlay;
@@ -703,16 +710,18 @@ export function fullscreen({ columns = 100, rows = 24 } = {}) {
 			if (row < 0) throw new Error(`${text} is not visible`);
 			return row;
 		},
-		/** The hardware cursor that the last frame placed, if any. */
+		/** Where the mounted component asks for the cursor, in its own rows:
+		 * a focused component marks the position, as pi-tui's contract has it.
+		 */
 		cursor(): { row: number; col: number } | undefined {
-			tui.renderNow();
-			// The cursor move just before hiding/showing it and ending the frame.
-			const match =
-				// biome-ignore lint/suspicious/noControlCharactersInRegex: Terminal escape sequences.
-				/\x1b\[(\d+);(\d+)H\x1b\[\?25[hl]\x1b\[\?2026l$/.exec(lastWrite);
-			return match
-				? { row: Number(match[1]) - 1, col: Number(match[2]) - 1 }
-				: undefined;
+			const lines = mounted?.render(columns) ?? [];
+			const row = lines.findIndex((line) => line.includes(CURSOR_MARKER));
+			const line = lines[row];
+			if (line === undefined) return undefined;
+			return {
+				row,
+				col: visibleWidth(line.slice(0, line.indexOf(CURSOR_MARKER))),
+			};
 		},
 	};
 	return harness;
