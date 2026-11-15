@@ -64,7 +64,7 @@ function reportTool({ runtime, id }: SessionOwner) {
 					{
 						type: "text",
 						text: stopped.length
-							? `Report recorded; leftovers stopped: ${stopped.join("; ")}. Reporting again replaces it.`
+							? `Report recorded; leftovers stopped: ${stopped.join("; ")}. This report stands unless you report again.`
 							: "Report recorded.",
 					},
 				],
