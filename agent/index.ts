@@ -372,7 +372,7 @@ export function createSubagentIntegration(
 	return defineTool({
 		name: "subagent",
 		label: "Subagent",
-		description: "Start a child agent (reports back when done).",
+		description: "Start an async child agent (reports back when done).",
 		parameters: Type.Object({
 			instructions: Type.String({ minLength: 1 }),
 			model: Type.Optional(Type.String({ minLength: 1 })),

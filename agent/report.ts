@@ -51,7 +51,7 @@ function reportTool({ runtime, id }: SessionOwner) {
 					content: [
 						{
 							type: "text",
-							text: "Not delivered: your parent already has your result.",
+							text: "Not delivered: your parent already has your report.",
 						},
 					],
 					details,
@@ -64,7 +64,7 @@ function reportTool({ runtime, id }: SessionOwner) {
 					{
 						type: "text",
 						text: stopped.length
-							? `Report recorded; leftovers stopped: ${stopped.join("; ")}. This report stands unless you report again.`
+							? `Report recorded; stopped leftovers: ${stopped.join("; ")}. This report stands unless you report again.`
 							: "Report recorded.",
 					},
 				],

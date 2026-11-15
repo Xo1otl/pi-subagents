@@ -93,7 +93,7 @@ function commandUnknown(
 	const seconds = UNKNOWN_STATUS_REPORT_MS / 1000;
 	return {
 		customType: COMMAND_UNKNOWN_TYPE,
-		content: `PGID ${pgid} status unknown for ${seconds}s (${commandPreview(reason)}); not stopped, still watched, exit notified once seen: ${commandPreview(command)}`,
+		content: `PGID ${pgid} status unknown for ${seconds}s (${commandPreview(reason)}); not stopped, still tracked; notifies once exit is seen: ${commandPreview(command)}`,
 		display: true,
 		details: { pgid, command, cwd, error: reason },
 	};
@@ -255,7 +255,7 @@ export function trackCommands(
 				if (pgid !== undefined)
 					options.onData(
 						Buffer.from(
-							`${endsLine ? "" : "\n"}[PGID ${pgid} running; exit will be notified]\n`,
+							`${endsLine ? "" : "\n"}[PGID ${pgid} running; notifies on exit]\n`,
 						),
 					);
 				await rm(directory, { recursive: true, force: true }).catch(fail);
@@ -293,7 +293,7 @@ export function trackCommands(
 			...bash,
 			promptGuidelines: [
 				...(bash.promptGuidelines ?? []),
-				"BG jobs (e.g. `nohup cmd > log 2>&1 &`) notify and wake you on exit, so go idle rather than poll with FG `sleep`. Output/exit code not included—log to a file. To outlive the session, use `setsid -f cmd`, not `… && setsid cmd &` (subshell stays in bash's tracked PGID).",
+				"BG jobs (e.g. `nohup cmd > log 2>&1 &`) are tracked and notify/wake you on exit, so go idle rather than poll in FG. Output/exit code not included—log to a file. To outlive the session, use `setsid -f cmd`, not `… && setsid cmd &` (subshell stays in bash's tracked PGID).",
 			],
 			// Replace execution without enabling a tool excluded by defaultTools.
 			defaultActive: false,
