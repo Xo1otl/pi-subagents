@@ -4,6 +4,12 @@ import { Text } from "@earendil-works/pi-tui";
 import extension from "../index.ts";
 import { parentSession } from "./fixtures.ts";
 
+const renderOptions = {
+	outputPad: 0,
+	keyText: () => "",
+	keyHint: (_key: string, description: string) => description,
+};
+
 test.each([false, true])(
 	"other extensions can wrap subagent renderers regardless of load order (%s)",
 	async (wrapperFirst) => {
@@ -79,7 +85,7 @@ test.each([false, true])(
 		};
 		const collapsed = completionRenderer?.(
 			message,
-			{ expanded: false, outputPad: 0 },
+			{ expanded: false, ...renderOptions },
 			theme,
 		)
 			?.render(120)
@@ -87,7 +93,7 @@ test.each([false, true])(
 		expect(collapsed).toContain("completion line 0");
 		expect(collapsed).not.toContain("completion line 19");
 		expect(
-			completionRenderer?.(message, { expanded: true, outputPad: 0 }, theme)
+			completionRenderer?.(message, { expanded: true, ...renderOptions }, theme)
 				?.render(120)
 				.join("\n"),
 		).toContain("completion line 19");

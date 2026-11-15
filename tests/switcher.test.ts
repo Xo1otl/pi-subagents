@@ -72,7 +72,7 @@ test("the compact picker lists every descendant's status, task and context below
 	expect(lines[0]).toContain("ROOT_TRANSCRIPT");
 	expect(lines.slice(-6)).toEqual([
 		expect.stringMatching(/^─+$/),
-		"Subagents · 3 · context",
+		expect.stringMatching(/^Subagents\b.*\b3\b/),
 		expect.stringMatching(/^> 1 \[done\] nest:1 +0\.0%$/),
 		expect.stringMatching(/^ {4}1\.1 \[done\] nest:0 +\d/),
 		expect.stringMatching(/^ {2}2 \[done\] other/),

@@ -3,7 +3,6 @@ import { existsSync } from "node:fs";
 import type { TranscriptContext } from "@earendil-works/pi-ai";
 import type {
 	AgentSession,
-	ExtensionContext,
 	ExtensionFactory,
 } from "@earendil-works/pi-coding-agent";
 import {
@@ -32,14 +31,10 @@ async function setup(
 		context: TranscriptContext,
 		signal?: AbortSignal,
 	) => string | Promise<string>,
-	{
-		mode,
-		extensions,
-	}: { mode?: ExtensionContext["mode"]; extensions?: ExtensionFactory[] } = {},
+	extensions?: ExtensionFactory[],
 ) {
 	let job: ReturnType<typeof backgroundJob> | undefined;
 	const { session, tree } = await rootSession({
-		mode,
 		extensions,
 		streamFn: stream(async (context, options) => {
 			if (lastText(context) === "start job") {
@@ -130,21 +125,6 @@ test("a job exit waits for a busy parent, survives its interrupt, and does not r
 	expect(notified).toBe(0);
 });
 
-test("a one-shot parent waits for its background job and answers the exit", async () => {
-	const { session, job } = await setup(checked, { mode: "print" });
-	let finished = false;
-	const prompt = session.prompt("start job").then(() => {
-		finished = true;
-	});
-	await until(() => session.getLastAssistantText() === "job started");
-	await Bun.sleep(50);
-	expect(finished).toBe(false);
-	await job.release();
-	await prompt;
-	expect(exits(session)).toHaveLength(1);
-	expect(session.getLastAssistantText()).toBe("checked after exit");
-});
-
 test("shutdown stops watching a parent's job without ending it", async () => {
 	const { session, tree, job } = await setup(checked);
 	await session.prompt("start job");
@@ -177,7 +157,7 @@ test("a configured bash override in the parent is neither replaced nor tracked",
 			},
 		});
 	};
-	const { session, job } = await setup(checked, { extensions: [remote] });
+	const { session, job } = await setup(checked, [remote]);
 	expect(session.getToolDefinition("bash")?.promptGuidelines).toEqual([
 		"REMOTE_BASH_MARKER",
 	]);

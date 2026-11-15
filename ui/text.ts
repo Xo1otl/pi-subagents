@@ -13,7 +13,7 @@ export function plain(text: string): string {
 			/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g,
 			"",
 		)
-		.replace(/\t/g, "    ");
+		.replaceAll("\t", "    ");
 }
 
 /** Inline labels must never introduce an extra physical terminal row. */

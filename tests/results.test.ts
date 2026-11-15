@@ -33,11 +33,11 @@ function run(output: string): SubagentResult {
 
 test("running receipts contain only the agent ID and status", () => {
 	const receipt = { id: "1", status: "running" as const };
-	expect(subagentReceipt({ id: "1" })).toEqual({
-		content: [{ type: "text", text: JSON.stringify(receipt) }],
-		details: receipt,
-		structuredContent: receipt,
-	});
+	const { content, details, structuredContent } = subagentReceipt("1");
+	expect(details).toEqual(receipt);
+	expect(structuredContent).toEqual(receipt);
+	// The model reads the same receipt, whatever its formatting.
+	expect(JSON.parse(contentText(content))).toEqual(receipt);
 });
 
 test("completions carry the output and omit redundant hierarchy fields", async () => {
@@ -89,7 +89,7 @@ test("renders partial calls and background receipts with switcher guidance", () 
 		renderSubagentResult(result, { expanded: false, isPartial }, theme)
 			.render(80)
 			.join("\n");
-	const receipt = subagentReceipt({ id: "2" });
+	const receipt = subagentReceipt("2");
 	expect(render(receipt, true)).not.toContain("/subagents");
 	expect(render(receipt, false)).toContain("/subagents 2");
 });

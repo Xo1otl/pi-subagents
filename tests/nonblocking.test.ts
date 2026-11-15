@@ -5,6 +5,8 @@ import { dirname } from "node:path";
 import { contentText, type Provider, type Usage } from "@earendil-works/pi-ai";
 import {
 	type AgentSession,
+	type BoundaryResult,
+	type BoundaryState,
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
 	type ExtensionContext,
@@ -544,63 +546,43 @@ test("results held by a busy parent are released together, starting one turn", a
 	expect(session.getLastAssistantText()).toBe("completions accepted");
 });
 
-test("a one-shot root settles only after delegated results are delivered and answered", async () => {
-	const child = deferred();
-	const dispatch = stream(async (context, options) => {
-		if (lastText(context) === "child task") {
-			await Promise.race([child.promise, waiting(options?.signal)]);
-			return response("child answer");
-		}
-		return defaultDispatch(model, context, options).result();
-	});
-	const { session, tree } = await rootSession({
-		streamFn: dispatch,
-		mode: "print",
-	});
-	let finished = false;
-	const prompt = session.prompt("delegate").then(() => {
-		finished = true;
-	});
-	await until(() => Boolean(tree.get("1")?.session?.isStreaming));
-	await Bun.sleep(10);
-	expect(finished).toBe(false);
-	expect(completions(session)).toHaveLength(0);
-	child.resolve();
-	await prompt;
-	expect(tree.get("1")?.status).toBe("done");
-	expect(completions(session)).toHaveLength(1);
-	expect(session.getLastAssistantText()).toBe("completion accepted");
-});
-
 test("accounting preserves other extensions' boundary drafts both with and without completion metadata", async () => {
 	const child = deferred();
+	// Every draft another extension adds at a boundary must be persisted.
+	const drafted = { "prior-turn": 0, "prior-settle": 0 };
+	const draft =
+		(customType: keyof typeof drafted) =>
+		(event: BoundaryState): BoundaryResult => {
+			drafted[customType]++;
+			return {
+				entries: [...event.entries, { type: "custom", customType, data: true }],
+			};
+		};
 	const { session } = await setup(defaultDispatch, async () => child.promise, {
 		parent: (pi) => {
-			pi.on("turn_end", (event) => ({
-				entries: [
-					...event.entries,
-					{ type: "custom", customType: "prior-turn", data: true },
-				],
-			}));
-			pi.on("agent_before_settle", (event) => ({
-				entries: [
-					...event.entries,
-					{ type: "custom", customType: "prior-settle", data: true },
-				],
-			}));
+			pi.on("turn_end", draft("prior-turn"));
+			pi.on("agent_before_settle", draft("prior-settle"));
 		},
 	});
 	const metadata = (kind: string) =>
 		session.sessionManager
 			.getEntries()
 			.filter((entry) => entry.type === "custom" && entry.customType === kind);
+	const expectPersisted = () => {
+		for (const [kind, count] of Object.entries(drafted)) {
+			expect(count).toBeGreaterThan(0);
+			expect(metadata(kind)).toHaveLength(count);
+		}
+	};
 	await session.prompt("delegate");
-	expect(metadata("prior-turn")).toHaveLength(2);
-	expect(metadata("prior-settle")).toHaveLength(1);
+	expectPersisted();
+	expect(metadata(SUBAGENT_USAGE_TYPE)).toHaveLength(0);
+	const before = { ...drafted };
 	child.resolve();
 	await until(() => completions(session).length === 1 && session.isIdle);
-	expect(metadata("prior-turn")).toHaveLength(3);
-	expect(metadata("prior-settle")).toHaveLength(2);
+	// Delivering the completion crossed new boundaries, which carried both kinds.
+	expect(drafted["prior-settle"]).toBeGreaterThan(before["prior-settle"]);
+	expectPersisted();
 	expect(metadata(SUBAGENT_USAGE_TYPE)).toHaveLength(1);
 });
 

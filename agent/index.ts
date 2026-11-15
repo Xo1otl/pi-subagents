@@ -84,8 +84,6 @@ interface SessionBinding {
 	pendingCompletions: Set<SubagentCompletionMessage>;
 	/** Root notices wait here while it is busy: an interrupt clears pi's queue. */
 	held: Notice[];
-	/** A one-shot root holds notices until all of its background work has finished. */
-	awaitingResults: boolean;
 }
 
 /** Wire Pi's lifecycle and return the undecorated, machine-facing tool. */
@@ -146,6 +144,11 @@ export function createSubagentIntegration(
 		}
 	}
 
+	/** The binding, while it still belongs to the context's session. */
+	function current(ctx: ExtensionContext): SessionBinding | undefined {
+		return binding && isCurrent(binding, ctx) ? binding : undefined;
+	}
+
 	/** Persist held root notices in order; only the last may start a turn. */
 	function release(source: SessionBinding, triggerTurn: boolean): void {
 		const messages = source.held.splice(0);
@@ -162,8 +165,7 @@ export function createSubagentIntegration(
 	}
 
 	function releaseIfIdle(source: SessionBinding, ctx: ExtensionContext): void {
-		if (isCurrent(source, ctx) && ctx.isIdle() && !source.awaitingResults)
-			release(source, true);
+		if (isCurrent(source, ctx) && ctx.isIdle()) release(source, true);
 	}
 
 	// A delegated session's jobs belong to its run (see delegatedCommands). The
@@ -174,8 +176,8 @@ export function createSubagentIntegration(
 		: trackCommands(pi, {
 				ownsJobs: false,
 				track(work, ctx) {
-					const source = binding;
-					if (!source || !isCurrent(source, ctx)) {
+					const source = current(ctx);
+					if (!source) {
 						// No session is left to tell.
 						void work.catch(() => {});
 						return;
@@ -187,15 +189,15 @@ export function createSubagentIntegration(
 								`Background command tracking failed: ${errorMessage(error)}`,
 								"error",
 							);
-							// Print and JSON modes have no notifications; keep the
-							// rejection for the runtime's shutdown report.
+							// Not every mode shows notifications; keep the rejection
+							// for the runtime's shutdown report.
 							throw error;
 						}),
 					);
 				},
 				listener(ctx) {
-					const source = binding;
-					if (!source || !isCurrent(source, ctx)) return undefined;
+					const source = current(ctx);
+					if (!source) return undefined;
 					return (message) => {
 						if (!isCurrent(source, ctx)) return;
 						source.held.push(message);
@@ -205,8 +207,7 @@ export function createSubagentIntegration(
 			});
 
 	function takeAccounting(ctx: ExtensionContext): SessionBoundaryDraft[] {
-		if (!binding || !isCurrent(binding, ctx)) return [];
-		return binding.accounting.splice(0);
+		return current(ctx)?.accounting.splice(0) ?? [];
 	}
 
 	// Custom drafts persist metadata, not model context. Boundary drafts cannot
@@ -279,9 +280,9 @@ export function createSubagentIntegration(
 	}
 
 	pi.on("agent_start", (_event, ctx) => {
-		const source = binding;
+		const source = current(ctx);
 		// Interrupting the root stops its turn, never the delivery of results.
-		if (!owner || !source || !isCurrent(source, ctx)) return;
+		if (!owner || !source) return;
 		source.stopWatchingAbort();
 		const signal = ctx.signal;
 		const fence = () => {
@@ -294,10 +295,9 @@ export function createSubagentIntegration(
 			signal?.removeEventListener("abort", fence);
 	});
 	pi.on("message_end", (event, ctx) => {
-		const source = binding;
+		const source = current(ctx);
 		if (
 			!source ||
-			!isCurrent(source, ctx) ||
 			event.message.role !== "custom" ||
 			event.message.customType !== SUBAGENT_RESULT_TYPE
 		)
@@ -308,8 +308,8 @@ export function createSubagentIntegration(
 				source.pendingCompletions.delete(message);
 	});
 	pi.on("agent_settled", async (event, ctx) => {
-		const source = binding;
-		if (source && isCurrent(source, ctx)) {
+		const source = current(ctx);
+		if (source) {
 			source.stopWatchingAbort();
 			if (owner) {
 				if (event.aborted) source.abortEpoch++;
@@ -317,18 +317,8 @@ export function createSubagentIntegration(
 				if (event.aborted && source.runtime.get(owner.id)?.cancelled)
 					await discardPending(source);
 			} else {
-				if (ctx.mode === "print" || ctx.mode === "json") {
-					// One-shot modes exit after settling, which would cancel delegated
-					// work and leave command exits untold.
-					source.awaitingResults = true;
-					try {
-						await source.runtime.settled(ROOT);
-					} finally {
-						source.awaitingResults = false;
-					}
-				}
 				// After an interrupt, keep the results without restarting the turn.
-				if (isCurrent(source, ctx)) release(source, !event.aborted);
+				release(source, !event.aborted);
 			}
 		}
 		// Aborted runs may skip the final actionable boundary.
@@ -358,7 +348,6 @@ export function createSubagentIntegration(
 			accounting: [],
 			pendingCompletions: new Set(),
 			held: [],
-			awaitingResults: false,
 		};
 		// Delegated sessions stay headless, even under a configured installation.
 		if (!owner) view?.bind(runtime, ctx);
@@ -397,8 +386,8 @@ export function createSubagentIntegration(
 			ctx,
 		) {
 			signal?.throwIfAborted();
-			const source = binding;
-			if (!source || !isCurrent(source, ctx))
+			const source = current(ctx);
+			if (!source)
 				throw new Error("Subagent parent session is no longer active.");
 			const tree = source.runtime;
 			const epoch = source.abortEpoch;
@@ -425,7 +414,7 @@ export function createSubagentIntegration(
 					throw error;
 				});
 			tree.trackCompletion(parentId, completion);
-			return subagentReceipt(started);
+			return subagentReceipt(started.id);
 		},
 	});
 }

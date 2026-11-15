@@ -17,7 +17,7 @@ export class ChatEditor extends Editor {
 	}
 
 	override render(width: number): string[] {
-		// Pi 1.2's word wrapper still overflows the stack below three columns.
+		// Pi's word wrapper overflows below three columns; render wider and cut.
 		if (width >= 3) return super.render(width);
 		return super.render(3).map((line) => truncateToWidth(line, width, ""));
 	}

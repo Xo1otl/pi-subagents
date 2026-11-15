@@ -84,11 +84,7 @@ export function isSubagentReceipt(
 	);
 }
 
-export function subagentReceipt({
-	id,
-}: {
-	id: string;
-}): AgentToolResult<SubagentReceipt> {
+export function subagentReceipt(id: string): AgentToolResult<SubagentReceipt> {
 	const receipt: SubagentReceipt = { id, status: "running" };
 	return {
 		content: [{ type: "text", text: JSON.stringify(receipt) }],

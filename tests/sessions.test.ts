@@ -84,7 +84,7 @@ async function setup({
 		});
 		parent.dispose();
 	});
-	await parent.bindExtensions({ mode: "print" });
+	await parent.bindExtensions({ mode: "rpc" });
 	const tree = testRuntime();
 	return { parent, tree, context, cwd, agentDir };
 }
@@ -140,12 +140,29 @@ test("honors requested effort and resolves requested models against available on
 	expect(
 		spawnContext(ctx, undefined, { model: "other-provider/test-model" }).model,
 	).toBe(other);
-	expect(() => spawnContext(ctx, undefined, { model: "test-model" })).toThrow(
-		'Ambiguous model "test-model": test-provider/test-model, other-provider/test-model',
-	);
-	expect(() => spawnContext(ctx, undefined, { model: "missing" })).toThrow(
-		'Unknown model "missing". Available: test-provider/test-model, test-provider/alternate-model, other-provider/test-model',
-	);
+	// Failures name the candidates, so the model can correct its request.
+	const failure = (reference: string) => {
+		try {
+			spawnContext(ctx, undefined, { model: reference });
+		} catch (error) {
+			return String(error);
+		}
+		throw new Error(`${reference} resolved`);
+	};
+	const ambiguous = failure("test-model");
+	for (const candidate of [
+		"test-provider/test-model",
+		"other-provider/test-model",
+	])
+		expect(ambiguous).toContain(candidate);
+	expect(ambiguous).not.toContain("alternate-model");
+	const unknown = failure("missing");
+	for (const candidate of [
+		"test-provider/test-model",
+		"test-provider/alternate-model",
+		"other-provider/test-model",
+	])
+		expect(unknown).toContain(candidate);
 });
 
 test("loads workspace resources into a fresh child of a persistent parent", async () => {

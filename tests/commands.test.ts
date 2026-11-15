@@ -4,6 +4,7 @@ import { once } from "node:events";
 import { existsSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { contentText } from "@earendil-works/pi-ai";
 import {
 	isProcessGroupActive,
 	waitForGroupToFinish,
@@ -142,21 +143,24 @@ test.each(["nohup", ""])(
 		expect(existsSync(first.finished)).toBe(true);
 		expect(existsSync(second.finished)).toBe(true);
 		expect(exits(tree)).toHaveLength(2);
-		// The launch result names the group; its exit notice stays one line.
-		const pgid = await first.pgid();
-		const messages = tree.get("1")?.session?.messages ?? [];
-		expect(
-			messages.some(
+		// The launch result names the group, so its exit notice can stay short:
+		// one bounded line, while details keep the full command.
+		const pgid = String(await first.pgid());
+		const launch = tree
+			.get("1")
+			?.session?.messages.find(
 				(message) =>
-					message.role === "toolResult" &&
-					JSON.stringify(message.content).includes(
-						`[PGID ${pgid} running; exit will be notified]`,
-					),
-			),
-		).toBe(true);
-		expect(exits(tree)[0]).toMatchObject({
-			content: `PGID ${pgid} exited: ${first.command.slice(0, 200)} …`,
-		});
+					message.role === "toolResult" && message.toolName === "bash",
+			);
+		if (launch?.role !== "toolResult") throw new Error("Missing launch");
+		expect(contentText(launch.content)).toContain(pgid);
+		const exit = exits(tree)[0];
+		if (exit?.role !== "custom") throw new Error("Missing exit");
+		const notice = contentText(exit.content);
+		expect(notice).toContain(pgid);
+		expect(notice).not.toContain("\n");
+		expect(notice.length).toBeLessThan(first.command.length);
+		expect(exit.details).toMatchObject({ command: first.command });
 	},
 );
 

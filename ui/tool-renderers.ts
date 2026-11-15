@@ -10,6 +10,8 @@ const PREVIEW_LINES = 8;
 const PREVIEW_COLUMNS = 240;
 const CALL_PREVIEW_COLUMNS = 160;
 
+const viewHint = (id: string) => `\n/subagents ${id} · view conversation`;
+
 export function renderSubagentCall(args: unknown, theme: UITheme): Text {
 	const instructions =
 		args && typeof args === "object" && "instructions" in args
@@ -32,29 +34,30 @@ export function renderSubagentResult(
 	theme: UITheme,
 ): Text {
 	if (isPartial) return new Text(theme.fg("muted", "Delegating…"), 0, 0);
-	const text = plain(contentText(result.content));
 	if (isSubagentReceipt(result.details)) {
 		const { id } = result.details;
 		return new Text(
 			theme.fg("muted", `Subagent ${id} · running in background`) +
-				theme.fg("dim", `\n/subagents ${id} · view conversation`),
+				theme.fg("dim", viewHint(id)),
 			0,
 			0,
 		);
 	}
 	const id = subagentId(result.details);
-	const lines = text.split("\n");
+	const lines = plain(contentText(result.content)).split("\n");
 	const preview = expanded
-		? text
+		? lines
 		: lines
 				.slice(0, PREVIEW_LINES)
-				.map((line) => line.slice(0, PREVIEW_COLUMNS))
-				.join("\n");
-	const hint = id ? `\n/subagents ${id} · view conversation` : "";
-	const hidden = expanded ? 0 : lines.length - PREVIEW_LINES;
+				.map((line) => line.slice(0, PREVIEW_COLUMNS));
+	const hidden = lines.length - preview.length;
 	const more =
 		hidden > 0
 			? theme.fg("dim", `\n… ${hidden} more lines · Ctrl+O to expand`)
 			: "";
-	return new Text(preview + more + theme.fg("dim", hint), 0, 0);
+	return new Text(
+		preview.join("\n") + more + theme.fg("dim", id ? viewHint(id) : ""),
+		0,
+		0,
+	);
 }

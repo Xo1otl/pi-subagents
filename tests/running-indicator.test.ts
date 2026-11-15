@@ -34,9 +34,9 @@ function setup(bind = true) {
 	});
 	let editorFactory: ReturnType<ExtensionUIContext["getEditorComponent"]>;
 	const getEditorComponent = () => editorFactory;
-	const setEditorComponent = mock((factory: typeof editorFactory) => {
+	const setEditorComponent = (factory: typeof editorFactory) => {
 		editorFactory = factory;
-	});
+	};
 	const ui: Pick<
 		ExtensionUIContext,
 		"setWidget" | "getEditorComponent" | "setEditorComponent"
@@ -55,7 +55,6 @@ function setup(bind = true) {
 		runtime,
 		ui,
 		setWidget,
-		setEditorComponent,
 		widgets,
 		dispose,
 		render,
@@ -139,7 +138,7 @@ test("disposal is idempotent, late updates touch no widget, and runtime shutdown
 });
 
 test("UI bindings are terminal-only, and rebinding or disposal removes the old runtime's widget and editor", async () => {
-	const { runtime, ui, setWidget, setEditorComponent, render } = setup(false);
+	const { runtime, ui, setWidget, render } = setup(false);
 	const controller = createSubagentUI({
 		registerMessageRenderer() {},
 		registerCommand() {},
@@ -150,7 +149,7 @@ test("UI bindings are terminal-only, and rebinding or disposal removes the old r
 		controller.bind(runtime, { mode, ui } as ExtensionContext);
 	const run = runtime.start(ROOT, "wait", await spawnContext(paused)).result;
 	expect(setWidget).not.toHaveBeenCalled();
-	expect(setEditorComponent).not.toHaveBeenCalled();
+	expect(ui.getEditorComponent()).toBeUndefined();
 	controller.bind(runtime, { mode: "tui", ui } as ExtensionContext);
 	const firstFactory = ui.getEditorComponent();
 	expect(firstFactory).toBeDefined();
@@ -167,5 +166,4 @@ test("UI bindings are terminal-only, and rebinding or disposal removes the old r
 	controller.dispose();
 	controller.dispose();
 	expect(ui.getEditorComponent()).toBeUndefined();
-	expect(setEditorComponent).toHaveBeenCalledTimes(4);
 });

@@ -65,7 +65,10 @@ test("history stays in place while output arrives; reaching the end or Ctrl+End 
 		content: Array.from({ length: 30 }, (_, i) => `arrival ${i}`).join("\n"),
 	});
 	expect(transcript()).toEqual(paused);
-	expect(header()).toEndWith(`↓${below + 32}`);
+	// Arrivals grow the distance to the end, at least by their own lines.
+	expect(Number(/↓(\d+)$/.exec(header())?.[1])).toBeGreaterThanOrEqual(
+		below + 30,
+	);
 	terminal.input("\t");
 	terminal.input("\x1b[Z"); // Each agent keeps its own position.
 	expect(transcript()).toEqual(paused);

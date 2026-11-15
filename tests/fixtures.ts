@@ -351,8 +351,6 @@ export interface ParentOptions {
 	onChildStart?: (ctx: ExtensionContext) => Promise<void>;
 	/** Loads into each child session. */
 	onChildLoad?: ExtensionFactory;
-	/** Long-lived by default; one-shot modes wait for delegated results before settling. */
-	mode?: ExtensionContext["mode"];
 }
 
 /** A root SDK session, with the same deterministic provider available to
@@ -363,7 +361,6 @@ export async function parentSession({
 	extensions = [],
 	onChildStart,
 	onChildLoad,
-	mode = "rpc",
 }: ParentOptions = {}) {
 	const context = await spawnContext(streamFn);
 	const child = shared({
@@ -414,7 +411,8 @@ export async function parentSession({
 		}
 		session.dispose();
 	});
-	await session.bindExtensions({ mode, shutdownHandler: () => {} });
+	// Long-lived and headless, like pi's RPC mode.
+	await session.bindExtensions({ mode: "rpc", shutdownHandler: () => {} });
 	return session;
 }
 

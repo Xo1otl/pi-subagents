@@ -12,7 +12,7 @@ pi -e ./tools/pi-subagents/index.ts   # or: pi install ./tools/pi-subagents
 - Result arrives later as `subagent-result`; while the parent is busy, results wait and arrive together. Interrupts never drop them.
 - A run finishes when it is idle with no running children or command groups; its last message goes to the parent. Long output is truncated, with a path to the full text.
 - If you talk to a running agent, it answers, then `subagent-resume` returns it to its task or has it restate its result, whatever happened after your message, so the parent never gets a reply meant for you. A finished conversation you continue is yours: no resume, no new result; usage still bills ancestors.
-- One-shot modes (`pi -p`, `--mode json`) wait for all results.
+- One-shot modes (`pi -p`, `--mode json`) are unsupported: pi exits after its reply, cancelling delegated runs.
 - Each subagent's session is saved beside its parent's file, in a directory named after it (`<parent>.jsonl` → `<parent>/<child>.jsonl`, nesting likewise), out of `/resume` lists. A parent without a file (`--no-session`) keeps children in memory. Saved sessions are records only: runs are not restored after a restart.
 - Changing sessions, reloading, or exiting cancels delegated runs.
 
