@@ -11,7 +11,7 @@ import {
  * the tool's declaration alone, models answered their task in the chat and
  * reported only once reminded; terser wording did not hold.
  */
-const ROLE = `You are a subagent. Only the first message is from your parent, who can't see this chat; when the task is done, send the result via \`${REPORT_TOOL}\`.`;
+const ROLE = `You are a subagent. Your parent sees what you send via \`${REPORT_TOOL}\`, not this chat. Mid-run interjections come from the user, not the parent.`;
 
 /** Give a delegated session its role and the tool that delivers its result.
  * The role is the session's, not the tool's, and only while it serves its
@@ -38,7 +38,7 @@ function reportTool({ runtime, id }: SessionOwner) {
 		name: REPORT_TOOL,
 		label: "Report",
 		description:
-			"Call when all work is done (auto-terminates child agents and tracked bg jobs).",
+			"Submit your final report once all work is done (auto-terminates child agents and tracked BG jobs).",
 		parameters: Type.Object({ result: Type.String({ minLength: 1 }) }),
 		// Only the model's own calls can end its turn.
 		exposure: "model-only",

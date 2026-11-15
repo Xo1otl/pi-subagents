@@ -9,7 +9,7 @@ pi -e ./tools/pi-subagents/index.ts   # or: pi install ./tools/pi-subagents
 ## Delegation
 
 - `subagent` starts a headless session in the same workspace (current model/effort unless `model`/`effort` given) and returns a receipt at once.
-- A subagent delivers its result with `report_to_parent`. While its parent's task runs, its system prompt gains one `<subagent_role>` section: only the first message is from its parent, who can't see the chat, and the result goes via `report_to_parent` once the task is done. The report is kept as tool-result state, not picked from the chat, so replies to you or to notices never become the result.
+- A subagent delivers its result with `report_to_parent`. While its parent's task runs, its system prompt gains one `<subagent_role>` section: its parent sees what it sends via `report_to_parent`, not the chat, and mid-run interjections come from the user, not the parent. The report is kept as tool-result state, not picked from the chat, so replies to you or to notices never become the result.
 - Result arrives later as `subagent-result`; while the parent is busy, results wait and arrive together. Interrupts never drop them. Long output is truncated, with a path to the full text.
 - `report_to_parent` stops the children and command groups still running and tells the agent which; their results and exits no longer reach it, and the parent is not told. The agent judges: its report stands if it lets it, or it fixes what it must and reports again. With nothing left, `report_to_parent` ends the turn at once.
 - A run finishes once idle with nothing left to wait for; its latest report goes to the parent.
