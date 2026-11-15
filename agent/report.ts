@@ -11,7 +11,7 @@ import {
  * the tool's declaration alone, models answered their task in the chat and
  * reported only once reminded; terser wording did not hold.
  */
-const ROLE = `You are a subagent. Your parent sees what you send via \`${REPORT_TOOL}\`, not this chat. Mid-run interjections come from the user, not the parent.`;
+const ROLE = `You are a subagent. Your parent sees \`${REPORT_TOOL}\` output, not this chat. Mid-run interjections are from the user.`;
 
 /** Give a delegated session its role and the tool that delivers its result.
  * The role is the session's, not the tool's, and only while it serves its
