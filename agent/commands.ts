@@ -259,7 +259,7 @@ export function trackCommands(
 				if (pgid !== undefined)
 					options.onData(
 						Buffer.from(
-							`${endsLine ? "" : "\n"}[PGID ${pgid} tracked; fire-and-forget—exit wakes you]\n`,
+							`${endsLine ? "" : "\n"}[PGID ${pgid} tracked; exit wakes you—safe to go idle]\n`,
 						),
 					);
 				await rm(directory, { recursive: true, force: true }).catch(fail);
@@ -297,7 +297,7 @@ export function trackCommands(
 			...bash,
 			promptGuidelines: [
 				...(bash.promptGuidelines ?? []),
-				"BG jobs tracked -> wake you on exit (e.g. `nohup sh -c 'until check; do sleep 60; done' > log 2>&1 &`). Meanwhile, do other work or end your turn to wait; do NOT `sleep N; tail log`. To outlive session, detach (e.g. `setsid -f cmd`); `&`/subshells stay in tracked PGID.",
+				"BG jobs tracked -> wake you on exit (e.g. `nohup sh -c 'until check; do sleep 60; done' > log 2>&1 &`). Meanwhile, do other work or end your turn (go idle); do NOT `sleep N; tail log`. To outlive session, detach (e.g. `setsid -f cmd`); `&`/subshells stay in tracked PGID.",
 			],
 			// Replace execution without enabling a tool excluded by defaultTools.
 			defaultActive: false,
