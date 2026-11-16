@@ -297,7 +297,7 @@ export function trackCommands(
 			...bash,
 			promptGuidelines: [
 				...(bash.promptGuidelines ?? []),
-				"BG jobs tracked -> wake you on exit (e.g. `nohup sh -c 'until check; do sleep 60; done' > log 2>&1 &`). Meanwhile, do other work or end your turn (go idle); do NOT `sleep N; tail log`. To outlive session, detach (e.g. `setsid -f cmd`); `&`/subshells stay in tracked PGID.",
+				"BG jobs tracked -> wake you on exit (e.g. `nohup sh -c 'until <check>; do …; done' > log 2>&1 &`). Meanwhile, do other work or end your turn (go idle); NEVER sleep-poll in FG. To outlive session, detach (e.g. `setsid -f cmd`); `&`/subshells stay in tracked PGID.",
 			],
 			// Replace execution without enabling a tool excluded by defaultTools.
 			defaultActive: false,
