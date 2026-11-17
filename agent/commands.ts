@@ -8,6 +8,7 @@ import {
 	type ExtensionAPI,
 	type ExtensionContext,
 	type ExtensionFactory,
+	isToolCallEventType,
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { errorMessage, hasErrorCode } from "../runtime/errors.ts";
@@ -70,6 +71,36 @@ function commandPreview(command: string): string {
 	const first = [...(lines[0]?.trim() ?? "")];
 	const preview = first.slice(0, 200).join("");
 	return first.length > 200 || lines.length > 1 ? `${preview} …` : preview;
+}
+
+/** Claude Code's floor: a shorter sleep, e.g. while a server starts, runs. */
+const SLEEP_LIMIT_SECONDS = 25;
+const SLEEP_UNIT_SECONDS: Readonly<Record<string, number>> = {
+	m: 60,
+	h: 3600,
+	d: 86400,
+};
+
+/** The foreground `sleep` a command starts with, if long enough to be a poll
+ * (`sleep 90; tail log`) that a tracked exit makes needless. A sleep later in
+ * the command, in a loop or sent to the background (`sleep 90 &`) is not one.
+ */
+export function leadingSleep(command: string): string | undefined {
+	const match =
+		/^\s*(sleep((?:[ \t]+(?:\d+(?:\.\d*)?|\.\d+)[smhd]?)+))[ \t]*(?:$|[;\n|]|&&)/.exec(
+			command,
+		);
+	if (!match?.[1] || !match[2]) return undefined;
+	const seconds = match[2]
+		.trim()
+		.split(/\s+/)
+		.reduce(
+			(total, arg) =>
+				total +
+				Number.parseFloat(arg) * (SLEEP_UNIT_SECONDS[arg.at(-1) ?? ""] ?? 1),
+			0,
+		);
+	return seconds >= SLEEP_LIMIT_SECONDS ? match[1] : undefined;
 }
 
 function commandExit(job: CommandJob): CommandExitMessage {
@@ -302,6 +333,18 @@ export function trackCommands(
 			// Replace execution without enabling a tool excluded by defaultTools.
 			defaultActive: false,
 		});
+	});
+	// Prompting alone does not stop sleep-polling; refusing it at the call does.
+	pi.on("tool_call", (event) => {
+		if (!session || !isToolCallEventType("bash", event)) return undefined;
+		const sleep = leadingSleep(event.input.command);
+		return sleep
+			? {
+					block: true,
+					reason:
+						"Blocked: FG sleep ≥25s. With a BG job, you can just go idle—it wakes you on exit.",
+				}
+			: undefined;
 	});
 	// A `!!` command stays out of the model's context, and so does its exit.
 	pi.on("user_bash", (event) =>

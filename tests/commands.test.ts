@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { contentText } from "@earendil-works/pi-ai";
+import { leadingSleep } from "../agent/commands.ts";
 import {
 	isProcessGroupActive,
 	waitForGroupToFinish,
@@ -432,4 +433,39 @@ test("failed commands still wait for jobs they already started and retain shell 
 	expect(JSON.stringify(event.content)).not.toContain(
 		"export PREFIX_VALUE=preserved",
 	);
+});
+
+test.each([
+	["sleep 90; cat log", "sleep 90"],
+	["  sleep 25 && tail log", "sleep 25"],
+	["sleep 1m | cat", "sleep 1m"],
+	["sleep 20 5\ncat log", "sleep 20 5"],
+	["sleep 1.5m", "sleep 1.5m"],
+	["sleep 24; cat log", undefined],
+	["sleep 90 & echo started", undefined],
+	["cd x && sleep 90; cat log", undefined],
+	["until check; do sleep 90; done", undefined],
+	["sleepy 90", undefined],
+])("leadingSleep(%p) is %p", (command, sleep) => {
+	expect(leadingSleep(command)).toBe(sleep);
+});
+
+test("a long leading sleep is refused before it runs", async () => {
+	const tree = testRuntime();
+	const context = await spawnContext(
+		stream((ctx) => {
+			const last = ctx.messages.at(-1);
+			return last?.role === "toolResult"
+				? answer(ctx, `${last.isError}: ${lastText(ctx)}`)
+				: toolCall("bash", { command: `sleep 90; touch ${marker}` });
+		}),
+	);
+	const marker = join(context.cwd, "slept");
+	expect(await tree.start(ROOT, "start", context).result).toMatchObject({
+		status: "done",
+		output: expect.stringContaining(
+			"true: Blocked: FG sleep ≥25s. With a BG job, you can just go idle—it wakes you on exit.",
+		),
+	});
+	expect(existsSync(marker)).toBe(false);
 });
