@@ -317,7 +317,7 @@ export function trackCommands(
 			return undefined;
 		return {
 			block: true,
-			reason: `Blocked: FG sleep ≥${SLEEP_LIMIT_SECONDS}s. A tracked BG job wakes you on exit: go idle or do other work. To wait on anything else, run the wait as one (e.g. \`nohup sh -c 'until <check>; do …; done' > log 2>&1 &\`).`,
+			reason: `Blocked: FG sleep ≥${SLEEP_LIMIT_SECONDS}s. A tracked BG job wakes you on exit: end your turn or do other work. To wait on anything else, run the wait as one (e.g. \`nohup sh -c 'until <check>; do …; done' > log 2>&1 &\`).`,
 		};
 	});
 	// A `!!` command stays out of the model's context, and so does its exit.
