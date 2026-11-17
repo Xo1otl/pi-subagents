@@ -25,7 +25,7 @@ pi -e ./tools/pi-subagents/index.ts   # or: pi install ./tools/pi-subagents
 - A group whose status cannot be read for a minute gets one `bg-unknown`, delivered the same way. It is neither stopped nor dropped: its `bg-exit` still follows.
 - Subagents own their jobs: a run waits for them; a report, Ctrl+C and shutdown stop them.
 - The root watches its own jobs and your `!` commands (`!!` stays private), never stopping them.
-- A bash call that starts with a foreground `sleep` of 25s or more (`sleep 90; tail log`) is refused before it runs, with a reason that points to waiting for the exit instead. Shorter sleeps, and sleeps later in the command or in a loop, run.
+- A bash call whose top-level foreground `sleep`s total 25s or more (`sleep 90; tail log`, `cd x && sleep 90; tail log`, `job & sleep 90; tail log`) is refused before it runs, with a reason that points to waiting for the exit instead, or to a background loop for what no tracked job covers. Shorter sleeps run, as do sleeps sent to the background, in a loop, group or substitution, quoted (`sh -c '…'`) or in a here-document.
 - Untracked: `setsid`/`setpgid` (detach with `setsid -f cmd`), bash overrides, and other tools' processes. On Windows, nothing is tracked.
 
 ## Switcher

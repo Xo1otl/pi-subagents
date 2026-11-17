@@ -27,6 +27,7 @@ import {
 	type CommandMessage,
 	type CommandUnknownMessage,
 } from "./protocol.ts";
+import { foregroundSleepSeconds, SLEEP_LIMIT_SECONDS } from "./sleep.ts";
 
 /** Tells the conversation that ran a command of its exit, or that its status
  * stayed unknown, waking it if idle. The signal aborts once the command's
@@ -71,36 +72,6 @@ function commandPreview(command: string): string {
 	const first = [...(lines[0]?.trim() ?? "")];
 	const preview = first.slice(0, 200).join("");
 	return first.length > 200 || lines.length > 1 ? `${preview} …` : preview;
-}
-
-/** Claude Code's floor: a shorter sleep, e.g. while a server starts, runs. */
-const SLEEP_LIMIT_SECONDS = 25;
-const SLEEP_UNIT_SECONDS: Readonly<Record<string, number>> = {
-	m: 60,
-	h: 3600,
-	d: 86400,
-};
-
-/** The foreground `sleep` a command starts with, if long enough to be a poll
- * (`sleep 90; tail log`) that a tracked exit makes needless. A sleep later in
- * the command, in a loop or sent to the background (`sleep 90 &`) is not one.
- */
-export function leadingSleep(command: string): string | undefined {
-	const match =
-		/^\s*(sleep((?:[ \t]+(?:\d+(?:\.\d*)?|\.\d+)[smhd]?)+))[ \t]*(?:$|[;\n|]|&&)/.exec(
-			command,
-		);
-	if (!match?.[1] || !match[2]) return undefined;
-	const seconds = match[2]
-		.trim()
-		.split(/\s+/)
-		.reduce(
-			(total, arg) =>
-				total +
-				Number.parseFloat(arg) * (SLEEP_UNIT_SECONDS[arg.at(-1) ?? ""] ?? 1),
-			0,
-		);
-	return seconds >= SLEEP_LIMIT_SECONDS ? match[1] : undefined;
 }
 
 function commandExit(job: CommandJob): CommandExitMessage {
@@ -335,16 +306,19 @@ export function trackCommands(
 		});
 	});
 	// Prompting alone does not stop sleep-polling; refusing it at the call does.
+	// A wait on what no tracked job covers (a remote run, a `setsid` job) moves
+	// to a background loop, whose exit is tracked.
 	pi.on("tool_call", (event) => {
-		if (!session || !isToolCallEventType("bash", event)) return undefined;
-		const sleep = leadingSleep(event.input.command);
-		return sleep
-			? {
-					block: true,
-					reason:
-						"Blocked: FG sleep ≥25s. With a BG job, you can just go idle—it wakes you on exit.",
-				}
-			: undefined;
+		if (
+			!session ||
+			!isToolCallEventType("bash", event) ||
+			foregroundSleepSeconds(event.input.command) < SLEEP_LIMIT_SECONDS
+		)
+			return undefined;
+		return {
+			block: true,
+			reason: `Blocked: FG sleep ≥${SLEEP_LIMIT_SECONDS}s. A tracked BG job wakes you on exit: go idle or do other work. To wait on anything else, run the wait as one (e.g. \`nohup sh -c 'until <check>; do …; done' > log 2>&1 &\`).`,
+		};
 	});
 	// A `!!` command stays out of the model's context, and so does its exit.
 	pi.on("user_bash", (event) =>
