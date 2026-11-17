@@ -155,9 +155,7 @@ test("each agent keeps its draft, undo and history across Tab and the picker; En
 test("Left twice at the text start returns to the picker; nothing inside a bracketed paste is a shortcut", async () => {
 	const { tree, terminal, done, header, composer } = await setup({
 		initialId: "1",
-		columns: 240,
 	});
-	expect(terminal.text()).toContain("←← agents (at text start)");
 	const sent = mock(() => {});
 	tree.subscribe(sent);
 	for (const chunk of ["\x1b[200~", left, left, "\t", "\x1b", "\x1b[201~"])

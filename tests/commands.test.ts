@@ -1,6 +1,6 @@
 import { expect, spyOn, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { contentText } from "@earendil-works/pi-ai";
 import { leadingSleep } from "../agent/commands.ts";
@@ -412,11 +412,11 @@ test("failed commands still wait for jobs they already started and retain shell 
 		),
 	);
 	const job = backgroundJob(context.cwd, "failed");
+	const settingsPath = join(context.agentDir, "settings.json");
 	await writeFile(
-		join(context.agentDir, "settings.json"),
+		settingsPath,
 		JSON.stringify({
-			retry: { enabled: false },
-			cacheWarming: "off",
+			...JSON.parse(await readFile(settingsPath, "utf8")),
 			shellPath: "/bin/bash",
 			shellCommandPrefix: "export PREFIX_VALUE=preserved",
 		}),

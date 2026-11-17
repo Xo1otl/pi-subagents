@@ -236,27 +236,49 @@ function recordError(node: SubagentNode, error: unknown): void {
 	node.error ??= errorMessage(error);
 }
 
+type ToolExecutionEvent = Extract<
+	AgentSessionEvent,
+	{ type: `tool_execution_${"start" | "update" | "end"}` }
+>;
+
+function isToolExecution(
+	event: AgentSessionEvent,
+): event is ToolExecutionEvent {
+	return (
+		event.type === "tool_execution_start" ||
+		event.type === "tool_execution_update" ||
+		event.type === "tool_execution_end"
+	);
+}
+
 /** Merge one execution event into the call's raw snapshot. */
 function toolSnapshot(
-	event: Extract<
-		AgentSessionEvent,
-		{ type: `tool_execution_${"start" | "update" | "end"}` }
-	>,
+	event: ToolExecutionEvent,
 	previous: SubagentToolExecution | undefined,
 ): SubagentToolExecution {
-	const ended = event.type === "tool_execution_end";
-	return {
+	const call = {
 		toolCallId: event.toolCallId,
 		toolName: event.toolName,
-		args: ended ? previous?.args : event.args,
 		parentToolCallId: event.parentToolCallId ?? previous?.parentToolCallId,
-		result: ended
-			? event.result
-			: event.type === "tool_execution_update"
-				? event.partialResult
-				: undefined,
-		status: ended ? (event.isError ? "error" : "done") : "running",
 	};
+	switch (event.type) {
+		case "tool_execution_start":
+			return { ...call, args: event.args, status: "running" };
+		case "tool_execution_update":
+			return {
+				...call,
+				args: event.args,
+				result: event.partialResult,
+				status: "running",
+			};
+		case "tool_execution_end":
+			return {
+				...call,
+				args: previous?.args,
+				result: event.result,
+				status: event.isError ? "error" : "done",
+			};
+	}
 }
 
 /** Owns one session's mutable state; all operations are safe to pass as callbacks. */
@@ -604,11 +626,7 @@ export function createSubagents({
 		node.unsubscribe = session.subscribe((event) => {
 			// Cancellation can precede async prompt validation and loop startup.
 			if (node.cancelled && event.type === "agent_start") stopSession(session);
-			if (
-				event.type === "tool_execution_start" ||
-				event.type === "tool_execution_update" ||
-				event.type === "tool_execution_end"
-			)
+			if (isToolExecution(event))
 				node.liveTools.set(
 					event.toolCallId,
 					toolSnapshot(event, node.liveTools.get(event.toolCallId)),

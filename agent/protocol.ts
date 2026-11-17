@@ -78,14 +78,17 @@ export interface CommandUnknownMessage {
 /** What command tracking tells the conversation that ran the command. */
 export type CommandMessage = CommandExitMessage | CommandUnknownMessage;
 
-/** Details may come from persisted sessions, so they are checked rather than trusted. */
+/** A string property of an untrusted value, e.g. persisted details or
+ * partial tool arguments, which are checked rather than trusted.
+ */
+function stringField(value: unknown, key: string): string | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const field: unknown = Reflect.get(value, key);
+	return typeof field === "string" ? field : undefined;
+}
+
 export function subagentId(details: unknown): string | undefined {
-	return details &&
-		typeof details === "object" &&
-		"id" in details &&
-		typeof details.id === "string"
-		? details.id
-		: undefined;
+	return stringField(details, "id");
 }
 
 export function isSubagentReceipt(
@@ -93,7 +96,7 @@ export function isSubagentReceipt(
 ): details is SubagentReceipt {
 	return (
 		subagentId(details) !== undefined &&
-		(details as Partial<SubagentReceipt>).status === "running"
+		stringField(details, "status") === "running"
 	);
 }
 
@@ -108,12 +111,7 @@ export function subagentReceipt(id: string): AgentToolResult<SubagentReceipt> {
 
 /** The result a report tool call carries, if its arguments are complete. */
 export function reportResult(args: unknown): string | undefined {
-	return args &&
-		typeof args === "object" &&
-		"result" in args &&
-		typeof args.result === "string"
-		? args.result
-		: undefined;
+	return stringField(args, "result");
 }
 
 /** The report an entry records, if any: a successful report's stored result. */
