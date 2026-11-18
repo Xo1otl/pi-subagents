@@ -100,7 +100,6 @@ test("nohup completion notifies the parent once, with the child's report", async
 			}
 			if (lastCustomMessage(context, SUBAGENT_RESULT_TYPE))
 				return response("completion accepted");
-			// Answering the user is no report; the job's exit leads to one.
 			if (lastCustomMessage(context, COMMAND_EXIT_TYPE))
 				return report("child report after exit");
 			if (text === "final update") return response("last child answer");
@@ -196,7 +195,6 @@ test.each(["initializing", "running"] as const)(
 		});
 		await session.prompt("delegate");
 		await until(() => child.reached);
-		// /model uses setModel; it must not wait for the detached child.
 		await session.setModel(alternate);
 		expect(session.model).toEqual(alternate);
 		expect(tree.get("1")?.status).toBe("running");
@@ -251,7 +249,6 @@ test.each(["finishes", "is interrupted"] as const)(
 		await until(() => parent.reached);
 		child.open();
 		await tree.settled(ROOT);
-		// Held by the integration, so an interrupt clearing pi's queue cannot drop it.
 		expect(session.agent.hasQueuedMessages()).toBe(false);
 		expect(completions(session)).toHaveLength(0);
 		expect(completionRequests).toBe(0);
@@ -259,17 +256,14 @@ test.each(["finishes", "is interrupted"] as const)(
 			parent.open();
 			await busy;
 			await session.waitForIdle();
-			// A follow-up to the newer prompt, not an interruption of it.
 			expect(replies(session.messages).slice(-2)).toEqual([
 				"newer prompt finished",
 				"completion accepted",
 			]);
 		} else {
-			// Pi's interactive interrupt clears queued messages before aborting.
 			session.clearQueue();
 			await session.abort();
 			await busy;
-			// Kept without restarting the turn.
 			expect(session.isIdle).toBe(true);
 			expect(completionRequests).toBe(0);
 		}
@@ -359,7 +353,6 @@ test("interrupting the originating parent leaves the child running and still del
 			child.reached &&
 			session.messages.some((message) => message.role === "toolResult"),
 	);
-	// Pi's interactive interrupt clears queued messages before aborting.
 	session.clearQueue();
 	await session.abort();
 	await prompt;
@@ -476,7 +469,6 @@ test("results held by a busy parent are released together, starting one turn", a
 
 test("accounting preserves other extensions' boundary drafts both with and without completion metadata", async () => {
 	const child = deferred();
-	// Every draft another extension adds at a boundary must be persisted.
 	const drafted = { "prior-turn": 0, "prior-settle": 0 };
 	const draft =
 		(customType: keyof typeof drafted) =>
@@ -512,7 +504,6 @@ test("accounting preserves other extensions' boundary drafts both with and witho
 	const before = { ...drafted };
 	child.resolve();
 	await until(() => completions(session).length === 1 && session.isIdle);
-	// Delivering the completion crossed new boundaries, which carried both kinds.
 	expect(drafted["prior-settle"]).toBeGreaterThan(before["prior-settle"]);
 	expectPersisted();
 	expect(metadata(SUBAGENT_USAGE_TYPE)).toHaveLength(1);
@@ -552,12 +543,10 @@ test.each([false, true])(
 		await until(() => input.reached);
 		original.open();
 		await until(() => Boolean(node.session?.isIdle));
-		// The session is idle, but the gated input still belongs to the run.
 		expect(await stillPending(started.result)).toBe(true);
 		if (!dispose) {
 			input.open();
 			await sent;
-			// Answering the input is no report, so the task is reminded.
 			expect(await started.result).toMatchObject({
 				status: "done",
 				output: "original finished",
@@ -728,7 +717,6 @@ test("completion output is bounded with full output saved, and rich usage is bil
 	expect(
 		session.messages.find((message) => message.role === "toolResult")?.usage,
 	).toBeUndefined();
-	// Only undelivered completions are discarded with the session.
 	await session.extensionRunner.emit({
 		type: "session_shutdown",
 		reason: "quit",
@@ -754,7 +742,6 @@ test("the view binds only to root sessions and is released before runtime teardo
 		extensions: [
 			(pi) => pi.registerTool(createSubagentIntegration(pi, view("root"))),
 		],
-		// A configured installation of the full extension also loads in children.
 		onChildLoad: (pi) => void createSubagentIntegration(pi, view("child")),
 	});
 	const tree = bound.get("root");
@@ -770,7 +757,6 @@ test("the view binds only to root sessions and is released before runtime teardo
 		reason: "quit",
 	});
 	expect(tree.closed).toBe(true);
-	// Root presentation goes first; tearing down children then releases their unbound views.
 	expect(calls).toEqual(["root dispose", "child dispose"]);
 });
 
@@ -809,7 +795,6 @@ test.each(["session_start", "session_shutdown"] as const)(
 		expect(tree.tree()).toHaveLength(0);
 		expect(child?.status).toBe("aborted");
 		expect(child?.session?.isStreaming).toBe(false);
-		// The binding is gone: no rebind, and the tool refuses new work.
 		expect(runtime()).toBe(tree);
 		await expect(
 			execute("late", { instructions: "child task" }),

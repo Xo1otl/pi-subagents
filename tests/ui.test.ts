@@ -35,9 +35,6 @@ type EditorFactory = ReturnType<ExtensionUIContext["getEditorComponent"]>;
 
 const left = "\x1b[D";
 
-/** The root delegates, keeping its turn running; the middle agent delegates
- * again, and the leaf runs until stopped.
- */
 const dispatch = stream((context, options) => {
 	if (context.messages.at(-1)?.role === "toolResult")
 		return taskText(context) === "delegate"
@@ -52,10 +49,6 @@ const dispatch = stream((context, options) => {
 	return waiting(options?.signal);
 });
 
-/** A root session running the whole extension under a stand-in for pi's
- * interactive mode: a focused root editor that extensions may replace,
- * ctx.ui.custom() overlays and widgets.
- */
 async function interactive() {
 	const session = await parentSession({
 		streamFn: dispatch,
@@ -131,10 +124,8 @@ async function interactive() {
 		editorFactory: () => editorFactory,
 		switcherOpen: () => switcher !== undefined,
 		bind: () => session.bindExtensions({ mode: "tui", uiContext: ui }),
-		/** The running indicator, as the root's widgets render it. */
 		indicator: () =>
 			[...widgets.values()].flatMap((widget) => widget.render(100)).join("\n"),
-		/** The picker's or the chat's first line. */
 		header: () =>
 			terminal.screen().find((line) => line.startsWith("Subagent")) ?? "",
 	};
@@ -145,11 +136,10 @@ test("the root opens the switcher from /subagents and from Left-Left at its edit
 		await interactive();
 	const rootEditor = editor();
 	await ui.bind();
-	// The live editor is wrapped, not replaced, keeping its undo and history.
 	expect(editor()).toBe(rootEditor);
 	terminal.input(left);
 	terminal.input(left);
-	expect(custom).not.toHaveBeenCalled(); // No agents yet.
+	expect(custom).not.toHaveBeenCalled();
 	const run = session.prompt("delegate");
 	await until(() => ui.indicator().includes("2 running"));
 	expect(ui.indicator()).toContain("1, 1.1");
@@ -165,7 +155,6 @@ test("the root opens the switcher from /subagents and from Left-Left at its edit
 	await open;
 	expect(terminal.text()).toContain("ROOT_TRANSCRIPT");
 
-	// The chord opens the picker during the root's run, keeping its draft.
 	editor().setText("root draft");
 	terminal.input("\x01");
 	terminal.input(left);
@@ -177,7 +166,6 @@ test("the root opens the switcher from /subagents and from Left-Left at its edit
 	await until(() => !ui.switcherOpen());
 	expect(terminal.tui.getFocusedComponent()).toBe(editor());
 
-	// Subagents outlive the root's turn, until stopped in the switcher.
 	await session.abort();
 	await run;
 	expect(ui.indicator()).toContain("2 running");
@@ -212,7 +200,7 @@ test("reload releases the indicator and the editor of running subagents; a rebou
 	expect(setWidget).not.toHaveBeenCalled();
 	terminal.input(left);
 	terminal.input(left);
-	expect(custom).not.toHaveBeenCalled(); // The old agents are gone.
+	expect(custom).not.toHaveBeenCalled();
 
 	await session.extensionRunner.emit({
 		type: "session_shutdown",

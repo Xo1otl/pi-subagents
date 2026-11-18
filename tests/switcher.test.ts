@@ -22,7 +22,6 @@ import {
 
 const left = "\x1b[D";
 
-/** Open the switcher the way ctx.ui.custom() does with an overlay. */
 async function setup({
 	agents = true,
 	initialId,
@@ -50,10 +49,8 @@ async function setup({
 	});
 	onCleanup(() => switcher.dispose());
 	overlay = terminal.mount(switcher);
-	/** The picker's or the chat's first line, wherever the overlay sits. */
 	const header = () =>
 		terminal.screen().find((line) => line.startsWith("Subagent")) ?? "";
-	/** The composer's text rows, below its labeled top border. */
 	const composer = () => {
 		const lines = terminal.screen();
 		const top = lines.findIndex((line) => line.includes("Message this"));
@@ -77,17 +74,17 @@ test("the compact picker lists every descendant's status, task and context below
 	]);
 	expect(terminal.cursor()).toBeUndefined();
 	const selected = () => terminal.screen().find((line) => line.startsWith(">"));
-	terminal.input("\x1b[A"); // Clamped at the top.
+	terminal.input("\x1b[A");
 	expect(selected()).toStartWith("> 1 [");
-	terminal.input("\x1b[C"); // Right selects the first child.
+	terminal.input("\x1b[C");
 	expect(selected()).toStartWith(">   1.1 [");
-	terminal.input(left); // Left selects the parent.
+	terminal.input(left);
 	expect(selected()).toStartWith("> 1 [");
-	terminal.input(left); // A top-level agent has no selectable parent.
+	terminal.input(left);
 	expect(selected()).toStartWith("> 1 [");
-	for (let i = 0; i < 3; i++) terminal.input("\x1b[B"); // Clamped at the bottom.
+	for (let i = 0; i < 3; i++) terminal.input("\x1b[B");
 	expect(selected()).toStartWith("> 2 [");
-	terminal.input("\x1b[C"); // A leaf's Right opens its chat, which fills the screen.
+	terminal.input("\x1b[C");
 	expect(terminal.screen()[0]).toContain("Subagent 2 · 3/3 · done · ctx");
 	expect(terminal.text()).not.toContain("ROOT_TRANSCRIPT");
 	expect(terminal.cursor()).toEqual({
@@ -98,7 +95,7 @@ test("the compact picker lists every descendant's status, task and context below
 
 test("clicks open agents and place the composer cursor without taking focus; wheels never scroll pi's screen beneath", async () => {
 	const { terminal, switcher, header } = await setup();
-	terminal.mouse(64, 10, terminal.row("  2 [done]")); // Wheel up over the picker.
+	terminal.mouse(64, 10, terminal.row("  2 [done]"));
 	expect(terminal.tui.isFollowingOutput).toBe(true);
 	terminal.click(4, terminal.row("  2 [done]"));
 	expect(header()).toContain("Subagent 2");
@@ -107,7 +104,7 @@ test("clicks open agents and place the composer cursor without taking focus; whe
 	terminal.input("X");
 	expect(terminal.text()).toContain("Xmessage after clicking");
 	expect(terminal.tui.getFocusedComponent()).toBe(switcher);
-	terminal.mouse(64, 10, 5); // Wheel up over a chat that fits the screen.
+	terminal.mouse(64, 10, 5);
 	expect(terminal.tui.isFollowingOutput).toBe(true);
 });
 
@@ -116,7 +113,7 @@ test("each agent keeps its draft, undo and history across Tab and the picker; En
 	const messages = (id: string) =>
 		JSON.stringify(tree.get(id)?.session?.messages);
 	terminal.input("alpha");
-	terminal.input("\n"); // Ctrl+J inserts a newline.
+	terminal.input("\n");
 	terminal.input("beta");
 	terminal.input("\t");
 	expect(header()).toContain("Subagent 1.1 · 2/3");
@@ -128,14 +125,14 @@ test("each agent keeps its draft, undo and history across Tab and the picker; En
 	terminal.input("leaf draft");
 	terminal.input("\t");
 	expect(header()).toContain("Subagent 2");
-	terminal.input("\t"); // Wraps around.
+	terminal.input("\t");
 	expect(composer()).toContain("alpha\nbeta");
 	terminal.input(left);
 	terminal.input("X");
 	expect(composer()).toContain("alpha\nbetXa");
-	terminal.input("\x1b[45;5u"); // Ctrl+- undoes, via the Kitty keyboard protocol.
+	terminal.input("\x1b[45;5u");
 	expect(composer()).toContain("alpha\nbeta");
-	terminal.input("\x1b[Z"); // Shift+Tab wraps backwards.
+	terminal.input("\x1b[Z");
 	expect(header()).toContain("Subagent 2");
 	terminal.input(left);
 	terminal.input(left);
@@ -144,7 +141,7 @@ test("each agent keeps its draft, undo and history across Tab and the picker; En
 	terminal.input("\r");
 	expect(header()).toContain("Subagent 1.1");
 	expect(composer()).toContain("leaf draft");
-	terminal.input("\x15"); // Ctrl+U clears the line; Up recalls this agent's history.
+	terminal.input("\x15");
 	terminal.input("\x1b[A");
 	expect(composer()).toContain("message the leaf");
 	terminal.input("\x1b[Z");
@@ -165,14 +162,13 @@ test("Left twice at the text start returns to the picker; nothing inside a brack
 	expect(composer()).toContain("[D[D");
 	terminal.input("\x15");
 	terminal.input("\x1b[200~first\nsecond\x1b[201~");
-	// Lefts that move the cursor never arm the chord.
 	for (let i = 0; i < "first\nsecond".length; i++) terminal.input(left);
 	expect(header()).toContain("Subagent 1 ");
 	terminal.input(left);
-	terminal.input("\x1b[200~\x1b[201~"); // A paste disarms it,
+	terminal.input("\x1b[200~\x1b[201~");
 	terminal.input(left);
 	terminal.input("\t");
-	terminal.input("\x1b[Z"); // and so does switching agents.
+	terminal.input("\x1b[Z");
 	terminal.input(left);
 	expect(header()).toContain("Subagent 1 ");
 	terminal.input(left);
@@ -262,18 +258,16 @@ test("context usage is unknown during startup, then shows the latest request in 
 	);
 	const release = await blockingTool(context);
 	const result = tree.start(ROOT, "monitor", context).result;
-	terminal.input("\r"); // Opens the first arriving child.
+	terminal.input("\r");
 	expect(header()).toContain("Subagent 1 · 1/1 · running · ctx ?");
 	await until(() => tree.get("1")?.liveTools.size === 1);
 	expect(header()).toContain("ctx 50k/100k (50.0%)");
-	// Pending steering is not finalized model context yet.
 	await tree.send("1", "next message");
 	expect(header()).toContain("ctx 50k/100k (50.0%)");
 	release.open();
 	await result;
 	expect(header()).toContain("ctx 61k/100k (61.0%)");
 	await tree.send("1", "resume");
-	// Two requests are billed, but context is the latest request, not their sum.
 	expect(
 		tree.get("1")?.session?.getSessionStats().tokens.total,
 	).toBeGreaterThan(100_000);
@@ -284,7 +278,6 @@ test("context usage is unknown during startup, then shows the latest request in 
 	terminal.input(left);
 	const rows = terminal.screen();
 	expect(rows.find((line) => line.includes("1 [done]"))).toEndWith("61.0%");
-	// Long instructions never push a nested row's context column out.
 	expect(rows.find((line) => line.includes("1.1.1 [done]"))).toEndWith("61.0%");
 });
 

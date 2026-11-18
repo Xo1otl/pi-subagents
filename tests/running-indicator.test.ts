@@ -74,11 +74,9 @@ test("counts concurrent runs from startup through stopping and settlement, bound
 	await until(() =>
 		runtime.tree().every((node) => Boolean(node.session?.isStreaming)),
 	);
-	// Session creation and streamed events do not reinstall an unchanged summary.
 	expect(setWidget).not.toHaveBeenCalled();
 	for (const width of [1, 5, 20])
 		expect(visibleWidth(render(width))).toBeLessThanOrEqual(width);
-	// The active theme is evaluated at render time.
 	const upper = { fg: (_color: string, text: string) => text.toUpperCase() };
 	expect(render(100, upper as Theme)).toContain("SUBAGENTS: 5 RUNNING");
 	runtime.abort("1");

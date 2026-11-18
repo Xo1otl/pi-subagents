@@ -129,7 +129,6 @@ test("a resumed parent that delegates again bills only new local and descendant 
 	const childBefore = parent.getSessionStats();
 	const messages = JSON.stringify(session.messages);
 	await tree.send("1", "nest:1");
-	// Three local responses (tool call, receipt, completion) plus one descendant.
 	const newUsage = {
 		...response("").usage,
 		input: 4,
@@ -175,8 +174,6 @@ test("a running ancestor drains a resumed descendant through an idle intermediat
 	let requested = false;
 	const rootBefore = session.getSessionStats();
 	const messages = JSON.stringify(session.messages);
-	// Resume the descendant once its ancestor is running again. Sending notifies
-	// listeners synchronously, so the request is marked before it is made.
 	const unsubscribe = tree.subscribe(() => {
 		if (tree.get("1")?.status !== "running" || requested) return;
 		requested = true;
@@ -225,7 +222,6 @@ test("resumed billing remains fenced from a replacement root ledger", async () =
 	await session.prompt("nest:1");
 	await settled(session, tree);
 	const oldId = session.sessionManager.getSessionId();
-	// Simulate replacing the captured manager without relying on a shutdown event.
 	session.sessionManager.newSession();
 	expect(session.sessionManager.getSessionId()).not.toBe(oldId);
 	await tree.send("1", "resume");

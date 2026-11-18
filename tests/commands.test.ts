@@ -52,7 +52,6 @@ test.each(["nohup", ""])(
 					return toolCall("bash", { command: second.command });
 				if (lastCustomMessage(ctx, COMMAND_EXIT_TYPE))
 					return response("background checked");
-				// Unreported once nothing is left to wait for, so reminded.
 				if (lastCustomMessage(ctx, SUBAGENT_REMINDER_TYPE))
 					return report("all background checked");
 				return response(
@@ -80,8 +79,6 @@ test.each(["nohup", ""])(
 		expect(existsSync(first.finished)).toBe(true);
 		expect(existsSync(second.finished)).toBe(true);
 		expect(exits(tree)).toHaveLength(2);
-		// The launch result names the group, so its exit notice can stay short:
-		// one bounded line, while details keep the full command.
 		const pgid = String(await first.pgid());
 		const launch = tree
 			.get("1")
@@ -179,7 +176,6 @@ test.each(["command", "child"] as const)(
 					await child.pass(options?.signal);
 					return report("child finished");
 				}
-				// Reports once it has heard of both.
 				return hasCustomMessage(ctx, COMMAND_EXIT_TYPE) &&
 					hasCustomMessage(ctx, SUBAGENT_RESULT_TYPE)
 					? report("final parent answer")
@@ -288,7 +284,6 @@ test.each(["waits for the exit", "reports again"] as const)(
 		const job = backgroundJob(context.cwd, "refused");
 		const started = tree.start(ROOT, "start", context);
 		if (choice === "waits for the exit") {
-			// The refused report was not sent, and the job is still tracked.
 			await until(() => idle(tree));
 			expect(tree.get("1")?.status).toBe("running");
 			await job.release();
@@ -299,13 +294,11 @@ test.each(["waits for the exit", "reports again"] as const)(
 			expect(exits(tree)).toHaveLength(1);
 			expect(requests).toBe(4);
 		} else {
-			// Sent while the job runs, which then ends the turn.
 			expect(await started.result).toMatchObject({
 				status: "done",
 				output: "report leaving the job",
 			});
 			expect(requests).toBe(3);
-			// Untracked, it is not stopped at shutdown either.
 			await tree.dispose();
 			expect(await isProcessGroupActive(await job.pgid())).toBe(true);
 			await job.release();
@@ -360,7 +353,6 @@ test("a report with nothing left running ends the turn at once", async () => {
 		output: "done at once",
 	});
 	expect(requests).toBe(1);
-	// No turn follows the report's own result.
 	expect(tree.get("1")?.session?.messages.at(-1)).toMatchObject({
 		role: "toolResult",
 		isError: false,
@@ -413,7 +405,6 @@ test("notification startup failures fail the run instead of delivering a stale f
 	await until(() => idle(tree));
 	const session = tree.get("1")?.session;
 	if (!session) throw new Error("Missing child session");
-	// Only the exit notice fails: a reminder would otherwise fail the run too.
 	const send = session.sendCustomMessage.bind(session);
 	spyOn(session, "sendCustomMessage").mockImplementation((message, options) =>
 		message.customType === COMMAND_EXIT_TYPE
@@ -485,7 +476,6 @@ test("a long foreground sleep is refused before it runs", async () => {
 	const context = await spawnContext(
 		stream((ctx) => {
 			const last = ctx.messages.at(-1);
-			// Wording is not under test: only that the call failed without running.
 			return last?.role === "toolResult"
 				? answer(ctx, `isError: ${last.isError}`)
 				: toolCall("bash", { command: `cd . && sleep 90; touch ${marker}` });

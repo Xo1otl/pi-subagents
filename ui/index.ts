@@ -12,10 +12,6 @@ import { bindRunningIndicator } from "./running-indicator.ts";
 import { createSubagentSwitcher, SWITCHER_OVERLAY } from "./switcher.ts";
 import { renderSubagentCall, renderSubagentResult } from "./tool-renderers.ts";
 
-/** Register human controls and expose default tool renderers for composition.
- * The integration owns the session lifecycle and binds the runtime to show;
- * creating the UI starts no timers or subscriptions.
- */
 export function createSubagentUI(pi: ExtensionAPI) {
 	let runtime: Subagents | undefined;
 	let switcherOpen = false;
@@ -77,7 +73,6 @@ export function createSubagentUI(pi: ExtensionAPI) {
 				{ expanded, isPartial: false },
 				theme,
 			);
-			// Pi pads a tool's output, but shows a message renderer's component as is.
 			text.setPaddingX(outputPad);
 			return text;
 		},

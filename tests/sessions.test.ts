@@ -41,7 +41,6 @@ import {
 	until,
 } from "./fixtures.ts";
 
-/** Wording is not under test: the guidance is whatever tracking adds to bash. */
 function addedGuidance(guidelines: readonly string[] | undefined): string {
 	const stock = createBashToolDefinition(".").promptGuidelines ?? [];
 	const added = (guidelines ?? []).filter((line) => !stock.includes(line));
@@ -143,7 +142,6 @@ test("honors requested effort and resolves requested models against available on
 	expect(
 		spawnContext(ctx, undefined, { model: "other-provider/test-model" }).model,
 	).toBe(other);
-	// Failures name the candidates, so the model can correct its request.
 	const failure = (reference: string) => {
 		try {
 			spawnContext(ctx, undefined, { model: reference });
@@ -240,7 +238,6 @@ test("saves each child's session in a directory named after its parent's file", 
 			JSON.stringify(session.sessionManager.getEntries()),
 		);
 	}
-	// Saved children are not offered alongside the parent's sessions.
 	const listed = await SessionManager.list(context.cwd, dirname(parentSession));
 	expect(listed.map((info) => info.path)).toEqual([parentSession]);
 });
@@ -268,7 +265,6 @@ test("only a child whose task names a `skill://` path is told to skip default sk
 	await tree.start(ROOT, "plain task", context).result;
 	const appended = (id: string) =>
 		tree.get(id)?.session?.resourceLoader.getAppendSystemPrompt() ?? [];
-	// Wording is not under test: the guidance is whatever the first child gains.
 	const guidance = appended("1").at(-1) ?? "";
 	expect(appended("1")).toEqual([...base, guidance]);
 	expect(base).not.toContain(guidance);
@@ -276,7 +272,6 @@ test("only a child whose task names a `skill://` path is told to skip default sk
 	expect(appended("2")).toEqual(base);
 	expect(tree.get("2")?.session?.systemPrompt).not.toContain(guidance);
 	expect(parent.systemPrompt).not.toContain(guidance);
-	// Skills stay listed either way.
 	for (const id of ["1", "2"])
 		expect(tree.get(id)?.session?.systemPrompt).toContain(
 			"STANDARD_SKILL_MARKER",
@@ -336,8 +331,6 @@ test("provides machine-facing delegation in children without loading UI registra
 	if (!child) throw new Error("Missing child");
 	const tool = child.getToolDefinition("subagent");
 	expect(tool).toBeDefined();
-	// Only a child has a parent to report to, through a tool its prompt does
-	// not list.
 	expect(child.getActiveToolNames()).toContain(REPORT_TOOL);
 	expect(parent.getToolDefinition(REPORT_TOOL)).toBeUndefined();
 	expect(child.systemPrompt).not.toContain(REPORT_TOOL);
@@ -356,7 +349,6 @@ test("provides machine-facing delegation in children without loading UI registra
 });
 
 test("a subagent's prompt gives its role while its parent's task runs, and drops it once the user takes over", async () => {
-	/** The role section each request carried, by what the request answers. */
 	const roles = new Map<string, string | null | undefined>();
 	const { parent, tree, context } = await setup({
 		streamFn: stream((context) => {
@@ -367,7 +359,6 @@ test("a subagent's prompt gives its role while its parent's task runs, and drops
 					SUBAGENT_ROLE_SECTION
 				],
 			);
-			// Reported once reminded, so the task spans two runs.
 			return reminded ? report("task done") : response(lastText(context));
 		}),
 	});
@@ -384,7 +375,6 @@ test("a subagent's prompt gives its role while its parent's task runs, and drops
 		"takeover",
 	]);
 	expect(roles.get("root prompt")).toBeUndefined();
-	// Every run of the task carries the role, which points to the report tool.
 	expect(roles.get("task")).toContain(REPORT_TOOL);
 	expect(roles.get("reminder")).toBe(roles.get("task"));
 	expect(roles.get("takeover")).toBeUndefined();
@@ -451,7 +441,6 @@ test("runs recursive delegation through pi's codemode extension", async () => {
 	const result = await tree.start(ROOT, "delegate", context).result;
 	expect(result.status).toBe("done");
 	expect(result.output).toContain("PROJECT_INSTRUCTIONS_MARKER");
-	// The background receipt and completion are separate parent turns.
 	expect(result.usage?.totalTokens).toBe(15);
 	expect(tree.tree().map((node) => node.id)).toEqual(["1", "1.1"]);
 });
@@ -673,7 +662,6 @@ test("dispatches standard extension commands without sending them to the model, 
 		});
 	});
 	const result = await tree.start(ROOT, "/ping", context).result;
-	// A task that the command handled is still reported, once reminded.
 	expect(result).toMatchObject({ status: "done", output: "pong" });
 	expect(requests).toHaveLength(1);
 	expect(requests[0]).toContain("PING_MARKER");

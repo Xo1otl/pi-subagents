@@ -30,9 +30,6 @@ import {
 
 const STATUS_ERROR = "Command failed: ps -A -o pgid=,stat=";
 
-/** Count status checks of a group, failing the first `failures` of them, as
- * an overloaded `ps` did, until recovery.
- */
 function statusChecks(pgid: () => number | undefined, failures: number) {
 	const kill = process.kill.bind(process);
 	let calls = 0;
@@ -59,13 +56,11 @@ function statusChecks(pgid: () => number | undefined, failures: number) {
 	};
 }
 
-/** The group a job's shell recorded, once it has. */
 function groupOf(job: ReturnType<typeof backgroundJob>) {
 	return () =>
 		existsSync(job.group) ? Number(readFileSync(job.group, "utf8")) : undefined;
 }
 
-/** Make the reporting delay pass, without waiting for it. */
 function clock() {
 	const now = performance.now.bind(performance);
 	let skew = 0;
@@ -78,7 +73,6 @@ function clock() {
 	};
 }
 
-/** A detached group that runs until stopped. */
 function sleeper() {
 	const child = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
 	const exited = once(child, "exit");
@@ -113,12 +107,10 @@ test("waits past shell exit for nohup and resolves when only zombies remain", as
 	if (!pgid) throw new Error("Missing shell pid");
 	onCleanup(() => killGroup(pgid));
 	await exited;
-	// The job outlives its shell, and so does their group.
 	expect(await isProcessGroupActive(pgid)).toBe(true);
 	const waiting = waitForGroupToFinish(pgid);
 	await job.release();
 	await waiting;
-	// The wait lasted until the job itself had finished.
 	expect(existsSync(job.finished)).toBe(true);
 });
 
@@ -137,7 +129,6 @@ test("waiting outlasts transient status-check failures", async () => {
 	const waiting = waitForGroupToFinish(pgid).then(() => {
 		finished = true;
 	});
-	// Checks continue past the failures.
 	await until(() => checks.calls() > 2);
 	expect(finished).toBe(false);
 	await stop();
@@ -157,12 +148,10 @@ test("a status that stays unknown is told once, and watching continues", async (
 		},
 	});
 	await until(() => checks.failures() >= 2);
-	// Not before the status has stayed unknown for the reporting delay.
 	expect(told).toHaveLength(0);
 	time.elapse();
 	await until(() => told.length === 1);
 	expect(String(told[0])).toContain(STATUS_ERROR);
-	// Checks keep failing, without further reports.
 	const failures = checks.failures();
 	await until(() => checks.failures() > failures);
 	expect(told).toHaveLength(1);
@@ -188,7 +177,6 @@ test.skipIf(process.platform !== "linux")(
 	"process names cannot impersonate a finished state",
 	async () => {
 		const context = await spawnContext();
-		// Read naively, this stat line has state Z.
 		const script = join(context.cwd, "a) Z 1 2 (b");
 		await writeFile(script, "#!/bin/sh\nread line\n");
 		await chmod(script, 0o755);
@@ -222,7 +210,6 @@ test("transient status-check failures neither stop a subagent's job nor lose its
 		}),
 	);
 	const job = backgroundJob(context.cwd, "flaky");
-	// Both the launch check and the watcher's first checks fail.
 	const checks = statusChecks(groupOf(job), 3);
 	const started = tree.start(ROOT, "start", context);
 	await until(
@@ -259,7 +246,6 @@ test("a subagent told its job's status stays unknown keeps the job and still lea
 	const job = backgroundJob(context.cwd, "unknown");
 	const checks = statusChecks(groupOf(job), Number.POSITIVE_INFINITY);
 	const started = tree.start(ROOT, "start", context);
-	// The launch check and the watcher's first check failed.
 	await until(() => checks.failures() >= 2);
 	time.elapse();
 	const session = () => tree.get("1")?.session;

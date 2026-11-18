@@ -35,9 +35,6 @@ export interface Picker {
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined;
 }
 
-/** The subagent tree with each child's status, task and own context usage,
- * sized to its content rather than the screen.
- */
 export function createPicker({
 	runtime,
 	theme,
@@ -46,7 +43,6 @@ export function createPicker({
 	onSelect,
 	onOpen,
 }: PickerProps): Picker {
-	// Clicks target the last displayed frame, not newly arriving agents.
 	let rowIds = new Map<number, string>();
 
 	function row(node: Subagent, active: boolean, width: number): string {
@@ -56,7 +52,6 @@ export function createPicker({
 			theme,
 			true,
 		);
-		// Reserve the usage column so long IDs or tasks cannot push it out.
 		return `${truncateToWidth(
 			theme.fg(active ? "accent" : "muted", label),
 			Math.max(0, width - visibleWidth(usage) - 1),
@@ -69,7 +64,6 @@ export function createPicker({
 		render(width, height) {
 			const nodes = runtime.tree();
 			const id = selected();
-			// Compact, so the root conversation stays in view above it.
 			const listHeight = Math.max(
 				1,
 				Math.min(nodes.length, Math.floor(height / 2) - 3),
@@ -111,7 +105,6 @@ export function createPicker({
 			)
 				onSelect(nodes[Math.min(nodes.length - 1, index + 1)]?.id ?? id);
 			else if (matchesKey(data, "left")) {
-				// Top-level agents have no selectable parent.
 				if (parentId && runtime.get(parentId)) onSelect(parentId);
 			} else if (matchesKey(data, "right")) {
 				if (child) onSelect(child.id);

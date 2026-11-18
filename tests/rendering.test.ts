@@ -91,7 +91,6 @@ test.each([false, true])(
 			.join("\n");
 		expect(collapsed).toStartWith("completion line 0");
 		expect(collapsed).not.toContain("completion line 19");
-		// Pi pads a tool's output, but a message renderer pads its own.
 		expect(
 			completionRenderer?.(
 				message,

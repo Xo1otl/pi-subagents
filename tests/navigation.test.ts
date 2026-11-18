@@ -35,9 +35,8 @@ test("the chord is two Left taps within 500 ms at the text start, in any key enc
 	expect(chord.matches(left, empty, 0)).toBe(false);
 	expect(chord.matches(left, empty, 500)).toBe(true);
 	expect(chord.matches(left, empty, 501)).toBe(false);
-	expect(chord.matches(left, empty, 1100)).toBe(false); // Too slow.
+	expect(chord.matches(left, empty, 1100)).toBe(false);
 	expect(chord.matches("\x1bOD", empty, 1200)).toBe(true);
-	// Kitty releases between taps are ignored; a held key's repeats are not taps.
 	expect(chord.matches("\x1b[1;1:3D", empty, 1300)).toBe(false);
 	expect(chord.matches(left, empty, 1300)).toBe(false);
 	expect(chord.matches("\x1b[1;1:3D", empty, 1350)).toBe(false);
@@ -48,7 +47,6 @@ test("the chord is two Left taps within 500 ms at the text start, in any key enc
 		expect(chord.matches(left, empty, 2200)).toBe(false);
 		chord.reset();
 	}
-	// Without cursor access, only an empty editor is at its text start.
 	expect(chord.matches(left, { getText: () => "draft" }, 3000)).toBe(false);
 	expect(chord.matches(left, { getText: () => "draft" }, 3100)).toBe(false);
 });
@@ -68,12 +66,12 @@ test("the root editor opens the switcher only from its text start, never from pa
 		expect(opened).not.toHaveBeenCalled();
 		enabled = true;
 		live.setText("first\nsecond");
-		live.handleInput("\x01"); // The second line's beginning is not the text start.
+		live.handleInput("\x01");
 		live.handleInput(left);
 		live.handleInput(left);
 		expect(live.getCursor()).toEqual({ line: 0, col: 4 });
 		while (live.getCursor().col > 0) live.handleInput(left);
-		live.handleInput(left); // Moves nowhere, but arms the chord.
+		live.handleInput(left);
 		for (const chunk of ["\x1b[200~", left, left, "\x1b[201~"])
 			live.handleInput(chunk);
 		expect(opened).not.toHaveBeenCalled();

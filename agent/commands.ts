@@ -29,32 +29,18 @@ import {
 } from "./protocol.ts";
 import { foregroundSleepSeconds, SLEEP_LIMIT_SECONDS } from "./sleep.ts";
 
-/** Tells the conversation that ran a command of its exit, or that its status
- * stayed unknown, waking it if idle. The signal aborts once the command's
- * messages must no longer be told.
- */
 type CommandListener = (
 	message: CommandMessage,
 	signal: AbortSignal,
 ) => void | Promise<void>;
 
-/** The session whose local bash commands are tracked. */
 export interface CommandHost {
-	/** A delegated run's jobs end with it, so it cannot finish before them; the
-	 * user's own outlive Pi.
-	 */
 	readonly ownsJobs: boolean;
-	/** Keep the session's settlement open until the work settles; a rejection
-	 * is a tracking failure. A group's watch comes with its `leftover`, which
-	 * ends the watch and leaves the group running, never stopped.
-	 */
 	track(work: Promise<void>, ctx: ExtensionContext, leftover?: Leftover): void;
-	/** Capture the conversation running a command, unless it is already over. */
 	listener(ctx: ExtensionContext): CommandListener | undefined;
 }
 
 export interface CommandTracking {
-	/** Stop watching every group and withhold the exits not yet told. */
 	stop(): void;
 }
 
@@ -64,9 +50,6 @@ interface TrackedSession {
 	readonly prefix: string | undefined;
 }
 
-/** Enough of a command to tell its exit apart: its first line, capped. The
- * launch result names the PGID; details keep the full command.
- */
 function commandPreview(command: string): string {
 	const lines = command.split("\n").filter((line) => line.trim());
 	const first = [...(lines[0]?.trim() ?? "")];
@@ -97,9 +80,6 @@ function commandUnknown(
 	};
 }
 
-/** The group a command recorded, or undefined when it never ran: a failed
- * spawn, an invalid timeout or a shell syntax error leaves nothing to wait for.
- */
 async function recordedGroup(path: string): Promise<number | undefined> {
 	let pid: string;
 	try {
@@ -114,17 +94,11 @@ async function recordedGroup(path: string): Promise<number | undefined> {
 	return pgid;
 }
 
-/** Watch the process groups that a session's local bash commands leave behind.
- * They belong to the host's settlement, not to a tool or an agent event
- * handler: the session must remain free to converse while they run.
- */
 export function trackCommands(
 	pi: ExtensionAPI,
 	host: CommandHost,
 ): CommandTracking {
-	/** Running groups, by the session that started them. */
 	const groups = new Map<number, ExtensionContext>();
-	/** Replaced by every stop, so that exits not yet told are fenced too. */
 	let scope = new AbortController();
 	let session: TrackedSession | undefined;
 	let installed = false;
@@ -146,9 +120,6 @@ export function trackCommands(
 		for (const [pgid, ctx] of running) end(pgid, ctx);
 	}
 
-	/** Watch a running group until it finishes, telling its conversation.
-	 * Detaching it, e.g. as a report leaves it running, ends the watch alone.
-	 */
 	function watch(
 		job: CommandJob,
 		ctx: ExtensionContext,
@@ -162,36 +133,27 @@ export function trackCommands(
 			try {
 				await waitForGroupToFinish(pgid, {
 					signal,
-					// An unknown status is told, not taken for an end: the group stays
-					// owned and watched.
 					onUnknown: (error) => notify(commandUnknown(job, error), signal),
 				});
 				if (signal.aborted) return;
-				// Never signal a finished (and possibly reused) PGID while the
-				// model handles its exit; the tracked work still gates settlement.
 				groups.delete(pgid);
 				await notify(commandExit(job), signal);
 			} catch (error) {
 				if (signal.aborted) return;
-				// Telling failed, which fails the run: it no longer waits for a
-				// group that may still be running, so the group ends with it.
 				if (groups.delete(pgid)) end(pgid, ctx);
 				throw error;
 			}
 		};
 		host.track(follow(), ctx, {
 			label: `PGID ${pgid}: ${commandPreview(job.command)}`,
-			// Deleted once finished, before its end is told.
 			running: () => groups.has(pgid),
 			detach() {
 				stopped.abort();
-				// Out of the map, no stop or shutdown ends it.
 				groups.delete(pgid);
 			},
 		});
 	}
 
-	/** Watch the group a command left running, if any, returning its PGID. */
 	async function record(
 		from: TrackedSession,
 		path: string,
@@ -200,9 +162,6 @@ export function trackCommands(
 		aborted: boolean,
 	): Promise<number | undefined> {
 		const pgid = await recordedGroup(path);
-		// Foreground-only commands are already reported by their tool result.
-		// Only groups that outlive the shell/tool need an asynchronous wakeup.
-		// A failed check leaves the group to the watcher, which retries it.
 		if (
 			pgid === undefined ||
 			!(await isProcessGroupActive(pgid).catch(() => true))
@@ -226,16 +185,12 @@ export function trackCommands(
 				host.track(Promise.reject(error), from.ctx);
 			const directory = await mkdtemp(join(tmpdir(), "pi-subagents-command-"));
 			const path = join(directory, "pgid");
-			// The bash tool keeps accepting output until exec settles.
 			let endsLine = true;
 			const onData = (data: Buffer) => {
 				if (data.length) endsLine = data.at(-1) === 0x0a;
 				options.onData(data);
 			};
 			try {
-				// Pi's local backend starts a detached shell: $$ is its PGID. A
-				// private side channel preserves stdout/stderr, streaming, timeouts,
-				// shell configuration and the built-in inherited-pipe handling.
 				const quoted = `'${path.replaceAll("'", "'\\''")}'`;
 				return await from.shell.exec(
 					`command printf '%s\\n' "$$" > ${quoted} || exit\n${command}`,
@@ -243,13 +198,10 @@ export function trackCommands(
 					{ ...options, onData },
 				);
 			} finally {
-				// Do not expose configuration-only shell prefixes in model messages.
 				const submitted =
 					from.prefix && command.startsWith(`${from.prefix}\n`)
 						? command.slice(from.prefix.length + 1)
 						: command;
-				// Tracking failures are the host's to report: they must neither
-				// replace the command's own outcome nor pass for a handled tool error.
 				const pgid = await record(
 					from,
 					path,
@@ -257,7 +209,6 @@ export function trackCommands(
 					cwd,
 					options.signal?.aborted === true,
 				).catch(fail);
-				// Name the tracked group at launch, so its exit notice can stay short.
 				if (pgid !== undefined)
 					options.onData(
 						Buffer.from(`${endsLine ? "" : "\n"}[PGID ${pgid} tracked]\n`),
@@ -270,8 +221,6 @@ export function trackCommands(
 	pi.on("session_start", (_event, ctx) => {
 		stop();
 		session = undefined;
-		// Tracking requires POSIX process groups, and only replaces Pi's own
-		// backend: a configured override (for example remote execution) stays.
 		installed ||=
 			process.platform !== "win32" &&
 			pi
@@ -281,7 +230,6 @@ export function trackCommands(
 						tool.name === "bash" && tool.sourceInfo.source === "builtin",
 				);
 		if (!installed) return;
-		// The effective settings, read as Pi's own bash tool reads them.
 		const settings = SettingsManager.inMemory(pi.getSettings());
 		const prefix = settings.getShellCommandPrefix();
 		session = {
@@ -299,14 +247,9 @@ export function trackCommands(
 				...(bash.promptGuidelines ?? []),
 				"BG jobs tracked -> wake you on exit. To wait for a condition, background an until-loop (e.g. `until <check>; do …; done > log 2>&1 &`). Meanwhile, do other work or end your turn.",
 			],
-			// Replace execution without enabling a tool excluded by defaultTools.
 			defaultActive: false,
 		});
 	});
-	// Forbidding sleep-polling in the guideline did not stop it; refusing it at
-	// the call does, so the guideline leaves it out. A wait on what no tracked
-	// job covers (a remote run, a `setsid` job) moves to a background loop,
-	// whose exit is tracked.
 	pi.on("tool_call", (event) => {
 		if (
 			!session ||
@@ -319,7 +262,6 @@ export function trackCommands(
 			reason: `Blocked: FG sleep ≥${SLEEP_LIMIT_SECONDS}s. BG jobs wake you on exit: end your turn, or background the wait first (e.g. an until-loop).`,
 		};
 	});
-	// A `!!` command stays out of the model's context, and so does its exit.
 	pi.on("user_bash", (event) =>
 		session && !event.excludeFromContext ? { operations } : undefined,
 	);
@@ -331,10 +273,6 @@ export function trackCommands(
 	return { stop };
 }
 
-/** Track a delegated session's commands: their groups keep its run open,
- * resume it when they exit, and end with it, unless its report leaves them
- * running.
- */
 export function delegatedCommands({
 	runtime,
 	id,
@@ -343,7 +281,6 @@ export function delegatedCommands({
 		let unsubscribe = () => {};
 		const commands = trackCommands(pi, {
 			ownsJobs: true,
-			// A failure fails the run, even when the model handles the tool error.
 			track: (work, _ctx, leftover) =>
 				runtime.trackCompletion(id, work, leftover),
 			listener(ctx) {
@@ -367,9 +304,6 @@ export function delegatedCommands({
 						await session.waitForIdle();
 						if (signal.aborted || !running()) return;
 					}
-					// Unlike pi.sendMessage (void), the SDK promise observes turn
-					// startup failures, which fail the run instead of leaving a stale
-					// final answer.
 					await session.sendCustomMessage<CommandMessage["details"]>(message, {
 						deliverAs: "steer",
 						triggerTurn: true,

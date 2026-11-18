@@ -6,23 +6,13 @@ import { hasErrorCode } from "../runtime/errors.ts";
 
 const exec = promisify(execFile);
 
-/** How long a group's status may stay unknown before its watcher says so. */
 export const UNKNOWN_STATUS_REPORT_MS = 60_000;
 
 export interface GroupWatch {
 	signal?: AbortSignal;
-	/** Told once, when the status has stayed unknown for UNKNOWN_STATUS_REPORT_MS. */
 	onUnknown?: (error: unknown) => void | Promise<void>;
 }
 
-/** Wait independently of the shell/tool, without blocking the agent's turn.
- * Polling backs off, as a job may be a server that runs for days.
- *
- * A check can fail, e.g. `ps` timing out under load, while the group runs on:
- * failures neither end the wait nor pass for the group's end. Once the status
- * has stayed unknown for UNKNOWN_STATUS_REPORT_MS, `onUnknown` is told, once;
- * waiting continues, and only rejects on abort or when a callback fails.
- */
 export async function waitForGroupToFinish(
 	pgid: number,
 	{ signal, onUnknown }: GroupWatch = {},
@@ -49,11 +39,6 @@ export async function waitForGroupToFinish(
 	}
 }
 
-/** A shell can exit before its background jobs, which retain its POSIX process
- * group even after reparenting (including nohup). Zombies have finished too;
- * kill(-pgid, 0) alone would wait forever on systems that do not reap them.
- * Processes that explicitly leave the group (setsid/setpgid) are not included.
- */
 export async function isProcessGroupActive(
 	pgid: number,
 	signal?: AbortSignal,
@@ -66,7 +51,6 @@ export async function isProcessGroupActive(
 		if (hasErrorCode(error, "ESRCH")) return false;
 		throw error;
 	}
-	// Linux needs no subprocess, which could itself fail under load.
 	if (process.platform === "linux") return hasLiveMember(pgid);
 	const { stdout } = await exec("ps", ["-A", "-o", "pgid=,stat="], {
 		signal,
@@ -90,7 +74,6 @@ function assertProcessGroup(pgid: number): void {
 		);
 }
 
-/** Whether procfs lists a member of the group that has not finished. */
 async function hasLiveMember(pgid: number): Promise<boolean> {
 	for (const entry of await readdir("/proc")) {
 		if (!/^\d+$/.test(entry)) continue;
@@ -98,12 +81,10 @@ async function hasLiveMember(pgid: number): Promise<boolean> {
 		try {
 			stat = await readFile(`/proc/${entry}/stat`, "utf8");
 		} catch (error) {
-			// Exited since the listing.
 			if (hasErrorCode(error, "ENOENT") || hasErrorCode(error, "ESRCH"))
 				continue;
 			throw error;
 		}
-		// `pid (comm) state ppid pgrp …`, where comm may contain anything.
 		const [state, , group] = stat
 			.slice(stat.lastIndexOf(")") + 2)
 			.split(" ", 3);

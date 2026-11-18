@@ -13,13 +13,11 @@ import {
 	type SubagentCompletionMessage,
 } from "./protocol.ts";
 
-// Reserve room for attribution and the full-output notice within Pi's limits.
 const LIMITS = {
 	maxBytes: DEFAULT_MAX_BYTES - 1024,
 	maxLines: DEFAULT_MAX_LINES - 4,
 };
 
-/** Bound model context without mixing terminal UI instructions into it. */
 async function boundedOutput(
 	output: string,
 ): Promise<{ text: string; fullOutputPath?: string }> {
@@ -35,7 +33,6 @@ async function boundedOutput(
 			fullOutputPath,
 		};
 	} catch (error) {
-		// A failed temp-file write must not lose completion or usage accounting.
 		if (directory)
 			await rm(directory, { recursive: true, force: true }).catch(() => {});
 		const reason = truncateHead(errorMessage(error), {
@@ -48,7 +45,6 @@ async function boundedOutput(
 	}
 }
 
-/** A completion is context, not another tool result (and never contains UI ANSI). */
 export async function subagentCompletionMessage(
 	result: SubagentResult,
 ): Promise<SubagentCompletionMessage> {
@@ -65,7 +61,6 @@ export async function subagentCompletionMessage(
 	};
 }
 
-/** Formatting may finish after the originating session has been invalidated. */
 export async function discardSubagentCompletion(
 	message: SubagentCompletionMessage,
 ): Promise<void> {

@@ -29,7 +29,6 @@ import {
 	waiting,
 } from "./fixtures.ts";
 
-/** Echoes its input, and reports only when reminded. */
 const echo = stream((context) => {
 	const text = lastText(context);
 	if (text === "monitor") return toolCall("blocking", {});
@@ -142,8 +141,6 @@ describe("silent hierarchy", () => {
 			leaf?.session?.messages.filter((message) => message.role === "user"),
 		).toHaveLength(1);
 		expect(JSON.stringify(leaf?.session?.messages)).not.toContain("nest:2");
-		// Seven model turns: each delegating parent gets a receipt and a later completion.
-		// Descendant usage is billed exactly once, not also on the receipt.
 		expect(result.usage?.totalTokens).toBe(21);
 		expect(result.usage?.cost.total).toBeCloseTo(0.21);
 	});
@@ -160,14 +157,12 @@ describe("silent hierarchy", () => {
 		const node = tree.get("1");
 		if (!node) throw new Error("Missing parent");
 		const tools = [...node.liveTools.keys()];
-		// Accepted before the descendant completes, while the run stays open.
 		await tree.send("1", "live continuation");
 		expect(await stillPending(started.result)).toBe(true);
 		expect(node.status).toBe("running");
 		expect(node.session?.getLastAssistantText()).toBe("live continuation");
 		expect([...node.liveTools.keys()]).toEqual(tools);
 		leaf.open();
-		// The reply to the continuation was no report; the child's result is.
 		expect(await started.result).toMatchObject({
 			status: "done",
 			output: "hello",
@@ -193,7 +188,6 @@ describe("silent hierarchy", () => {
 		tree.abort("1");
 		expect((await result).status).toBe("aborted");
 		expect(tree.get("1.1")?.status).toBe("aborted");
-		// Suppressed notifications must not discard the child's billed work.
 		expect((await result).usage.totalTokens).toBe(9);
 	});
 });
@@ -323,7 +317,6 @@ describe("task results", () => {
 
 	test("a report in a conversation the user continued is not delivered, and says so", async () => {
 		const tree = testRuntime();
-		// Reports its task, then again whatever the user says.
 		const context = await spawnContext(stream(() => report("again")));
 		await tree.start(ROOT, "task", context).result;
 		await tree.send("1", "report again");
@@ -362,7 +355,6 @@ describe("task results", () => {
 			status: "error",
 			error: expect.any(String),
 		});
-		// The last message tells the parent what the agent was saying.
 		expect(result.output).toContain("Should I proceed?");
 		expect(reminders(tree, "1")).toBe(1);
 		expect(requests).toBe(2);
@@ -412,7 +404,6 @@ describe("interaction and cleanup", () => {
 		await sent;
 		expect(node?.queuedInput).toEqual(["are you there?"]);
 		release.open();
-		// The reply to the user neither stops the run nor becomes its result.
 		expect(await result).toMatchObject({
 			status: "done",
 			output: "task result",
@@ -436,7 +427,6 @@ describe("interaction and cleanup", () => {
 		);
 		await blockingTool(context);
 		const early = tree.start(ROOT, "monitor", context);
-		// Waits for session initialization, before pi's own queue exists.
 		const pending = tree.send("1", "before startup");
 		expect(tree.get("1")?.queuedInput).toEqual(["before startup"]);
 		expect(tree.abort("1")).toEqual(new Map([["1", ["before startup"]]]));
@@ -539,7 +529,6 @@ describe("interaction and cleanup", () => {
 					: { status: "done", output: "parent carried on" },
 			);
 			expect(tree.get("1.1")?.status).toBe("aborted");
-			// The stopped child's result does not reach a conversation that moved on.
 			expect(
 				tree
 					.get("1")

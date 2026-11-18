@@ -15,7 +15,6 @@ import {
 	until,
 } from "./fixtures.ts";
 
-/** A switcher showing agent 1's chat; `agents` completed agents exist up front. */
 async function setup(agents = 2) {
 	const tree = testRuntime();
 	const context = await spawnContext();
@@ -33,7 +32,6 @@ async function setup(agents = 2) {
 	onCleanup(() => switcher.dispose());
 	terminal.mount(switcher);
 	const header = () => terminal.screen()[0] ?? "";
-	/** The transcript rows, between the header and the composer. */
 	const transcript = () => {
 		const lines = terminal.screen();
 		return lines.slice(
@@ -52,7 +50,7 @@ test("history stays in place while output arrives; reaching the end or Ctrl+End 
 	);
 	expect(header()).toEndWith(" · live");
 	expect(transcript().at(-1)).toBe("history 79");
-	terminal.input("\x1b[5~"); // PageUp
+	terminal.input("\x1b[5~");
 	const paused = transcript();
 	expect(paused.at(-1)).toMatch(/^history \d+$/);
 	expect(paused.at(-1)).not.toBe("history 79");
@@ -64,22 +62,21 @@ test("history stays in place while output arrives; reaching the end or Ctrl+End 
 		content: Array.from({ length: 30 }, (_, i) => `arrival ${i}`).join("\n"),
 	});
 	expect(transcript()).toEqual(paused);
-	// Arrivals grow the distance to the end, at least by their own lines.
 	expect(Number(/↓(\d+)$/.exec(header())?.[1])).toBeGreaterThanOrEqual(
 		below + 30,
 	);
 	terminal.input("\t");
-	terminal.input("\x1b[Z"); // Each agent keeps its own position.
+	terminal.input("\x1b[Z");
 	expect(transcript()).toEqual(paused);
-	terminal.mouse(64, 10, 5); // Wheel up one line.
+	terminal.mouse(64, 10, 5);
 	expect(transcript().slice(1)).toEqual(paused.slice(0, -1));
-	terminal.input("\x1b[1;5H"); // Ctrl+Home
+	terminal.input("\x1b[1;5H");
 	expect(transcript()[0]).toBe("user");
-	terminal.input("\x1b[1;5F"); // Ctrl+End
+	terminal.input("\x1b[1;5F");
 	expect(transcript().at(-1)).toBe("arrival 29");
 	expect(header()).toEndWith(" · live");
 	terminal.input("\x1b[5~");
-	terminal.input("\x1b[6~"); // Paging back to the end resumes following.
+	terminal.input("\x1b[6~");
 	expect(header()).toEndWith(" · live");
 	await tree.get("1")?.session?.sendCustomMessage({
 		customType: "incoming",
@@ -120,7 +117,6 @@ test("a real bash tool streams logs before exit; clicking its header toggles it 
 	expect(text()).not.toContain("LAST_LOG");
 	const row = terminal.row("▸ bash [running]");
 	terminal.click(2, row);
-	// The expanded header holds its row instead of following the end.
 	expect(terminal.row("▾ bash [running]")).toBe(row);
 	expect(header()).toMatch(/↓[1-9]\d*$/);
 	expect(text()).toContain('"command":');
@@ -130,10 +126,10 @@ test("a real bash tool streams logs before exit; clicking its header toggles it 
 	expect(text()).toContain("LAST_LOG");
 	terminal.click(2, terminal.row("▾ bash [done]"));
 	expect(text()).toContain("▸ bash [done]");
-	terminal.input("\x0f"); // Ctrl+O expands every tool, not thinking.
+	terminal.input("\x0f");
 	expect(text()).toContain("▾ bash [done]");
 	expect(text()).not.toContain("PRIVATE_THINKING");
-	terminal.input("\x14"); // Ctrl+T shows thinking.
+	terminal.input("\x14");
 	expect(transcript()).toContain("PRIVATE_THINKING");
 	expect(text()).toContain("▾ bash [done]");
 });

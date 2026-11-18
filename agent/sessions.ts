@@ -23,10 +23,6 @@ import type {
 import { delegatedCommands } from "./commands.ts";
 import { REPORT_TOOL, SUBAGENT_REMINDER_TYPE } from "./protocol.ts";
 
-/** Each delegated session has its own event bus, which answers this request.
- * Unlike module state, the bus reaches every copy of this extension, including
- * a configured installation that Pi's loader evaluates separately.
- */
 const OWNER_REQUEST = "pi-subagents:owner";
 
 interface OwnerRequest {
@@ -41,17 +37,12 @@ interface OwnerRequest {
 const SKILL_PATH_GUIDANCE =
 	"Skip default skill-file loading for direct `skill://` paths.";
 
-/** The subagent a loading extension serves; undefined in a root session. */
 export function sessionOwner(events: EventBus): SessionOwner | undefined {
 	const request: OwnerRequest = {};
-	// Bus handlers run synchronously within emit.
 	events.emit(OWNER_REQUEST, request);
 	return request.owner;
 }
 
-/** Children inherit their parent's configuration, then its current selections,
- * unless the request names a model (`provider/id` or a unique `id`) or an effort.
- */
 export function spawnContext(
 	ctx: ExtensionContext,
 	owner?: SessionOwner,
@@ -68,10 +59,6 @@ export function spawnContext(
 	};
 }
 
-/** Children are saved beside their parent's file, in a directory named after it,
- * so the hierarchy mirrors delegation and stays out of Pi's session lists.
- * Saved transcripts are records only: delegated runs do not survive a restart.
- */
 function childSessionManager({
 	cwd,
 	parentSession,
@@ -100,9 +87,6 @@ function resolveModel(ctx: ExtensionContext, reference: string): Model<Api> {
 	);
 }
 
-/** A delegated session loads `extension`, the machine-facing integration,
- * unless a configured installation replaces it.
- */
 export async function createChildSession(
 	{ context, owner, onCreated, onError }: SessionRequest,
 	extension: ExtensionFactory,
@@ -111,15 +95,12 @@ export async function createChildSession(
 	const settingsManager = SettingsManager.create(context.cwd, agentDir, {
 		projectTrusted: context.projectTrusted,
 	});
-	// Use the supported decision hook rather than changing the configured policy.
-	// Idle refreshes must not add charges after this run's result was captured.
 	const ownedWarming: ExtensionFactory = (pi) => {
 		pi.on("cache_warming_decision", () => {
 			if (owner.runtime.get(owner.id)?.status !== "running")
 				return { action: "stop" };
 		});
 	};
-	// A task is fixed at spawn, so the prompt never changes mid-conversation.
 	const namesSkillPaths =
 		owner.runtime.get(owner.id)?.instructions.includes("skill://") === true;
 	const eventBus = createEventBus();
@@ -136,8 +117,6 @@ export async function createChildSession(
 		extensionFactories: [
 			ownedWarming,
 			{ name: "subagent-commands", factory: delegatedCommands(owner) },
-			// A configured installation takes precedence, without duplicate registrations.
-			// Otherwise children receive only the machine-facing extension, not the UI entrypoint.
 			{
 				name: "subagents",
 				factory: extension,
@@ -175,10 +154,7 @@ export async function createChildSession(
 		resourceLoader,
 		sessionManager,
 	});
-	// Publication transfers cleanup to the runtime, including failed binding.
 	onCreated(session);
-	// Headless but long-lived: command groups and descendants may outlive a turn,
-	// and the agent remains available for conversation until the runtime settles.
 	await session.bindExtensions({
 		mode: "rpc",
 		shutdownHandler: () => owner.runtime.abort(owner.id),
@@ -186,10 +162,6 @@ export async function createChildSession(
 	});
 }
 
-/** Remind an idle task with nothing left to wait for that it has not
- * reported, e.g. after answering the user. The promise settles with the turn,
- * so startup failures fail the run.
- */
 export function remindChildSession(session: AgentSession): Promise<void> {
 	return session.sendCustomMessage(
 		{

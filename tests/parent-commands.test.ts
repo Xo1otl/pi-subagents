@@ -26,7 +26,6 @@ import {
 	until,
 } from "./fixtures.ts";
 
-/** A root that starts `job` when told to, with the rest of its replies given. */
 async function setup(
 	reply: (
 		context: TranscriptContext,
@@ -50,7 +49,6 @@ async function setup(
 		}),
 	});
 	job = backgroundJob(session.sessionManager.getCwd(), "parent");
-	// The root never ends its jobs, so the tests must.
 	onCleanup(job.release);
 	return { session, tree, job };
 }
@@ -106,7 +104,6 @@ test("a job exit waits for a busy parent, survives its interrupt, and does not r
 	await job.release();
 	await waitForGroupToFinish(await job.pgid());
 	await tree.settled(ROOT);
-	// Held by the integration, so an interrupt clearing pi's queue cannot drop it.
 	expect(session.agent.hasQueuedMessages()).toBe(false);
 	expect(exits(session)).toHaveLength(0);
 	session.clearQueue();

@@ -7,7 +7,6 @@ import {
 } from "@earendil-works/pi-tui";
 import type { UITheme } from "./text.ts";
 
-/** Pi's editor owns multiline editing, paste expansion, history and undo. */
 export class ChatEditor extends Editor {
 	constructor(tui: TUI, theme: UITheme) {
 		super(tui, {
@@ -17,7 +16,6 @@ export class ChatEditor extends Editor {
 	}
 
 	override render(width: number): string[] {
-		// Pi's word wrapper overflows below three columns; render wider and cut.
 		if (width >= 3) return super.render(width);
 		return super.render(3).map((line) => truncateToWidth(line, width, ""));
 	}

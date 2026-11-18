@@ -87,7 +87,7 @@ test("context scans are cached per session, branch, entries and effective model"
 	manager.appendMessage(response("second"));
 	readContextUsage(session);
 	expect(getContextUsage).toHaveBeenCalledTimes(3);
-	manager.branch(first); // Same entry count, different active context.
+	manager.branch(first);
 	readContextUsage(session);
 	expect(getContextUsage).toHaveBeenCalledTimes(4);
 
@@ -99,7 +99,6 @@ test("context scans are cached per session, branch, entries and effective model"
 	readContextUsage(session);
 	expect(getContextUsage).toHaveBeenCalledTimes(6);
 
-	// Replacing an empty ledger changes its session ID, not its leaf or count.
 	manager.newSession();
 	readContextUsage(session);
 	manager.newSession();

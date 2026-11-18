@@ -3,22 +3,14 @@ import type { Usage } from "@earendil-works/pi-ai";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { SubagentResult } from "../runtime/index.ts";
 
-/** What the integration emits and persists, shared with presentation.
- * Pure data and parsing only; producing completions lives in completions.ts.
- */
 export const SUBAGENT_RESULT_TYPE = "subagent-result";
 export const SUBAGENT_USAGE_TYPE = "subagent-usage";
 export const SUBAGENT_REMINDER_TYPE = "subagent-reminder";
 export const COMMAND_EXIT_TYPE = "bg-exit";
 export const COMMAND_UNKNOWN_TYPE = "bg-unknown";
-/** The tool through which a subagent delivers its result and ends its task. */
 export const REPORT_TOOL = "report_to_parent";
-/** The system prompt section that gives a delegated session its role, only
- * while its parent's task runs.
- */
 export const SUBAGENT_ROLE_SECTION = "subagent_role";
 
-/** A report is kept as the tool result's state, never shown to the model. */
 export interface ReportDetails {
 	result: string;
 }
@@ -43,7 +35,6 @@ export interface SubagentCompletionMessage {
 	details: SubagentCompletionDetails;
 }
 
-/** A process group that outlived the command that started it. */
 export interface CommandJob {
 	pgid: number;
 	command: string;
@@ -51,7 +42,6 @@ export interface CommandJob {
 }
 
 interface CommandExitDetails extends CommandJob {
-	/** A job that outlived its shell has no known status, not an implied success. */
 	exitCode: null;
 }
 
@@ -63,11 +53,9 @@ export interface CommandExitMessage {
 }
 
 interface CommandUnknownDetails extends CommandJob {
-	/** Why the group's status could not be read. */
 	error: string;
 }
 
-/** A group whose status stayed unknown: neither stopped nor forgotten. */
 export interface CommandUnknownMessage {
 	customType: typeof COMMAND_UNKNOWN_TYPE;
 	content: string;
@@ -75,12 +63,8 @@ export interface CommandUnknownMessage {
 	details: CommandUnknownDetails;
 }
 
-/** What command tracking tells the conversation that ran the command. */
 export type CommandMessage = CommandExitMessage | CommandUnknownMessage;
 
-/** A string property of an untrusted value, e.g. persisted details or
- * partial tool arguments, which are checked rather than trusted.
- */
 function stringField(value: unknown, key: string): string | undefined {
 	if (!value || typeof value !== "object") return undefined;
 	const field: unknown = Reflect.get(value, key);
@@ -91,7 +75,6 @@ export function subagentId(details: unknown): string | undefined {
 	return stringField(details, "id");
 }
 
-/** The task a subagent tool call carries, once its arguments have one. */
 export function subagentInstructions(args: unknown): string | undefined {
 	return stringField(args, "instructions");
 }
@@ -114,12 +97,10 @@ export function subagentReceipt(id: string): AgentToolResult<SubagentReceipt> {
 	};
 }
 
-/** The result a report tool call carries, if its arguments are complete. */
 export function reportResult(args: unknown): string | undefined {
 	return stringField(args, "result");
 }
 
-/** The report an entry records, if any: a successful report's stored result. */
 export function reportOf(entry: SessionEntry): string | undefined {
 	if (entry.type !== "message") return undefined;
 	const { message } = entry;

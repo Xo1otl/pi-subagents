@@ -22,7 +22,6 @@ function atTextStart(editor: TextCursor): boolean {
 		: editor.getText() === "";
 }
 
-/** Bracketed paste may span several input chunks; none of it is a shortcut. */
 export function createPasteGuard(): (data: string) => boolean {
 	let pasting = false;
 	return (data) => {
@@ -32,14 +31,10 @@ export function createPasteGuard(): (data: string) => boolean {
 	};
 }
 
-/** Left twice within 500 ms at the editor's text start. The first Left still
- * reaches the editor, and a Left that moves the cursor does not arm the chord.
- */
 export function createDoubleLeft() {
 	let previous: number | undefined;
 	return {
 		matches(data: string, editor: TextCursor, now = performance.now()) {
-			// Kitty releases occur between taps; holding a key is not a second tap.
 			if (isKeyRelease(data)) return false;
 			const last = previous;
 			previous = undefined;
@@ -60,8 +55,6 @@ type EditorFactory = NonNullable<
 >;
 
 function focusedEditor(tui: TUI): EditorComponent | undefined {
-	// Pi's renderers expose this method, though the common TUI interface omits it.
-	// Reusing the live editor retains its undo and prompt history.
 	const renderer = tui as TUI &
 		Partial<Pick<TuiAltScreen, "getFocusedComponent">>;
 	const editor = renderer.getFocusedComponent?.();
@@ -77,9 +70,6 @@ function focusedEditor(tui: TUI): EditorComponent | undefined {
 	return undefined;
 }
 
-/** Open on Left-Left at the root editor's text start, wrapping any existing
- * custom editor. The returned cleanup is idempotent.
- */
 export function bindDoubleLeftNavigation(
 	ui: Pick<ExtensionUIContext, "getEditorComponent" | "setEditorComponent">,
 	enabled: () => boolean,
@@ -116,7 +106,6 @@ export function bindDoubleLeftNavigation(
 		disposed = true;
 		for (const restore of restores.reverse()) restore();
 		restores.length = 0;
-		// Another extension may have installed its own editor after ours.
 		if (ui.getEditorComponent() === factory)
 			ui.setEditorComponent(previousFactory);
 	};

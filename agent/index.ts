@@ -49,7 +49,6 @@ const EFFORTS = [
 	"max",
 ] as const satisfies readonly ThinkingLevel[];
 
-/** Compose execution with Pi's session lifecycle, without loading presentation. */
 export function createSubagentRuntime(
 	rootSessionManager?: SessionManager,
 ): Subagents {
@@ -62,62 +61,43 @@ export function createSubagentRuntime(
 	});
 }
 
-/** Root-session presentation. The integration binds it once the session's
- * subagents are installed and releases it before they are torn down.
- */
 export interface SubagentView {
 	bind(runtime: Subagents, ctx: ExtensionContext): void;
 	dispose(): void;
 }
 
-/** What reaches the root's context without having been asked for in its turn. */
 type Notice = SubagentCompletionMessage | CommandMessage;
 
-/** What a finished run leaves in its parent's session, delivered or not. */
 type CompletionRecord = Pick<SubagentResult, "id" | "status" | "usage">;
 
 interface SessionBinding {
 	runtime: Subagents;
-	/** Pi's public SessionManager behind the context's read-only view. */
 	manager: SessionManager;
 	sessionId: string;
-	/** Only cancellation aborts a headless session; it fences that session's older children. */
 	abortEpoch: number;
 	stopWatchingAbort: () => void;
-	/** Records awaiting a boundary at which they can be persisted. */
 	accounting: CompletionRecord[];
-	/** Formatting artifacts remain ours until the queued message is persisted. */
 	pendingCompletions: Set<SubagentCompletionMessage>;
-	/** Root notices wait here while it is busy: an interrupt clears pi's queue. */
 	held: Notice[];
 }
 
-/** Wire Pi's lifecycle and return the undecorated, machine-facing tool. */
 export function createSubagentIntegration(
 	pi: ExtensionAPI,
 	view?: SubagentView,
 ) {
-	// Each delegated session loads its own extensions, so the owner is fixed.
 	const owner = sessionOwner(pi.events);
-	// A root session's children report to ROOT, a delegated session's to its node.
 	const parentId = owner?.id ?? ROOT;
 	let binding: SessionBinding | undefined;
-	// Only a delegated session has a parent to report to.
 	if (owner) registerReporting(pi, owner);
 
-	// A delegated session's jobs belong to its run (see delegatedCommands).
 	const commands = owner ? undefined : trackCommands(pi, rootCommands());
 
-	/** The root's jobs are the user's: watched for the model, never ended, and
-	 * told like results, which an interrupt must not drop.
-	 */
 	function rootCommands(): CommandHost {
 		return {
 			ownsJobs: false,
 			track(work, ctx) {
 				const source = current(ctx);
 				if (!source) {
-					// No session is left to tell.
 					void work.catch(() => {});
 					return;
 				}
@@ -126,8 +106,6 @@ export function createSubagentIntegration(
 						`Background command tracking failed: ${errorMessage(error)}`,
 						"error",
 					);
-					// Not every mode shows notifications; keep the rejection for the
-					// runtime's shutdown report.
 					throw error;
 				});
 				source.runtime.trackCompletion(ROOT, reported);
@@ -154,11 +132,6 @@ export function createSubagentIntegration(
 		return cleanup;
 	}
 
-	/** Release presentation, fence deliveries, then stop the session's work.
-	 * A root disposes its runtime. A delegated session, whose runtime is its
-	 * root's, stops work only when shut down: quitting ends its own run, while
-	 * replacing its conversation only cancels its children.
-	 */
 	async function teardown(
 		shutdown?: SessionShutdownEvent["reason"],
 	): Promise<void> {
@@ -166,9 +139,7 @@ export function createSubagentIntegration(
 		try {
 			view?.dispose();
 		} finally {
-			// Fence deliveries before awaiting cancellation or asynchronous initialization.
 			source?.stopWatchingAbort();
-			// Command watchers are tracked work, which shutdown would wait for.
 			commands?.stop();
 			binding = undefined;
 			const cleanup = source ? discardPending(source) : Promise.resolve();
@@ -187,12 +158,10 @@ export function createSubagentIntegration(
 		);
 	}
 
-	/** The binding, while it still belongs to the context's session. */
 	function current(ctx: ExtensionContext): SessionBinding | undefined {
 		return binding && isCurrent(binding, ctx) ? binding : undefined;
 	}
 
-	/** Persist held root notices in order; only the last may start a turn. */
 	function release(source: SessionBinding, triggerTurn: boolean): void {
 		const messages = source.held.splice(0);
 		for (const [index, message] of messages.entries()) {
@@ -201,7 +170,6 @@ export function createSubagentIntegration(
 				deliverAs: "followUp",
 				triggerTurn: trigger,
 			});
-			// An idle session appends an untriggered message at once, without message_end.
 			if (!trigger && message.customType === SUBAGENT_RESULT_TYPE)
 				source.pendingCompletions.delete(message);
 		}
@@ -211,7 +179,6 @@ export function createSubagentIntegration(
 		if (isCurrent(source, ctx) && ctx.isIdle()) release(source, true);
 	}
 
-	/** Keep a notice for the root, which receives it at once if idle. */
 	function hold(
 		source: SessionBinding,
 		ctx: ExtensionContext,
@@ -225,8 +192,6 @@ export function createSubagentIntegration(
 		return current(ctx)?.accounting.splice(0) ?? [];
 	}
 
-	// Custom drafts persist metadata, not model context. Boundary drafts cannot
-	// carry usage; the actual billing entry is appended separately.
 	function appendAccounting(
 		event: BoundaryState,
 		ctx: ExtensionContext,
@@ -246,9 +211,6 @@ export function createSubagentIntegration(
 			pi.appendEntry(SUBAGENT_USAGE_TYPE, record);
 	}
 
-	/** Add one result to its parent's context, or only record it when fenced.
-	 * Run billing is already persisted, independently of this notification.
-	 */
 	async function deliver(
 		source: SessionBinding,
 		ctx: ExtensionContext,
@@ -265,7 +227,6 @@ export function createSubagentIntegration(
 			: undefined;
 		if (!message || !canDeliver()) {
 			try {
-				// Cancellation suppresses context delivery, not already-incurred billing.
 				if (source.manager.getSessionId() === source.sessionId)
 					source.manager.appendCustomEntry(SUBAGENT_USAGE_TYPE, record);
 			} finally {
@@ -282,14 +243,11 @@ export function createSubagentIntegration(
 			}
 			const parent = source.runtime.get(owner.id)?.session;
 			if (!parent) throw new Error("Subagent parent session is unavailable.");
-			// Unlike pi.sendMessage (void), the SDK promise observes turn
-			// startup failures and keeps headless settlement/billing fenced.
 			await parent.sendCustomMessage(message, {
 				deliverAs: "followUp",
 				triggerTurn: true,
 			});
 		} catch (error) {
-			// Unless it was already persisted or discarded with its binding.
 			if (source.pendingCompletions.delete(message))
 				await discardSubagentCompletion(message);
 			throw error;
@@ -298,14 +256,12 @@ export function createSubagentIntegration(
 
 	pi.on("agent_start", (_event, ctx) => {
 		const source = current(ctx);
-		// Interrupting the root stops its turn, never the delivery of results.
 		if (!owner || !source) return;
 		source.stopWatchingAbort();
 		const signal = ctx.signal;
 		const fence = () => {
 			source.abortEpoch++;
 		};
-		// Fence immediately, not after potentially asynchronous agent_end handlers.
 		signal?.addEventListener("abort", fence, { once: true });
 		if (signal?.aborted) fence();
 		source.stopWatchingAbort = () =>
@@ -319,7 +275,6 @@ export function createSubagentIntegration(
 			event.message.customType !== SUBAGENT_RESULT_TYPE
 		)
 			return;
-		// A continued agent reuses its ID, so match this exact completion.
 		for (const message of source.pendingCompletions)
 			if (message.details === event.message.details)
 				source.pendingCompletions.delete(message);
@@ -328,19 +283,15 @@ export function createSubagentIntegration(
 		const source = current(ctx);
 		if (source) {
 			source.stopWatchingAbort();
-			// After an interrupt, the root keeps its results without restarting the turn.
 			if (!owner) release(source, !event.aborted);
 			else if (event.aborted) {
 				source.abortEpoch++;
-				// Core subtree cancellation clears this headless session's queues.
 				if (source.runtime.get(owner.id)?.cancelled)
 					await discardPending(source);
 			}
 		}
-		// Aborted runs may skip the final actionable boundary.
 		flushAccounting(ctx);
 	});
-	// Compaction and branch summaries occupy an idle root without a run to settle.
 	const releaseAfterIdleWork = (_event: unknown, ctx: ExtensionContext) => {
 		const source = binding;
 		if (source?.held.length) setImmediate(() => releaseIfIdle(source, ctx));
@@ -351,8 +302,6 @@ export function createSubagentIntegration(
 
 	pi.on("session_start", async (_event, ctx) => {
 		await teardown();
-		// ExtensionContext exposes a read-only view of Pi's public SessionManager.
-		// Capture the actual ledger once; run billing must survive binding teardown.
 		const manager = ctx.sessionManager as SessionManager;
 		const runtime = owner?.runtime ?? createSubagentRuntime(manager);
 		binding = {
@@ -365,7 +314,6 @@ export function createSubagentIntegration(
 			pendingCompletions: new Set(),
 			held: [],
 		};
-		// Delegated sessions stay headless, even under a configured installation.
 		if (!owner) view?.bind(runtime, ctx);
 	});
 	pi.on("session_shutdown", async (event, ctx) => {
@@ -401,7 +349,6 @@ export function createSubagentIntegration(
 			const tree = source.runtime;
 			const epoch = source.abortEpoch;
 			const context = spawnContext(ctx, owner, { model, effort });
-			// After receipt, this job belongs to the runtime, not the parent's turn signal.
 			const started = tree.start(parentId, instructions, context);
 			const canDeliver = () =>
 				isCurrent(source, ctx) &&
@@ -418,8 +365,6 @@ export function createSubagentIntegration(
 							`Subagent ${started.id} completion delivery failed: ${errorMessage(error)}`,
 							"error",
 						);
-					// Headless UI is a no-op. Keep the rejection for runtime settlement
-					// (or shutdown reporting at root) instead of silently losing it.
 					throw error;
 				});
 			tree.trackCompletion(parentId, completion);
@@ -428,7 +373,6 @@ export function createSubagentIntegration(
 	});
 }
 
-/** What delegated sessions load: the machine-facing tool, without presentation. */
 function headlessExtension(pi: ExtensionAPI): void {
 	pi.registerTool(createSubagentIntegration(pi));
 }

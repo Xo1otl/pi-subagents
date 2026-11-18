@@ -11,7 +11,6 @@ import {
 
 type CustomMessage = Extract<AgentMessage, { role: "custom" }>;
 const prefix = "pi-subagents-test-event:";
-/** The messages through which the integration tells an agent something. */
 export const PROTOCOL_TYPES: string[] = [
 	COMMAND_EXIT_TYPE,
 	COMMAND_UNKNOWN_TYPE,
@@ -20,10 +19,6 @@ export const PROTOCOL_TYPES: string[] = [
 ];
 const types = new Set(PROTOCOL_TYPES);
 
-/** Pi converts custom messages to user text before calling a provider. Preserve
- * their protocol metadata for deterministic test providers, not their wording.
- * This hook changes request context only; recorded messages and UI stay real.
- */
 export function protocolMessages(
 	messages: readonly AgentMessage[],
 ): AgentMessage[] {
@@ -40,7 +35,6 @@ export default function protocolFixture(pi: ExtensionAPI): void {
 
 type ProviderMessage = TranscriptContext["messages"][number];
 
-/** The protocol message a provider-facing user message encodes, if any. */
 function decode(
 	message: ProviderMessage | undefined,
 ): CustomMessage | undefined {
@@ -62,7 +56,6 @@ export function lastCustomMessage(
 	return message?.customType === customType ? message : undefined;
 }
 
-/** Whether a protocol message of this type has reached the agent. */
 export function hasCustomMessage(
 	context: TranscriptContext,
 	customType: string,
@@ -72,9 +65,6 @@ export function hasCustomMessage(
 	);
 }
 
-/** A completion's body follows its attribution block, independently of the
- * heading's wording or how the model-facing text joins the blocks.
- */
 export function completionOutput({
 	content,
 }: Pick<CustomMessage, "content">): string {

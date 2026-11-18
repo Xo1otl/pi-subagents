@@ -11,14 +11,12 @@ import { plain, singleLine, type UITheme } from "./text.ts";
 
 export interface TranscriptRow {
 	text: string;
-	/** Only the disclosure header is clickable, leaving logs selectable. */
 	toolId?: string;
 }
 
 export interface TranscriptPreferences {
 	expandTools: boolean;
 	showThinking: boolean;
-	/** Per-call overrides survive streaming updates and agent switches. */
 	toolExpanded: ReadonlyMap<string, boolean>;
 }
 
@@ -32,7 +30,6 @@ interface Block {
 	nested?: boolean;
 }
 
-/** Like pi-ai's contentText, but images leave a visible placeholder. */
 function displayText(
 	content: string | readonly (TextContent | ImageContent)[] | undefined,
 ): string {
@@ -45,7 +42,6 @@ function displayText(
 		.join("\n");
 }
 
-/** The agent's conversation, ending with the response it is still streaming. */
 function transcriptMessages(node: Subagent): AgentMessage[] {
 	const messages =
 		node.session?.sessionManager
@@ -87,7 +83,6 @@ function transcriptBlocks(node: Subagent): Block[] {
 		calls.add(id);
 		const result = results.get(id);
 		const live = node.liveTools.get(id);
-		// A report is the run's result, kept out of what the model read back.
 		const report =
 			name === REPORT_TOOL && !result?.isError
 				? reportResult(args ?? live?.args)
@@ -116,8 +111,6 @@ function transcriptBlocks(node: Subagent): Block[] {
 			(message.role === "custom" && !message.display)
 		)
 			continue;
-		// A partial and finalized assistant message share this key, even though
-		// the final session entry receives a new ID. Disambiguate same-ms messages.
 		const key = `${message.role}:${message.timestamp}`;
 		const occurrence = occurrences.get(key) ?? 0;
 		occurrences.set(key, occurrence + 1);
@@ -143,7 +136,6 @@ function transcriptBlocks(node: Subagent): Block[] {
 					});
 			}
 		} else if (message.role === "toolResult") {
-			// Old or extension-injected transcripts can contain orphan results.
 			addTool(message.toolCallId, message.toolName);
 		} else if (message.role === "bashExecution") {
 			blocks.push({
@@ -168,8 +160,6 @@ function transcriptBlocks(node: Subagent): Block[] {
 			});
 		}
 	}
-	// Execution events can precede transcript persistence, including nested tools
-	// that never have their own transcript message.
 	for (const live of node.liveTools.values())
 		addTool(
 			live.toolCallId,
@@ -177,7 +167,6 @@ function transcriptBlocks(node: Subagent): Block[] {
 			live.args,
 			Boolean(live.parentToolCallId),
 		);
-	// Sent input stays visible while it waits, e.g. for a long-running tool.
 	for (const [index, text] of node.queuedInput.entries())
 		blocks.push({
 			id: `queued:${index}`,
@@ -188,7 +177,6 @@ function transcriptBlocks(node: Subagent): Block[] {
 	return blocks;
 }
 
-/** The argument that identifies a call at a glance, e.g. a command or path. */
 function argumentPreview(args: unknown): string {
 	if (!args || typeof args !== "object") return "";
 	for (const key of ["command", "path", "instructions", "pattern"])
@@ -264,7 +252,6 @@ function renderBlock(
 	return [truncateToWidth(header, width), ...body.render(width)];
 }
 
-/** Cache each block independently so a live log does not re-render old Markdown. */
 export function createTranscriptRenderer(theme: UITheme) {
 	let cache = new Map<
 		string,

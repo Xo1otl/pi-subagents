@@ -14,7 +14,6 @@ interface CachedContextUsage {
 
 const cache = new WeakMap<AgentSession, CachedContextUsage>();
 
-/** Context scans finalized history; streaming and editor frames reuse the last scan. */
 export function readContextUsage(
 	session: AgentSession | undefined,
 ): ContextUsage | undefined {
@@ -46,7 +45,6 @@ function formatTokens(count: number): string {
 	return `${Math.round(count / 1_000_000)}M`;
 }
 
-/** `ctx 50k/100k (50.0%)`, with `?` for whatever pi cannot estimate yet. */
 function describeUsage(
 	usage: ContextUsage | undefined,
 	percentage: string | undefined,
@@ -57,7 +55,6 @@ function describeUsage(
 	return `ctx ${tokens}/${formatTokens(usage.contextWindow)}${share}`;
 }
 
-/** Use pi's context estimate, never cumulative or delegated token charges. */
 export function renderContextUsage(
 	usage: ContextUsage | undefined,
 	theme: UITheme,
@@ -67,7 +64,6 @@ export function renderContextUsage(
 	const percentage =
 		percent === undefined ? undefined : `${percent.toFixed(1)}%`;
 	const text = compact ? (percentage ?? "?") : describeUsage(usage, percentage);
-	// Match the root footer's pressure thresholds, including values over 100%.
 	const pressure = percent ?? 0;
 	return theme.fg(
 		pressure > 90 ? "error" : pressure > 70 ? "warning" : "dim",

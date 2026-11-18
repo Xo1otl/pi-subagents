@@ -27,9 +27,7 @@ export interface Chat extends Focusable {
 	render(width: number, height: number): string[];
 	handleInput(data: string): void;
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined;
-	/** Pasted text goes to the draft verbatim, never to chat shortcuts. */
 	paste(data: string): void;
-	/** Return undelivered messages to the draft, ahead of newer text. */
 	restore(input: readonly string[]): void;
 	invalidate(): void;
 	dispose(): void;
@@ -50,9 +48,6 @@ function hints(width: number): string[] {
 	];
 }
 
-/** One subagent's conversation and composer. It keeps its draft, undo, history,
- * tool expansion and scroll position while the switcher is open.
- */
 export function createChat({
 	id,
 	runtime,
@@ -69,11 +64,9 @@ export function createChat({
 		showThinking: false,
 		toolExpanded: new Map<string, boolean>(),
 	};
-	/** The first visible transcript row, or undefined to follow the end. */
 	let pinnedTop: number | undefined;
 	let error = "";
 	let disposed = false;
-	// Scrolling and clicks act on the last displayed frame.
 	let frame = {
 		visible: [] as readonly TranscriptRow[],
 		top: 0,
@@ -84,7 +77,6 @@ export function createChat({
 	};
 
 	function scrollTo(top: number): void {
-		// Reaching the end resumes following new output.
 		pinnedTop = top >= frame.maxTop ? undefined : Math.max(0, top);
 	}
 
@@ -126,7 +118,6 @@ export function createChat({
 		void runtime.send(id, text).catch((cause: unknown) => {
 			if (disposed) return;
 			error = errorMessage(cause);
-			// Preserve failed input, without replacing a newer draft.
 			if (!editor.getText()) editor.setText(text);
 			tui.requestRender();
 		});
@@ -183,11 +174,9 @@ export function createChat({
 				scrollTo(frame.top + (event.wheelDelta ?? 0));
 				return { handled: true };
 			}
-			// Only clicks: presses and drags remain pi's text selection.
 			if (event.type !== "click" || event.button !== "left") return undefined;
 			const tool = frame.visible[event.y - 1]?.toolId;
 			if (tool) {
-				// Keep the clicked header in place instead of following the end.
 				pinnedTop = frame.top;
 				preferences.toolExpanded.set(
 					tool,
@@ -197,7 +186,6 @@ export function createChat({
 			}
 			const y = event.y - frame.composerTop;
 			if (y < 0 || y >= frame.composerHeight) return undefined;
-			// Position the cursor without moving keyboard focus off the switcher.
 			return editor.handleMouse({ ...event, y })
 				? { handled: true }
 				: undefined;

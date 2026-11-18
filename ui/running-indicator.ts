@@ -3,10 +3,8 @@ import { truncateToWidth } from "@earendil-works/pi-tui";
 import type { Subagent, Subagents } from "../runtime/index.ts";
 
 const WIDGET_KEY = "pi-subagents.running";
-/** IDs listed before eliding the rest. */
 const LISTED_IDS = 3;
 
-/** `● Subagents: 2 running · 1 stopping · 1, 1.1, 2`, or "" when none are active. */
 function summarize(nodes: readonly Subagent[]): string {
 	const active = nodes.filter((node) => node.status === "running");
 	if (!active.length) return "";
@@ -21,7 +19,6 @@ function summarize(nodes: readonly Subagent[]): string {
 	return `● Subagents: ${parts.join(" · ")}`;
 }
 
-/** A root-session widget independent of the switcher and the root's own run. */
 export function bindRunningIndicator(
 	runtime: Subagents,
 	ui: Pick<ExtensionUIContext, "setWidget">,
@@ -30,7 +27,6 @@ export function bindRunningIndicator(
 	let disposed = false;
 
 	function show(next: string): void {
-		// Token streaming should not reinstall or redraw an unchanged widget.
 		if (next === summary) return;
 		summary = next;
 		ui.setWidget(

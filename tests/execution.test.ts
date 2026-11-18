@@ -27,7 +27,6 @@ import {
 
 const context: SpawnContext = { cwd: "/unused", model, projectTrusted: false };
 
-/** The runtime only needs to recognize reports; here they are custom entries. */
 const REPORT = "test-report";
 
 function reportOf(entry: SessionEntry): string | undefined {
@@ -36,13 +35,11 @@ function reportOf(entry: SessionEntry): string | undefined {
 		: undefined;
 }
 
-/** Answer like Pi, and report the answer unless told otherwise. */
 function reply(session: AgentSession, text: string, reported = true): void {
 	session.sessionManager.appendMessage(response(text));
 	if (reported) session.sessionManager.appendCustomEntry(REPORT, text);
 }
 
-/** Only the SDK boundary is stubbed; entries use Pi's real ledger. */
 function sessionStub(overrides: Partial<AgentSession> = {}): AgentSession {
 	const sessionManager = SessionManager.inMemory();
 	const session = {
@@ -57,7 +54,6 @@ function sessionStub(overrides: Partial<AgentSession> = {}): AgentSession {
 	return session;
 }
 
-/** A runtime shut down after the test, unless the test did so itself. */
 function runtimeWith(
 	options: Pick<SubagentsOptions, "createSession"> & Partial<SubagentsOptions>,
 ) {
@@ -81,7 +77,6 @@ function runtimeFor(
 	});
 }
 
-/** The failures that a shutdown reports, in no particular order. */
 async function cleanupErrors(closing: Promise<void>): Promise<string[]> {
 	const failure = await closing.then(
 		() => undefined,
@@ -105,7 +100,6 @@ test("runtime owns execution but delegates session creation and disposal", async
 	const runtime = runtimeFor(session, { createSession, disposeSession });
 	expect(createSession).not.toHaveBeenCalled();
 	const result = await runtime.start(ROOT, "task instructions", context).result;
-	// One session, created for the node from the context given.
 	expect(createSession).toHaveBeenCalledTimes(1);
 	expect(createSession.mock.calls[0]?.[0]).toMatchObject({
 		context,
@@ -120,7 +114,6 @@ test("runtime owns execution but delegates session creation and disposal", async
 		output: "complete output",
 		usage: { totalTokens: 3 },
 	});
-	// Shutdowns requested together or again clean up once.
 	await Promise.all([runtime.dispose(), runtime.dispose()]);
 	await runtime.dispose();
 	expect(disposeSession.mock.calls).toEqual([[session]]);
@@ -164,7 +157,6 @@ test("start reserves a running receipt synchronously, before session initializat
 	const started = runtime.start(ROOT, "delayed child", context);
 	expect(started.id).toBe("1");
 	expect(createSession).not.toHaveBeenCalled();
-	// A resolved tool-receipt promise also beats the factory's synchronous work.
 	await Promise.resolve(started);
 	expect(createSession).not.toHaveBeenCalled();
 	expect(runtime.get("1")?.status).toBe("running");
@@ -262,7 +254,6 @@ test("a send arriving as the run's last work settles is drained and billed", asy
 	const session = sessionStub({
 		prompt: async (text) => {
 			reply(session, text);
-			// Lands just before the microtask that resumes the run's drain.
 			if (text === "initial")
 				queueMicrotask(() => {
 					sent = runtime.send("1", "late input");
@@ -295,11 +286,9 @@ test.each([true, false])(
 				status: "error",
 				error: expect.any(String),
 			});
-			// The last message tells the parent what the agent was saying.
 			expect(result.output).toContain("task result");
 		}
 		expect(remindSession).toHaveBeenCalledTimes(1);
-		// A conversation the user continues is theirs: no report, no reminder.
 		await runtime.send("1", "continue");
 		expect(runtime.get("1")?.status).toBe("done");
 		expect(remindSession).toHaveBeenCalledTimes(1);
@@ -341,13 +330,11 @@ test("a task's leftovers are its delegated children and its running work with a 
 			if (text !== "task") return reply(parent, text);
 			runtime.start("1", "child task", context);
 			runtime.trackCompletion("1", job.promise, running);
-			// Work that already ended, though it is still settling, is no leftover.
 			runtime.trackCompletion("1", Promise.resolve(), {
 				label: "PGID 43: ended",
 				running: () => false,
 				detach,
 			});
-			// Nor is work without a handle, e.g. a prompt.
 			runtime.trackCompletion("1", job.promise);
 			found = runtime.leftovers("1");
 			reply(parent, "parent report");
@@ -435,7 +422,6 @@ test("disposal attempts every session and unsubscribe before reporting cleanup e
 	await runtime.start(ROOT, "two", context).result;
 	const errors = ["cleanup failed", "unsubscribe failed", "unsubscribe failed"];
 	expect(await cleanupErrors(runtime.dispose())).toEqual(errors);
-	// Shutting down again reports the same outcome, without repeating cleanup.
 	expect(await cleanupErrors(runtime.dispose())).toEqual(errors);
 	expect(disposeSession).toHaveBeenCalledTimes(2);
 	expect(unsubscribe).toHaveBeenCalledTimes(2);
@@ -497,7 +483,6 @@ test("liveTools retains full raw snapshots, authoritative terminal results, and 
 		details: { complete: true },
 	};
 	const outer = () => runtime.get("1")?.liveTools.get("call");
-	/** What the outer call's snapshot showed as its events arrived. */
 	const seen: unknown[] = [];
 	let toolsInNextRun: number | undefined;
 	let runs = 0;
@@ -568,7 +553,6 @@ test("liveTools retains full raw snapshots, authoritative terminal results, and 
 		parentToolCallId: "call",
 	});
 	await runtime.send("1", "next run");
-	// Cleared as the next run starts, not once it ends.
 	expect(toolsInNextRun).toBe(0);
 	expect(runtime.get("1")?.liveTools.size).toBe(0);
 });

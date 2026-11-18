@@ -15,7 +15,6 @@ import { createPasteGuard } from "./navigation.ts";
 import { createPicker } from "./picker.ts";
 import type { UITheme } from "./text.ts";
 
-/** Content-sized: the picker sits over pi's editor, a chat covers the screen. */
 export const SWITCHER_OVERLAY: OverlayOptions = {
 	width: "100%",
 	anchor: "bottom-left",
@@ -27,7 +26,6 @@ export interface SubagentSwitcherProps {
 	theme: UITheme;
 	keybindings: Pick<KeybindingsManager, "matches">;
 	onClose: () => void;
-	/** Open this agent's chat instead of the picker. */
 	initialId?: string;
 }
 
@@ -37,7 +35,6 @@ export interface SubagentSwitcher extends Component, Focusable {
 	dispose(): void;
 }
 
-/** Pick a subagent, then chat with it on its own screen. */
 export function createSubagentSwitcher({
 	runtime,
 	tui,
@@ -46,7 +43,6 @@ export function createSubagentSwitcher({
 	onClose,
 	initialId,
 }: SubagentSwitcherProps): SubagentSwitcher {
-	// Keyed like React state: each agent keeps its chat across switches.
 	const chats = new Map<string, Chat>();
 	const isPaste = createPasteGuard();
 	let chosen = initialId;
@@ -59,7 +55,6 @@ export function createSubagentSwitcher({
 	function show(id: string | undefined, next = screen): void {
 		chosen = id;
 		screen = next;
-		// Only the visible chat's composer shows a cursor.
 		const active = activeChat();
 		for (const chat of chats.values())
 			chat.focused = focused && chat === active;
@@ -90,7 +85,6 @@ export function createSubagentSwitcher({
 		return chat;
 	}
 
-	/** The open chat, or undefined on the picker. */
 	function activeChat(): Chat | undefined {
 		const id = selected();
 		return !closed && screen === "chat" && id ? chatFor(id) : undefined;
@@ -105,7 +99,6 @@ export function createSubagentSwitcher({
 	function stop(): void {
 		const id = selected();
 		if (!id) return;
-		// Like pi's interrupt, undelivered messages return to each agent's draft.
 		for (const [agent, input] of runtime.abort(id))
 			chatFor(agent).restore(input);
 	}
@@ -140,7 +133,6 @@ export function createSubagentSwitcher({
 		handleInput(data) {
 			if (closed) return;
 			const chat = activeChat();
-			// The picker has no text field to paste into.
 			if (isPaste(data)) chat?.paste(data);
 			else if (keybindings.matches(data, "app.interrupt")) close();
 			else if (matchesKey(data, "tab")) show(cycle(1));
@@ -151,7 +143,6 @@ export function createSubagentSwitcher({
 		handleMouse(event) {
 			if (closed) return undefined;
 			const result = (activeChat() ?? picker).handleMouse(event);
-			// A wheel over the switcher must not scroll pi's transcript underneath.
 			return (
 				result ??
 				(event.type === "wheel" ? { handled: true, render: false } : undefined)

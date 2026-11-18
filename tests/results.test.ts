@@ -35,7 +35,6 @@ test("running receipts contain only the agent ID and status", () => {
 	const { content, details, structuredContent } = subagentReceipt("1");
 	expect(details).toEqual(receipt);
 	expect(structuredContent).toEqual(receipt);
-	// The model reads the same receipt, whatever its formatting.
 	expect(JSON.parse(contentText(content))).toEqual(receipt);
 });
 

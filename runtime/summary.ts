@@ -5,7 +5,6 @@ import {
 } from "@earendil-works/pi-ai";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 
-/** Attribution for asynchronous delegation, outside a tool result's usage. */
 export const SUBAGENT_USAGE_KIND = "pi-subagents";
 
 export interface RunSummary {
@@ -33,7 +32,6 @@ const COST_KEYS = [
 	"total",
 ] as const;
 
-/** The charge an entry records: a model response, a tool's own, or a usage entry. */
 function entryUsage(entry: SessionEntry): Usage | undefined {
 	if (entry.type !== "message")
 		return "usage" in entry ? entry.usage : undefined;
@@ -43,7 +41,6 @@ function entryUsage(entry: SessionEntry): Usage | undefined {
 		: undefined;
 }
 
-/** Raw entries are the single source of billing, including descendant charges. */
 function summarizeUsage(entries: readonly SessionEntry[]): Usage {
 	const usage: Usage = {
 		input: 0,
@@ -64,7 +61,6 @@ function summarizeUsage(entries: readonly SessionEntry[]): Usage {
 	return usage;
 }
 
-/** Propagate only new, local charges; descendants bill every ancestor themselves. */
 export function summarizeOwnUsage(entries: readonly SessionEntry[]): Usage {
 	return summarizeUsage(
 		entries.filter(
@@ -77,22 +73,9 @@ export function summarizeOwnUsage(entries: readonly SessionEntry[]): Usage {
 export interface RunOutcome {
 	cancelled: boolean;
 	error?: string;
-	/** Present for a delegated task, whose result is its report: the report an
-	 * entry records, if any. A conversation the user continued has none; its
-	 * output is its last message.
-	 */
 	reportOf?: (entry: SessionEntry) => string | undefined;
 }
 
-/** Derive one run's result from the raw entries it appended.
- * Raw entries survive compaction and context edits, so neither the report
- * nor billing disappears when a full pi session repairs its model context.
- *
- * A delegated task's result is its last report, whatever followed it:
- * neither a later failure nor a stop undoes it. Without one, a task that
- * otherwise ended normally is `unreported`: its output is an error, followed
- * by its last message for diagnosis.
- */
 export function summarizeRun(
 	entries: readonly SessionEntry[],
 	{ cancelled, error, reportOf }: RunOutcome,
@@ -122,7 +105,6 @@ export function summarizeRun(
 	if (report !== undefined) return done(report);
 	if (cancelled || final?.stopReason === "aborted")
 		return failed("aborted", "Subagent was aborted.");
-	// A turn may end on tools that terminate it, such as a report.
 	if (
 		error ||
 		(final && final.stopReason !== "stop" && final.stopReason !== "toolUse")
