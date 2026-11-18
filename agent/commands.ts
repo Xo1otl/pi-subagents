@@ -316,7 +316,7 @@ export function trackCommands(
 			return undefined;
 		return {
 			block: true,
-			reason: `Blocked: FG sleep ≥${SLEEP_LIMIT_SECONDS}s. A tracked BG job wakes you on exit: end your turn or do other work. To wait for a condition, background an until-loop.`,
+			reason: `Blocked: FG sleep ≥${SLEEP_LIMIT_SECONDS}s. BG jobs wake you on exit: end your turn, or background the wait first (e.g. an until-loop).`,
 		};
 	});
 	// A `!!` command stays out of the model's context, and so does its exit.
