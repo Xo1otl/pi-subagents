@@ -46,7 +46,7 @@ export interface CommandHost {
 	readonly ownsJobs: boolean;
 	/** Keep the session's settlement open until the work settles; a rejection
 	 * is a tracking failure. A group's watch comes with its `leftover`, which
-	 * stops the group (when owned) and the watch.
+	 * ends the watch and leaves the group running, never stopped.
 	 */
 	track(work: Promise<void>, ctx: ExtensionContext, leftover?: Leftover): void;
 	/** Capture the conversation running a command, unless it is already over. */
@@ -91,7 +91,7 @@ function commandUnknown(
 	const seconds = UNKNOWN_STATUS_REPORT_MS / 1000;
 	return {
 		customType: COMMAND_UNKNOWN_TYPE,
-		content: `PGID ${job.pgid} status unknown for ${seconds}s (${commandPreview(reason)}); not stopped, still tracked; notifies once exit is seen: ${commandPreview(job.command)}`,
+		content: `PGID ${job.pgid} status unknown for ${seconds}s (${commandPreview(reason)}); still tracked: ${commandPreview(job.command)}`,
 		display: true,
 		details: { ...job, error: reason },
 	};
@@ -147,8 +147,7 @@ export function trackCommands(
 	}
 
 	/** Watch a running group until it finishes, telling its conversation.
-	 * Stopping this one group, e.g. one that a reporting run left over, ends
-	 * its watch as stopping them all does.
+	 * Detaching it, e.g. as a report leaves it running, ends the watch alone.
 	 */
 	function watch(
 		job: CommandJob,
@@ -182,11 +181,12 @@ export function trackCommands(
 		};
 		host.track(follow(), ctx, {
 			label: `PGID ${pgid}: ${commandPreview(job.command)}`,
-			stop() {
+			// Deleted once finished, before its end is told.
+			running: () => groups.has(pgid),
+			detach() {
 				stopped.abort();
-				if (!groups.delete(pgid)) return false;
-				end(pgid, ctx);
-				return true;
+				// Out of the map, no stop or shutdown ends it.
+				groups.delete(pgid);
 			},
 		});
 	}
@@ -260,9 +260,7 @@ export function trackCommands(
 				// Name the tracked group at launch, so its exit notice can stay short.
 				if (pgid !== undefined)
 					options.onData(
-						Buffer.from(
-							`${endsLine ? "" : "\n"}[PGID ${pgid} tracked; exit wakes you—safe to go idle]\n`,
-						),
+						Buffer.from(`${endsLine ? "" : "\n"}[PGID ${pgid} tracked]\n`),
 					);
 				await rm(directory, { recursive: true, force: true }).catch(fail);
 			}
@@ -299,15 +297,16 @@ export function trackCommands(
 			...bash,
 			promptGuidelines: [
 				...(bash.promptGuidelines ?? []),
-				"BG jobs tracked -> wake you on exit (e.g. `nohup sh -c 'until <check>; do …; done' > log 2>&1 &`). Meanwhile, do other work or end your turn (go idle); NEVER sleep-poll in FG. To outlive session, detach (e.g. `setsid -f cmd`); `&`/subshells stay in tracked PGID.",
+				"BG jobs tracked -> wake you on exit. To wait for a condition, background an until-loop (e.g. `until <check>; do …; done > log 2>&1 &`). Meanwhile, do other work or end your turn.",
 			],
 			// Replace execution without enabling a tool excluded by defaultTools.
 			defaultActive: false,
 		});
 	});
-	// Prompting alone does not stop sleep-polling; refusing it at the call does.
-	// A wait on what no tracked job covers (a remote run, a `setsid` job) moves
-	// to a background loop, whose exit is tracked.
+	// Forbidding sleep-polling in the guideline did not stop it; refusing it at
+	// the call does, so the guideline leaves it out. A wait on what no tracked
+	// job covers (a remote run, a `setsid` job) moves to a background loop,
+	// whose exit is tracked.
 	pi.on("tool_call", (event) => {
 		if (
 			!session ||
@@ -317,7 +316,7 @@ export function trackCommands(
 			return undefined;
 		return {
 			block: true,
-			reason: `Blocked: FG sleep ≥${SLEEP_LIMIT_SECONDS}s. A tracked BG job wakes you on exit: end your turn or do other work. To wait on anything else, run the wait as one (e.g. \`nohup sh -c 'until <check>; do …; done' > log 2>&1 &\`).`,
+			reason: `Blocked: FG sleep ≥${SLEEP_LIMIT_SECONDS}s. A tracked BG job wakes you on exit: end your turn or do other work. To wait for a condition, background an until-loop.`,
 		};
 	});
 	// A `!!` command stays out of the model's context, and so does its exit.
@@ -333,7 +332,8 @@ export function trackCommands(
 }
 
 /** Track a delegated session's commands: their groups keep its run open,
- * resume it when they exit, and end with it or with its report.
+ * resume it when they exit, and end with it, unless its report leaves them
+ * running.
  */
 export function delegatedCommands({
 	runtime,

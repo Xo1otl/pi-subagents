@@ -9,9 +9,10 @@ import {
 import { errorMessage } from "../runtime/errors.ts";
 import {
 	createSubagents,
+	type Leftover,
+	type Leftovers,
 	ROOT,
 	type SpawnContext,
-	type SubagentResult,
 	type SubagentsOptions,
 } from "../runtime/index.ts";
 import { deferred, model, onCleanup, response, until } from "./fixtures.ts";
@@ -323,60 +324,56 @@ test("an ignored reminder is repeated only once the task's work changes, e.g. wi
 	expect(remindSession).toHaveBeenCalledTimes(2);
 });
 
-test("stopping a task's leftovers ends its children and stoppable work at once, naming what still ran", async () => {
-	const job = Promise.withResolvers<void>();
-	const stop = mock(() => {
-		job.resolve();
-		return true;
-	});
-	let stopped: string[] = [];
-	let leftover: SubagentResult | undefined;
+test("a task's leftovers are its delegated children and its running work with a leftover handle, none of them stopped", async () => {
+	const childWork = deferred();
+	const job = deferred();
+	const detach = mock(() => {});
+	const running: Leftover = {
+		label: "PGID 42: job",
+		running: () => true,
+		detach,
+	};
+	let found: Leftovers | undefined;
 	const parent = sessionStub({
 		prompt: async (text) => {
 			if (text !== "task") return reply(parent, text);
-			const child = runtime.start("1", "child task", context);
-			runtime.trackCompletion("1", job.promise, {
-				label: "PGID 42: job",
-				stop,
-			});
-			// Work that already ended, though it is still settling, was not cut short.
-			const ended = Promise.withResolvers<void>();
-			runtime.trackCompletion("1", ended.promise, {
+			runtime.start("1", "child task", context);
+			runtime.trackCompletion("1", job.promise, running);
+			// Work that already ended, though it is still settling, is no leftover.
+			runtime.trackCompletion("1", Promise.resolve(), {
 				label: "PGID 43: ended",
-				stop: () => {
-					ended.resolve();
-					return false;
-				},
+				running: () => false,
+				detach,
 			});
-			stopped = runtime.stopLeftovers("1");
-			leftover = await child.result;
-			// The task goes on: it may start new work, then report.
-			await runtime.start("1", "new child", context).result;
+			// Nor is work without a handle, e.g. a prompt.
+			runtime.trackCompletion("1", job.promise);
+			found = runtime.leftovers("1");
 			reply(parent, "parent report");
+			job.resolve();
+			childWork.resolve();
 		},
 	});
 	const runtime = runtimeWith({
 		createSession: async (_context, { id }, onCreated) => {
 			if (id === "1") return onCreated(parent);
-			// A child that works until stopped, unless its work is new.
-			const work = Promise.withResolvers<void>();
 			const child = sessionStub({
 				prompt: async (text) => {
-					if (text === "new child") return reply(child, "new work");
-					await work.promise;
+					await childWork.promise;
+					reply(child, text);
 				},
-				abort: async () => work.resolve(),
 			});
 			onCreated(child);
 		},
 	});
-	const result = await runtime.start(ROOT, "task", context).result;
-	expect(result).toMatchObject({ status: "done", output: "parent report" });
-	expect(result).not.toHaveProperty("leftover");
-	expect(leftover).toMatchObject({ status: "aborted", leftover: true });
-	expect(stopped).toEqual(["subagent 1.1", "PGID 42: job"]);
-	expect(stop).toHaveBeenCalledTimes(1);
-	expect(runtime.get("1.2")?.status).toBe("done");
+	expect(await runtime.start(ROOT, "task", context).result).toMatchObject({
+		status: "done",
+		output: "parent report",
+	});
+	expect(found?.children).toEqual(["1.1"]);
+	expect(found?.work).toHaveLength(1);
+	expect(found?.work[0]).toBe(running);
+	expect(detach).not.toHaveBeenCalled();
+	expect(runtime.get("1.1")?.status).toBe("done");
 });
 
 test("failed binding revokes a published session and retry creates a fresh one", async () => {

@@ -265,11 +265,11 @@ test("a command-exit wake can launch another background command before reporting
 	expect(notifications).toBe(2);
 });
 
-test.each([false, true])(
-	"a report stops a job left running and tells the agent, which keeps its report or reports again (again: %p)",
-	async (again) => {
+test.each(["waits for the exit", "reports again"] as const)(
+	"a report while a job runs is refused, naming the job; the agent %s",
+	async (choice) => {
 		const tree = testRuntime();
-		let told = "";
+		let refusal = "";
 		let requests = 0;
 		const context = await spawnContext(
 			stream((ctx) => {
@@ -279,26 +279,74 @@ test.each([false, true])(
 					return toolCall("bash", { command: job.command });
 				if (last?.role === "toolResult" && last.toolName === "bash")
 					return report("first report");
-				told = lastText(ctx);
-				return again ? report("revised report") : response("fine as it is");
+				if (lastCustomMessage(ctx, COMMAND_EXIT_TYPE))
+					return report("report after exit");
+				refusal = lastText(ctx);
+				return choice === "reports again"
+					? report("report leaving the job")
+					: response("waiting for the job");
 			}),
 		);
-		const job = backgroundJob(context.cwd, "forgotten");
-		const result = await tree.start(ROOT, "start", context).result;
-		const pgid = await job.pgid();
-		expect(told).toContain(String(pgid));
-		expect(result).toMatchObject({
-			status: "done",
-			output: again ? "revised report" : "first report",
-		});
-		// The job is never released: the report stopped it, telling no one else.
-		expect(await isProcessGroupActive(pgid)).toBe(false);
-		expect(existsSync(job.finished)).toBe(false);
-		expect(exits(tree)).toHaveLength(0);
-		// Nothing was left the second time, so that report ended the turn.
-		expect(requests).toBe(3);
+		const job = backgroundJob(context.cwd, "refused");
+		const started = tree.start(ROOT, "start", context);
+		if (choice === "waits for the exit") {
+			// The refused report was not sent, and the job is still tracked.
+			await until(() => idle(tree));
+			expect(tree.get("1")?.status).toBe("running");
+			await job.release();
+			expect(await started.result).toMatchObject({
+				status: "done",
+				output: "report after exit",
+			});
+			expect(exits(tree)).toHaveLength(1);
+			expect(requests).toBe(4);
+		} else {
+			// Sent while the job runs, which then ends the turn.
+			expect(await started.result).toMatchObject({
+				status: "done",
+				output: "report leaving the job",
+			});
+			expect(requests).toBe(3);
+			// Untracked, it is not stopped at shutdown either.
+			await tree.dispose();
+			expect(await isProcessGroupActive(await job.pgid())).toBe(true);
+			await job.release();
+			await waitForGroupToFinish(await job.pgid());
+			expect(existsSync(job.finished)).toBe(true);
+		}
+		expect(refusal).toContain(String(await job.pgid()));
 	},
 );
+
+test("a job started after a refusal refuses the next report too", async () => {
+	const tree = testRuntime();
+	const refusals: string[] = [];
+	const context = await spawnContext(
+		stream((ctx) => {
+			const last = ctx.messages.at(-1);
+			if (lastText(ctx) === "start")
+				return toolCall("bash", { command: first.command });
+			if (last?.role !== "toolResult") return response("unexpected");
+			if (last.toolName === "bash") return report("report");
+			refusals.push(lastText(ctx));
+			return refusals.length === 1
+				? toolCall("bash", { command: second.command })
+				: report("report leaving both jobs");
+		}),
+	);
+	const first = backgroundJob(context.cwd, "told");
+	const second = backgroundJob(context.cwd, "untold");
+	expect(await tree.start(ROOT, "start", context).result).toMatchObject({
+		status: "done",
+		output: "report leaving both jobs",
+	});
+	expect(refusals).toHaveLength(2);
+	expect(refusals[1]).toContain(String(await second.pgid()));
+	for (const job of [first, second])
+		expect(await isProcessGroupActive(await job.pgid())).toBe(true);
+	await first.release();
+	await second.release();
+});
 
 test("a report with nothing left running ends the turn at once", async () => {
 	const tree = testRuntime();

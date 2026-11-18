@@ -295,34 +295,47 @@ describe("task results", () => {
 		expect(session?.agent.peekQueuedMessages()).toHaveLength(0);
 	});
 
-	test("a report stops the children still running and tells only the agent, whose report stands unless it reports again", async () => {
+	test("a report while children run is refused, naming them, until their results have reached the agent", async () => {
 		const tree = testRuntime();
-		let told = "";
-		const result = await tree.start(
+		const child = deferred();
+		let refusal = "";
+		const started = tree.start(
 			ROOT,
 			"delegate, then report",
 			await spawnContext(
-				stream((context, options) => {
-					if (lastText(context) === "endless") return waiting(options?.signal);
+				stream(async (context, options) => {
+					const text = lastText(context);
+					if (text === "delegate, then report")
+						return toolCall("subagent", { instructions: "child task" });
+					if (text === "child task") {
+						await Promise.race([child.promise, waiting(options?.signal)]);
+						return report("child done");
+					}
+					if (lastCustomMessage(context, SUBAGENT_RESULT_TYPE))
+						return report("parent done, with the child's result");
 					const last = context.messages.at(-1);
-					if (last?.role !== "toolResult")
-						return toolCall("subagent", { instructions: "endless" });
-					if (last.toolName === "subagent") return report("parent done");
-					told = lastText(context);
-					return response("fine as it is");
+					if (last?.role === "toolResult" && last.toolName === "subagent")
+						return report("parent done early");
+					refusal = text;
+					return response("waiting for the child");
 				}),
 			),
-		).result;
-		// The agent is told which child its report stopped.
-		expect(told).toContain("1.1");
-		expect(result).toMatchObject({ status: "done", output: "parent done" });
-		expect(tree.get("1.1")?.status).toBe("aborted");
-		// The stopped child's result does not wake its parent.
-		expect(
-			tree
-				.get("1")
-				?.session?.messages.some((message) => message.role === "custom"),
-		).toBe(false);
+		);
+		await until(
+			() =>
+				tree.get("1")?.session?.isIdle === true &&
+				tree.get("1")?.session?.getLastAssistantText() ===
+					"waiting for the child",
+		);
+		expect(refusal).toContain("1.1");
+		expect(tree.get("1")?.status).toBe("running");
+		expect(tree.get("1.1")?.status).toBe("running");
+		child.resolve();
+		expect(await started.result).toMatchObject({
+			status: "done",
+			output: "parent done, with the child's result",
+		});
+		expect(tree.get("1.1")?.status).toBe("done");
 	});
 
 	test("a report in a conversation the user continued is not delivered, and says so", async () => {

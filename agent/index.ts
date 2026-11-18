@@ -411,10 +411,7 @@ export function createSubagentIntegration(
 						!signal?.aborted &&
 						!tree.get(owner.id)?.cancelled));
 			const completion = started.result
-				// The report that stopped a leftover child already told its parent.
-				.then((result) =>
-					deliver(source, ctx, result, () => !result.leftover && canDeliver()),
-				)
+				.then((result) => deliver(source, ctx, result, canDeliver))
 				.catch((error: unknown) => {
 					if (canDeliver())
 						ctx.ui.notify(

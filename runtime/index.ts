@@ -35,14 +35,26 @@ export interface SessionOwner {
 	id: string;
 }
 
-/** Work that a reporting task stops instead of waiting for. */
+/** Tracked work that a reporting task may leave running, e.g. a job. */
 export interface Leftover {
 	/** Names the work for the agent, e.g. a job's PGID and command. */
 	readonly label: string;
-	/** Stop the work, returning whether it was still running: work that
-	 * already ended may still be settling, e.g. while telling of its end.
+	/** Whether the work still runs: work that already ended may still be
+	 * settling, e.g. while telling of its end.
 	 */
-	stop(): boolean;
+	running(): boolean;
+	/** Stop tracking the work without stopping it: nothing waits for it,
+	 * tells of its end or stops it any longer.
+	 */
+	detach(): void;
+}
+
+/** What a task still runs, e.g. as it reports. */
+export interface Leftovers {
+	/** Its delegated children still running, by ID: their results are its own. */
+	children: string[];
+	/** Its running work with a leftover handle. */
+	work: Leftover[];
 }
 
 export interface SubagentsOptions {
@@ -107,8 +119,6 @@ export interface Subagent {
 /** Complete run data, independent of tool output limits and presentation. */
 export interface SubagentResult extends RunSummary {
 	id: string;
-	/** Stopped by its parent's report, which already told the parent agent. */
-	leftover?: boolean;
 }
 
 export interface Subagents {
@@ -124,18 +134,16 @@ export interface Subagents {
 		context: SpawnContext,
 	): { id: string; result: Promise<SubagentResult> };
 	/** Include asynchronous work, such as result delivery, in a parent's
-	 * settlement. With a `leftover` handle, the parent's report stops it instead.
+	 * settlement. With a `leftover` handle, the parent's report may leave it
+	 * running instead.
 	 */
 	trackCompletion(
 		parentId: string,
 		completion: Promise<void>,
 		leftover?: Leftover,
 	): void;
-	/** Stop what a task left running as it reports: its delegated children
-	 * and its tracked work with a leftover handle, such as jobs. Returns what
-	 * was still running, by label. The children's results are not delivered.
-	 */
-	stopLeftovers(id: string): string[];
+	/** What a task still runs, e.g. as it reports. */
+	leftovers(id: string): Leftovers;
 	/** Resolves once a parent's tracked work, including late additions, drains. */
 	settled(parentId: string): Promise<void>;
 	/** Steer an active run; otherwise continue the same conversation. */
@@ -152,8 +160,6 @@ interface ActiveRun {
 	 * it reports nothing.
 	 */
 	readonly userLed: boolean;
-	/** Stopped by its parent's report, which already told the parent agent. */
-	leftover: boolean;
 	/** Reminded to report since the run's tracked work last changed. */
 	reminded: boolean;
 	reminder?: Promise<void>;
@@ -293,8 +299,8 @@ export function createSubagents({
 	const nodes = new Map<string, SubagentNode>();
 	/** Outstanding work by the parent whose settlement includes it. */
 	const completions = new Map<string, Set<Promise<void>>>();
-	/** How to stop outstanding work that a report leaves over. */
-	const leftovers = new Map<Promise<void>, Leftover>();
+	/** Outstanding work that a report may leave running. */
+	const handles = new Map<Promise<void>, Leftover>();
 	/** Failures without a running node to own them, reported at shutdown. */
 	const completionErrors: unknown[] = [];
 	const listeners = new Set<() => void>();
@@ -365,10 +371,10 @@ export function createSubagents({
 		const pending = completions.get(parentId) ?? new Set();
 		completions.set(parentId, pending);
 		pending.add(completion);
-		if (leftover) leftovers.set(completion, leftover);
+		if (leftover) handles.set(completion, leftover);
 		const remove = () => {
 			pending.delete(completion);
-			leftovers.delete(completion);
+			handles.delete(completion);
 			if (!pending.size && completions.get(parentId) === pending)
 				completions.delete(parentId);
 			const node = nodes.get(parentId);
@@ -483,7 +489,6 @@ export function createSubagents({
 		// Track the whole delegated run before any lifecycle callback can request shutdown.
 		const active: ActiveRun = {
 			userLed,
-			leftover: false,
 			reminded: false,
 			preflight: initialization.promise,
 			settled: settlement.promise,
@@ -583,40 +588,26 @@ export function createSubagents({
 				changed();
 			}
 			const { status, error, output, usage } = summary;
-			return {
-				id: node.id,
-				status,
-				error,
-				output,
-				usage,
-				...(active.leftover && { leftover: true }),
-			};
+			return { id: node.id, status, error, output, usage };
 		} finally {
 			initialization.resolve();
 			finish();
 		}
 	}
 
-	function stopLeftovers(id: string): string[] {
-		const stopped: string[] = [];
-		// A child the user continues is theirs, and reports nothing anyway.
-		for (const child of childrenOf(id))
-			if (child.run && !child.run.userLed && !child.cancelled) {
-				child.run.leftover = true;
-				stopped.push(`subagent ${child.id}`);
-				abort(child.id);
-			}
+	function leftovers(id: string): Leftovers {
+		const work: Leftover[] = [];
 		for (const completion of completions.get(id) ?? []) {
-			const leftover = leftovers.get(completion);
-			if (!leftover) continue;
-			leftovers.delete(completion);
-			try {
-				if (leftover.stop()) stopped.push(leftover.label);
-			} catch (error) {
-				completionErrors.push(error);
-			}
+			const leftover = handles.get(completion);
+			if (leftover?.running()) work.push(leftover);
 		}
-		return stopped;
+		return {
+			// A child the user continues is theirs, and reports nothing anyway.
+			children: childrenOf(id)
+				.filter((child) => child.delegated && !child.cancelled)
+				.map((child) => child.id),
+			work,
+		};
 	}
 
 	/** Mirror a published session's events into its node. */
@@ -721,7 +712,7 @@ export function createSubagents({
 		},
 		start,
 		trackCompletion,
-		stopLeftovers,
+		leftovers,
 		settled,
 		send,
 		abort,
