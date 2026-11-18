@@ -15,7 +15,15 @@ import {
 	type SpawnContext,
 	type SubagentsOptions,
 } from "../runtime/index.ts";
-import { deferred, model, onCleanup, response, until } from "./fixtures.ts";
+import {
+	checkpoint,
+	deferred,
+	model,
+	onCleanup,
+	response,
+	stillPending,
+	until,
+} from "./fixtures.ts";
 
 const context: SpawnContext = { cwd: "/unused", model, projectTrusted: false };
 
@@ -68,7 +76,7 @@ function runtimeFor(
 	options: Partial<SubagentsOptions> = {},
 ) {
 	return runtimeWith({
-		createSession: async (_context, _owner, onCreated) => onCreated(session),
+		createSession: async ({ onCreated }) => onCreated(session),
 		...options,
 	});
 }
@@ -92,17 +100,17 @@ test("runtime owns execution but delegates session creation and disposal", async
 	const session = sessionStub({ subscribe: () => unsubscribe, prompt });
 	const disposeSession = mock(async (_session: AgentSession) => {});
 	const createSession = mock<SubagentsOptions["createSession"]>(
-		async (_context, _owner, onCreated) => onCreated(session),
+		async ({ onCreated }) => onCreated(session),
 	);
 	const runtime = runtimeFor(session, { createSession, disposeSession });
 	expect(createSession).not.toHaveBeenCalled();
 	const result = await runtime.start(ROOT, "task instructions", context).result;
 	// One session, created for the node from the context given.
 	expect(createSession).toHaveBeenCalledTimes(1);
-	expect(createSession.mock.calls[0]?.slice(0, 2)).toEqual([
+	expect(createSession.mock.calls[0]?.[0]).toMatchObject({
 		context,
-		{ runtime, id: "1" },
-	]);
+		owner: { runtime, id: "1" },
+	});
 	expect(prompt.mock.calls.map(([instructions]) => instructions)).toEqual([
 		"task instructions",
 	]);
@@ -147,7 +155,7 @@ test("start reserves a running receipt synchronously, before session initializat
 		},
 	});
 	const createSession = mock<SubagentsOptions["createSession"]>(
-		async (_context, _owner, onCreated) => {
+		async ({ onCreated }) => {
 			await initialized.promise;
 			onCreated(session);
 		},
@@ -161,15 +169,11 @@ test("start reserves a running receipt synchronously, before session initializat
 	expect(createSession).not.toHaveBeenCalled();
 	expect(runtime.get("1")?.status).toBe("running");
 	expect(runtime.get("1")?.session).toBeUndefined();
-	let settled = false;
-	void started.result.then(() => {
-		settled = true;
-	});
 	await until(() => createSession.mock.calls.length === 1);
-	expect(settled).toBe(false);
+	expect(await stillPending(started.result)).toBe(true);
 	initialized.resolve();
 	await until(() => runtime.get("1")?.session !== undefined);
-	expect(settled).toBe(false);
+	expect(await stillPending(started.result)).toBe(true);
 	finished.resolve();
 	expect(await started.result).toMatchObject({
 		status: "done",
@@ -194,24 +198,22 @@ test("start validates synchronously without reserving nodes, and shutdown reject
 });
 
 test("cancellation during session initialization prevents prompting and disposes the late session once", async () => {
-	const initialized = deferred();
-	const entered = deferred();
+	const initialization = checkpoint();
 	const prompt = mock(async () => {});
 	const session = sessionStub({ prompt });
 	const disposeSession = mock(async () => {});
 	const runtime = runtimeFor(session, {
-		createSession: async (_context, _owner, onCreated) => {
-			entered.resolve();
-			await initialized.promise;
+		createSession: async ({ onCreated }) => {
+			await initialization.pass();
 			onCreated(session);
 		},
 		disposeSession,
 	});
 	const started = runtime.start(ROOT, "hello", context);
-	await entered.promise;
+	await until(() => initialization.reached);
 	runtime.abort("1");
 	const closing = runtime.dispose();
-	initialized.resolve();
+	initialization.open();
 	expect((await started.result).status).toBe("aborted");
 	await closing;
 	expect(prompt).not.toHaveBeenCalled();
@@ -354,7 +356,7 @@ test("a task's leftovers are its delegated children and its running work with a 
 		},
 	});
 	const runtime = runtimeWith({
-		createSession: async (_context, { id }, onCreated) => {
+		createSession: async ({ owner: { id }, onCreated }) => {
 			if (id === "1") return onCreated(parent);
 			const child = sessionStub({
 				prompt: async (text) => {
@@ -389,7 +391,7 @@ test("failed binding revokes a published session and retry creates a fresh one",
 	const disposeSession = mock(async (_session: AgentSession) => {});
 	let creates = 0;
 	const runtime = runtimeFor(good, {
-		createSession: async (_context, _owner, onCreated) => {
+		createSession: async ({ onCreated }) => {
 			const session = creates++ === 0 ? failed : good;
 			onCreated(session);
 			if (session === failed) throw new Error("binding failed");
@@ -424,7 +426,7 @@ test("disposal attempts every session and unsubscribe before reporting cleanup e
 			throw new Error("cleanup failed");
 	});
 	const runtime = runtimeWith({
-		createSession: async (_context, _owner, onCreated) => {
+		createSession: async ({ onCreated }) => {
 			onCreated(sessionStub({ subscribe: () => unsubscribe }));
 		},
 		disposeSession,

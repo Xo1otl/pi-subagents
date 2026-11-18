@@ -91,6 +91,11 @@ export function subagentId(details: unknown): string | undefined {
 	return stringField(details, "id");
 }
 
+/** The task a subagent tool call carries, once its arguments have one. */
+export function subagentInstructions(args: unknown): string | undefined {
+	return stringField(args, "instructions");
+}
+
 export function isSubagentReceipt(
 	details: unknown,
 ): details is SubagentReceipt {

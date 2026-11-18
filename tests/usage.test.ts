@@ -4,12 +4,12 @@ import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import { ROOT, type Subagents } from "../runtime/index.ts";
 import {
 	charges,
-	deferred,
+	checkpoint,
 	hierarchyStream,
 	lastText,
-	model,
 	response,
 	rootSession,
+	stillPending,
 	stream,
 	until,
 	waiting,
@@ -58,7 +58,7 @@ test("resuming an aborted child bills each new run without notifying or rechargi
 		const text = lastText(context);
 		if (text === "nest:0") return waiting(options?.signal);
 		if (text === "resume") return response("resumed", { usage: resumedUsage });
-		return hierarchyStream(model, context, options).result();
+		return hierarchyStream.respond(context, options);
 	});
 	const { session, tree } = await rootSession({ streamFn: dispatch });
 	await session.prompt("nest:1");
@@ -89,7 +89,7 @@ test("resumed nested descendants bill all idle ancestors exactly once", async ()
 	const dispatch = stream((context, options) =>
 		lastText(context) === "resume"
 			? response("resumed", { usage: resumedUsage })
-			: hierarchyStream(model, context, options).result(),
+			: hierarchyStream.respond(context, options),
 	);
 	const { session, tree } = await rootSession({ streamFn: dispatch });
 	await session.prompt("nest:3");
@@ -160,22 +160,19 @@ test("a resumed parent that delegates again bills only new local and descendant 
 });
 
 test("a running ancestor drains a resumed descendant through an idle intermediate parent", async () => {
-	const gate = deferred();
-	const entered = deferred();
+	const descendant = checkpoint();
 	const dispatch = stream(async (context, options) => {
 		if (lastText(context) === "slow resume") {
-			entered.resolve();
-			await Promise.race([gate.promise, waiting(options?.signal)]);
+			await descendant.pass(options?.signal);
 			return response("resumed", { usage: resumedUsage });
 		}
-		return hierarchyStream(model, context, options).result();
+		return hierarchyStream.respond(context, options);
 	});
 	const { session, tree } = await rootSession({ streamFn: dispatch });
 	await session.prompt("nest:3");
 	await settled(session, tree);
 	let resumed: Promise<void> | undefined;
 	let requested = false;
-	let completed = false;
 	const rootBefore = session.getSessionStats();
 	const messages = JSON.stringify(session.messages);
 	// Resume the descendant once its ancestor is running again. Sending notifies
@@ -185,15 +182,12 @@ test("a running ancestor drains a resumed descendant through an idle intermediat
 		requested = true;
 		resumed = tree.send("1.1.1", "slow resume");
 	});
-	const ancestor = tree.send("1", "continue ancestor").then(() => {
-		completed = true;
-	});
-	await entered.promise;
+	const ancestor = tree.send("1", "continue ancestor");
+	await until(() => descendant.reached);
 	unsubscribe();
 	await until(() => Boolean(tree.get("1")?.session?.isIdle));
-	await Bun.sleep(10);
-	expect(completed).toBe(false);
-	gate.resolve();
+	expect(await stillPending(ancestor)).toBe(true);
+	descendant.open();
 	await resumed;
 	await ancestor;
 	expectDelta(session, rootBefore, {
@@ -210,7 +204,7 @@ test("stopping a resumed run preserves its charges without a late parent notific
 	const dispatch = stream((context, options) =>
 		lastText(context) === "slow resume"
 			? waiting(options?.signal)
-			: hierarchyStream(model, context, options).result(),
+			: hierarchyStream.respond(context, options),
 	);
 	const { session, tree } = await rootSession({ streamFn: dispatch });
 	await session.prompt("nest:1");

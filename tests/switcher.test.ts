@@ -269,7 +269,7 @@ test("context usage is unknown during startup, then shows the latest request in 
 	// Pending steering is not finalized model context yet.
 	await tree.send("1", "next message");
 	expect(header()).toContain("ctx 50k/100k (50.0%)");
-	release.resolve();
+	release.open();
 	await result;
 	expect(header()).toContain("ctx 61k/100k (61.0%)");
 	await tree.send("1", "resume");

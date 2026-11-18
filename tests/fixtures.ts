@@ -108,6 +108,42 @@ export function deferred() {
 	return gate;
 }
 
+/** A point that a response, tool or hook blocks at until the test opens it,
+ * or its signal aborts. `reached` tells whether anything got there yet.
+ */
+export function checkpoint() {
+	const gate = deferred();
+	let reached = false;
+	return {
+		get reached() {
+			return reached;
+		},
+		async pass(signal?: AbortSignal): Promise<void> {
+			reached = true;
+			await Promise.race([gate.promise, waiting(signal)]);
+		},
+		open: () => gate.resolve(),
+	};
+}
+
+/** Whether a promise is still pending once work that nothing gates has had
+ * time to finish. No event marks that something did not happen, so this
+ * waits briefly: it can miss a regression, but never fails a correct run.
+ */
+export async function stillPending(
+	promise: Promise<unknown>,
+): Promise<boolean> {
+	const pending = Symbol("pending");
+	const outcome = await Promise.race([
+		promise.then(
+			() => undefined,
+			() => undefined,
+		),
+		Bun.sleep(10).then(() => pending),
+	]);
+	return outcome === pending;
+}
+
 /** Remove a completion's full-output file after the test. */
 export function removeOutputOnCleanup(path: string): void {
 	onCleanup(() => rm(dirname(path), { recursive: true, force: true }));
@@ -272,13 +308,18 @@ export function replies(messages: readonly AgentMessage[] = []): string[] {
 	);
 }
 
+type Respond = (
+	context: TranscriptContext,
+	options?: SimpleStreamOptions,
+) => AssistantMessage | Promise<AssistantMessage>;
+
+/** A provider stream answering with `respond`, which other streams can reuse
+ * as their fallback.
+ */
 export function stream(
-	respond: (
-		context: TranscriptContext,
-		options?: SimpleStreamOptions,
-	) => AssistantMessage | Promise<AssistantMessage>,
-): Provider["streamSimple"] {
-	return (_model, context, options) => {
+	respond: Respond,
+): Provider["streamSimple"] & { respond: Respond } {
+	const streamFn: Provider["streamSimple"] = (_model, context, options) => {
 		const output = createAssistantMessageEventStream();
 		queueMicrotask(async () => {
 			let message: AssistantMessage;
@@ -324,6 +365,7 @@ export function stream(
 		});
 		return output;
 	};
+	return Object.assign(streamFn, { respond });
 }
 
 /** Deterministic delegation through full pi sessions and real subagent tools. */
@@ -358,7 +400,9 @@ export const hierarchyStream = stream((context) => {
 /** A stream that runs until aborted. */
 export const paused = stream((_context, options) => waiting(options?.signal));
 
-export function testProvider(streamFn = hierarchyStream): Provider {
+export function testProvider(
+	streamFn: Provider["streamSimple"] = hierarchyStream,
+): Provider {
 	return {
 		id: model.provider,
 		name: "Test provider",
@@ -383,7 +427,7 @@ const QUIET_SETTINGS = {
 
 /** A fresh workspace and agent directory whose model answers with `streamFn`. */
 export async function spawnContext(
-	streamFn = hierarchyStream,
+	streamFn: Provider["streamSimple"] = hierarchyStream,
 ): Promise<SpawnContext & { agentDir: string }> {
 	// Without the preload (e.g. run from another cwd) the first file removes it.
 	await mkdir(root, { recursive: true });
@@ -453,7 +497,7 @@ export const remoteBash: ExtensionFactory = (pi) => {
 	});
 };
 
-export interface ParentOptions {
+interface ParentOptions {
 	streamFn?: Provider["streamSimple"];
 	/** The root's own extensions. */
 	extensions?: ExtensionFactory[];
@@ -575,7 +619,7 @@ export async function rootSession({
 
 /** A child tool that blocks its step until released or cancelled. */
 export async function blockingTool(context: { agentDir: string }) {
-	const release = deferred();
+	const release = checkpoint();
 	await childExtension(context, "blocking", (pi) => {
 		pi.registerTool({
 			name: "blocking",
@@ -583,7 +627,7 @@ export async function blockingTool(context: { agentDir: string }) {
 			description: "Blocks until released",
 			parameters: Type.Object({}),
 			async execute(_id, _args, signal) {
-				await Promise.race([release.promise, waiting(signal)]);
+				await release.pass(signal);
 				return {
 					content: [{ type: "text", text: "tool done" }],
 					details: undefined,

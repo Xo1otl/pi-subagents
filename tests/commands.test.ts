@@ -16,9 +16,9 @@ import { ROOT, type Subagents } from "../runtime/index.ts";
 import {
 	answer,
 	backgroundJob,
+	checkpoint,
 	childExtension,
 	customMessages,
-	deferred,
 	hasCustomMessage,
 	lastCustomMessage,
 	lastText,
@@ -30,7 +30,6 @@ import {
 	testRuntime,
 	toolCall,
 	until,
-	waiting,
 } from "./fixtures.ts";
 
 const idle = (tree: Subagents) =>
@@ -104,13 +103,12 @@ test.each(["nohup", ""])(
 
 test("a job exit reaching a busy session is answered after its reply", async () => {
 	const tree = testRuntime();
-	const reply = deferred();
+	const reply = checkpoint();
 	const context = await spawnContext(
 		stream(async (ctx, options) => {
 			const text = lastText(ctx);
 			if (text === "start") return toolCall("bash", { command: job.command });
-			if (text === "still thinking")
-				await Promise.race([reply.promise, waiting(options?.signal)]);
+			if (text === "still thinking") await reply.pass(options?.signal);
 			if (lastCustomMessage(ctx, COMMAND_EXIT_TYPE))
 				return report("verified after exit");
 			return response(text);
@@ -120,12 +118,12 @@ test("a job exit reaching a busy session is answered after its reply", async () 
 	const started = tree.start(ROOT, "start", context);
 	await until(() => idle(tree));
 	const sent = tree.send("1", "still thinking");
-	await until(() => tree.get("1")?.session?.isIdle === false);
+	await until(() => reply.reached);
 	await job.release();
 	await waitForGroupToFinish(await job.pgid());
 	await until(() => tree.get("1")?.session?.agent.hasQueuedMessages() === true);
 	expect(tree.get("1")?.status).toBe("running");
-	reply.resolve();
+	reply.open();
 	await sent;
 	expect(await started.result).toMatchObject({
 		status: "done",
@@ -169,7 +167,7 @@ test.each(["command", "child"] as const)(
 	"an unreported task waits for both commands and descendants (%s finishes first)",
 	async (first) => {
 		const tree = testRuntime();
-		const child = deferred();
+		const child = checkpoint();
 		const context = await spawnContext(
 			stream(async (ctx, options) => {
 				const text = lastText(ctx);
@@ -178,7 +176,7 @@ test.each(["command", "child"] as const)(
 				if (last?.role === "toolResult" && last.toolName === "bash")
 					return toolCall("subagent", { instructions: "child work" });
 				if (text === "child work") {
-					await Promise.race([child.promise, waiting(options?.signal)]);
+					await child.pass(options?.signal);
 					return report("child finished");
 				}
 				// Reports once it has heard of both.
@@ -190,13 +188,13 @@ test.each(["command", "child"] as const)(
 		);
 		const job = backgroundJob(context.cwd, "nested");
 		const started = tree.start(ROOT, "start", context);
-		await until(() => idle(tree) && tree.get("1.1")?.session?.isIdle === false);
+		await until(() => idle(tree) && child.reached);
 		if (first === "command") {
 			await job.release();
 			await waitForGroupToFinish(await job.pgid());
 			await until(() => exits(tree).length === 1 && idle(tree));
 		} else {
-			child.resolve();
+			child.open();
 			await until(
 				() =>
 					customMessages(tree.get("1")?.session?.messages, SUBAGENT_RESULT_TYPE)
@@ -205,7 +203,7 @@ test.each(["command", "child"] as const)(
 			);
 		}
 		expect(tree.get("1")?.status).toBe("running");
-		child.resolve();
+		child.open();
 		await job.release();
 		expect(await started.result).toMatchObject({
 			status: "done",
@@ -371,7 +369,7 @@ test("a report with nothing left running ends the turn at once", async () => {
 
 test("a report waits for messages already queued, and a later report replaces it", async () => {
 	const tree = testRuntime();
-	const reply = deferred();
+	const reply = checkpoint();
 	const context = await spawnContext(
 		stream(async (ctx, options) => {
 			if (lastText(ctx) === "start")
@@ -379,7 +377,7 @@ test("a report waits for messages already queued, and a later report replaces it
 			if (lastCustomMessage(ctx, COMMAND_EXIT_TYPE))
 				return report("revised after exit");
 			if (lastText(ctx) === "report now") {
-				await Promise.race([reply.promise, waiting(options?.signal)]);
+				await reply.pass(options?.signal);
 				return report("first report");
 			}
 			return response("waiting");
@@ -389,11 +387,11 @@ test("a report waits for messages already queued, and a later report replaces it
 	const started = tree.start(ROOT, "start", context);
 	await until(() => idle(tree));
 	const sent = tree.send("1", "report now");
-	await until(() => tree.get("1")?.session?.isIdle === false);
+	await until(() => reply.reached);
 	await job.release();
 	await waitForGroupToFinish(await job.pgid());
 	await until(() => tree.get("1")?.session?.agent.hasQueuedMessages() === true);
-	reply.resolve();
+	reply.open();
 	await sent;
 	expect(await started.result).toMatchObject({
 		status: "done",

@@ -9,8 +9,8 @@ import {
 import { ROOT, type Subagents } from "../runtime/index.ts";
 import {
 	blockingTool,
+	checkpoint,
 	childExtension,
-	deferred,
 	hasRunningTool,
 	hierarchyStream,
 	lastCustomMessage,
@@ -21,6 +21,7 @@ import {
 	report,
 	response,
 	spawnContext,
+	stillPending,
 	stream,
 	testRuntime,
 	toolCall,
@@ -149,31 +150,23 @@ describe("silent hierarchy", () => {
 
 	test("an idle headless parent accepts a continuation before its descendant completes and bills it in the same run", async () => {
 		const tree = testRuntime();
-		const gate = deferred();
-		let leafStarted = false;
+		const leaf = checkpoint();
 		const paused = stream(async (context, options) => {
-			if (lastText(context) === "nest:0") {
-				leafStarted = true;
-				await Promise.race([gate.promise, waiting(options?.signal)]);
-			}
-			return hierarchyStream(model, context, options).result();
+			if (lastText(context) === "nest:0") await leaf.pass(options?.signal);
+			return hierarchyStream.respond(context, options);
 		});
 		const started = tree.start(ROOT, "nest:1", await spawnContext(paused));
-		let completed = false;
-		void started.result.then(() => {
-			completed = true;
-		});
-		await until(() => leafStarted && Boolean(tree.get("1")?.session?.isIdle));
+		await until(() => leaf.reached && Boolean(tree.get("1")?.session?.isIdle));
 		const node = tree.get("1");
 		if (!node) throw new Error("Missing parent");
 		const tools = [...node.liveTools.keys()];
 		// Accepted before the descendant completes, while the run stays open.
 		await tree.send("1", "live continuation");
-		expect(completed).toBe(false);
+		expect(await stillPending(started.result)).toBe(true);
 		expect(node.status).toBe("running");
 		expect(node.session?.getLastAssistantText()).toBe("live continuation");
 		expect([...node.liveTools.keys()]).toEqual(tools);
-		gate.resolve();
+		leaf.open();
 		// The reply to the continuation was no report; the child's result is.
 		expect(await started.result).toMatchObject({
 			status: "done",
@@ -186,20 +179,17 @@ describe("silent hierarchy", () => {
 
 	test("stopping an idle parent that drains a child stops both and keeps billed work", async () => {
 		const tree = testRuntime();
-		let leafStarted = false;
-		const paused = stream((context, options) => {
-			if (lastText(context) === "nest:0") {
-				leafStarted = true;
-				return waiting(options?.signal);
-			}
-			return hierarchyStream(model, context, options).result();
+		const leaf = checkpoint();
+		const paused = stream(async (context, options) => {
+			if (lastText(context) === "nest:0") await leaf.pass(options?.signal);
+			return hierarchyStream.respond(context, options);
 		});
 		const result = tree.start(
 			ROOT,
 			"nest:1",
 			await spawnContext(paused),
 		).result;
-		await until(() => leafStarted && Boolean(tree.get("1")?.session?.isIdle));
+		await until(() => leaf.reached && Boolean(tree.get("1")?.session?.isIdle));
 		tree.abort("1");
 		expect((await result).status).toBe("aborted");
 		expect(tree.get("1.1")?.status).toBe("aborted");
@@ -211,22 +201,20 @@ describe("silent hierarchy", () => {
 describe("task results", () => {
 	test("failed headless completion delivery is reported, billed once, and cleans its unused output file", async () => {
 		const tree = testRuntime();
-		const gate = deferred();
-		let leafStarted = false;
+		const leaf = checkpoint();
 		const paused = stream(async (context, options) => {
 			if (lastText(context) === "nest:0") {
-				leafStarted = true;
-				await Promise.race([gate.promise, waiting(options?.signal)]);
+				await leaf.pass(options?.signal);
 				return report("large output\n".repeat(3000));
 			}
-			return hierarchyStream(model, context, options).result();
+			return hierarchyStream.respond(context, options);
 		});
 		const result = tree.start(
 			ROOT,
 			"nest:1",
 			await spawnContext(paused),
 		).result;
-		await until(() => leafStarted && Boolean(tree.get("1")?.session?.isIdle));
+		await until(() => leaf.reached && Boolean(tree.get("1")?.session?.isIdle));
 		const parent = tree.get("1")?.session;
 		if (!parent) throw new Error("Missing parent");
 		let path: string | undefined;
@@ -235,7 +223,7 @@ describe("task results", () => {
 			if (path) removeOutputOnCleanup(path);
 			throw new Error("completion sender failed");
 		});
-		gate.resolve();
+		leaf.open();
 		expect(await result).toMatchObject({
 			status: "error",
 			error: "completion sender failed",
@@ -248,31 +236,26 @@ describe("task results", () => {
 
 	test("subtree cancellation discards output files belonging to abandoned queued completions", async () => {
 		const tree = testRuntime();
-		const child = deferred();
-		const parent = deferred();
-		let childRunning = false;
-		let parentRunning = false;
+		const child = checkpoint();
+		const parent = checkpoint();
 		const paused = stream(async (context, options) => {
 			if (lastText(context) === "nest:0") {
-				childRunning = true;
-				await Promise.race([child.promise, waiting(options?.signal)]);
+				await child.pass(options?.signal);
 				return report("large output\n".repeat(3000));
 			}
-			if (lastText(context) === "busy parent") {
-				parentRunning = true;
-				await Promise.race([parent.promise, waiting(options?.signal)]);
-			}
-			return hierarchyStream(model, context, options).result();
+			if (lastText(context) === "busy parent")
+				await parent.pass(options?.signal);
+			return hierarchyStream.respond(context, options);
 		});
 		const result = tree.start(
 			ROOT,
 			"nest:1",
 			await spawnContext(paused),
 		).result;
-		await until(() => childRunning && Boolean(tree.get("1")?.session?.isIdle));
+		await until(() => child.reached && Boolean(tree.get("1")?.session?.isIdle));
 		const sent = tree.send("1", "busy parent");
-		await until(() => parentRunning);
-		child.resolve();
+		await until(() => parent.reached);
+		child.open();
 		const session = tree.get("1")?.session;
 		let path: string | undefined;
 		await until(() => {
@@ -297,7 +280,7 @@ describe("task results", () => {
 
 	test("a report while children run is refused, naming them, until their results have reached the agent", async () => {
 		const tree = testRuntime();
-		const child = deferred();
+		const child = checkpoint();
 		let refusal = "";
 		const started = tree.start(
 			ROOT,
@@ -308,7 +291,7 @@ describe("task results", () => {
 					if (text === "delegate, then report")
 						return toolCall("subagent", { instructions: "child task" });
 					if (text === "child task") {
-						await Promise.race([child.promise, waiting(options?.signal)]);
+						await child.pass(options?.signal);
 						return report("child done");
 					}
 					if (lastCustomMessage(context, SUBAGENT_RESULT_TYPE))
@@ -330,7 +313,7 @@ describe("task results", () => {
 		expect(refusal).toContain("1.1");
 		expect(tree.get("1")?.status).toBe("running");
 		expect(tree.get("1.1")?.status).toBe("running");
-		child.resolve();
+		child.open();
 		expect(await started.result).toMatchObject({
 			status: "done",
 			output: "parent done, with the child's result",
@@ -428,7 +411,7 @@ describe("interaction and cleanup", () => {
 		expect(node?.queuedInput).toEqual(["are you there?"]);
 		await sent;
 		expect(node?.queuedInput).toEqual(["are you there?"]);
-		release.resolve();
+		release.open();
 		// The reply to the user neither stops the run nor becomes its result.
 		expect(await result).toMatchObject({
 			status: "done",
@@ -483,22 +466,19 @@ describe("interaction and cleanup", () => {
 			),
 		);
 		await blockingTool(context);
-		const hook = deferred();
-		const entered = deferred();
+		const hook = checkpoint();
 		await childExtension(context, "input", (pi) => {
 			pi.on("input", async (event) => {
-				if (event.text !== "in flight") return;
-				entered.resolve();
-				await hook.promise;
+				if (event.text === "in flight") await hook.pass();
 			});
 		});
 		const result = tree.start(ROOT, "monitor", context).result;
 		const node = tree.get("1");
 		await until(() => hasRunningTool(node));
 		const sent = tree.send("1", "in flight");
-		await entered.promise;
+		await until(() => hook.reached);
 		expect(tree.abort("1")).toEqual(new Map([["1", ["in flight"]]]));
-		hook.resolve();
+		hook.open();
 		await sent;
 		expect((await result).status).toBe("aborted");
 		expect(JSON.stringify(node?.session?.messages)).not.toContain("in flight");
@@ -578,7 +558,7 @@ describe("interaction and cleanup", () => {
 			stream((context, options) =>
 				lastText(context) === "wait"
 					? waiting(options?.signal)
-					: hierarchyStream(model, context, options).result(),
+					: hierarchyStream.respond(context, options),
 			),
 		);
 		await tree.start(ROOT, "nest:1", context).result;

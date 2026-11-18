@@ -57,17 +57,21 @@ export interface Leftovers {
 	work: Leftover[];
 }
 
-export interface SubagentsOptions {
-	/** onCreated publishes the session and transfers cleanup ownership, even if
-	 * initialization later rejects. Resolution signals that binding is ready.
-	 * onError receives the session's extension errors, e.g. through bindExtensions.
+/** What creating a node's session is given. */
+export interface SessionRequest {
+	context: SpawnContext;
+	owner: SessionOwner;
+	/** Publishes the session and transfers cleanup ownership, even if
+	 * initialization later rejects.
 	 */
-	createSession: (
-		context: SpawnContext,
-		owner: SessionOwner,
-		onCreated: (session: AgentSession) => void,
-		onError: (error: ExtensionError) => void,
-	) => Promise<void>;
+	onCreated: (session: AgentSession) => void;
+	/** Receives the session's extension errors, e.g. through bindExtensions. */
+	onError: (error: ExtensionError) => void;
+}
+
+export interface SubagentsOptions {
+	/** Resolves once the published session's binding is ready. */
+	createSession: (request: SessionRequest) => Promise<void>;
 	/** Start a turn that reminds an idle task, which has nothing left to wait
 	 * for, to report, with a message that is not the user's. Settles with that
 	 * turn.
@@ -238,6 +242,7 @@ function bill(
 			manager.appendUsage(SUBAGENT_USAGE_KIND, provider, id, usage, node.id);
 }
 
+/** A run keeps its first error. */
 function recordError(node: SubagentNode, error: unknown): void {
 	node.error ??= errorMessage(error);
 }
@@ -319,6 +324,15 @@ export function createSubagents({
 		return [...nodes.values()].filter((node) => node.parentId === id);
 	}
 
+	/** A failure fails the agent's active run; without one, it is reported at
+	 * shutdown.
+	 */
+	function fail(id: string, error: unknown): void {
+		const node = nodes.get(id);
+		if (node?.run) recordError(node, error);
+		else completionErrors.push(error);
+	}
+
 	function start(
 		parentId: string,
 		instructions: string,
@@ -385,9 +399,7 @@ export function createSubagents({
 		};
 		// Observe detached work, but retain failures even if they settle before drainage.
 		void completion.then(remove, (error: unknown) => {
-			const node = nodes.get(parentId);
-			if (node?.run) recordError(node, error);
-			else completionErrors.push(error);
+			fail(parentId, error);
 			remove();
 		});
 	}
@@ -455,16 +467,15 @@ export function createSubagents({
 	/** Publish a node's session. A published session whose binding failed is not reusable. */
 	async function initialize(node: SubagentNode): Promise<void> {
 		try {
-			await createSession(
-				node.context,
-				{ runtime, id: node.id },
-				(session) => attach(node, session),
-				(error) => {
-					if (node.run) node.error ??= error.error;
-					else completionErrors.push(new Error(error.error));
+			await createSession({
+				context: node.context,
+				owner: { runtime, id: node.id },
+				onCreated: (session) => attach(node, session),
+				onError: ({ error }) => {
+					fail(node.id, new Error(error));
 					changed();
 				},
-			);
+			});
 		} catch (error) {
 			// Record first: disposing the session can report errors of its own.
 			recordError(node, error);

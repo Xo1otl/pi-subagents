@@ -21,8 +21,8 @@ import extension from "../index.ts";
 import { ROOT } from "../runtime/index.ts";
 import {
 	answer,
+	checkpoint,
 	childExtension,
-	deferred,
 	hierarchyStream,
 	lastCompletion,
 	lastCustomMessage,
@@ -38,6 +38,7 @@ import {
 	testProvider,
 	testRuntime,
 	toolCall,
+	until,
 } from "./fixtures.ts";
 
 /** Wording is not under test: the guidance is whatever tracking adds to bash. */
@@ -680,8 +681,7 @@ test("dispatches standard extension commands without sending them to the model, 
 });
 
 test("cancellation during async standard input hooks stops the later agent loop", async () => {
-	const gate = deferred();
-	const entered = deferred();
+	const hook = checkpoint();
 	let modelCalls = 0;
 	const { tree, context } = await setup({
 		streamFn: stream(() => {
@@ -690,15 +690,12 @@ test("cancellation during async standard input hooks stops the later agent loop"
 		}),
 	});
 	await childExtension(context, "behavior", (pi) => {
-		pi.on("input", async () => {
-			entered.resolve();
-			await gate.promise;
-		});
+		pi.on("input", () => hook.pass());
 	});
 	const result = tree.start(ROOT, "wait", context).result;
-	await entered.promise;
+	await until(() => hook.reached);
 	tree.abort("1");
-	gate.resolve();
+	hook.open();
 	expect((await result).status).toBe("aborted");
 	expect(tree.get("1")?.status).toBe("aborted");
 	expect(modelCalls).toBe(0);

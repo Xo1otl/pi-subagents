@@ -12,15 +12,13 @@ function summarize(nodes: readonly Subagent[]): string {
 	if (!active.length) return "";
 	const stopping = active.filter((node) => node.cancelled).length;
 	const running = active.length - stopping;
-	const counts = [
-		running && `${running} running`,
-		stopping && `${stopping} stopping`,
-	]
-		.filter(Boolean)
-		.join(" · ");
+	const parts: string[] = [];
+	if (running) parts.push(`${running} running`);
+	if (stopping) parts.push(`${stopping} stopping`);
 	const ids = active.slice(0, LISTED_IDS).map((node) => node.id);
 	if (active.length > LISTED_IDS) ids.push("…");
-	return `● Subagents: ${counts} · ${ids.join(", ")}`;
+	parts.push(ids.join(", "));
+	return `● Subagents: ${parts.join(" · ")}`;
 }
 
 /** A root-session widget independent of the switcher and the root's own run. */

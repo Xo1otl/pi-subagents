@@ -63,18 +63,24 @@ export function createSubagentUI(pi: ExtensionAPI) {
 		}
 	}
 
-	pi.registerMessageRenderer(SUBAGENT_RESULT_TYPE, (message, options, theme) =>
-		renderSubagentResult(
-			{
-				content:
-					typeof message.content === "string"
-						? [{ type: "text", text: message.content }]
-						: message.content,
-				details: message.details,
-			},
-			{ expanded: options.expanded, isPartial: false },
-			theme,
-		),
+	pi.registerMessageRenderer(
+		SUBAGENT_RESULT_TYPE,
+		({ content, details }, { expanded, outputPad }, theme) => {
+			const text = renderSubagentResult(
+				{
+					content:
+						typeof content === "string"
+							? [{ type: "text", text: content }]
+							: content,
+					details,
+				},
+				{ expanded, isPartial: false },
+				theme,
+			);
+			// Pi pads a tool's output, but shows a message renderer's component as is.
+			text.setPaddingX(outputPad);
+			return text;
+		},
 	);
 	pi.registerCommand("subagents", {
 		description: "Pick a subagent, or chat with one: /subagents [id]",
@@ -84,11 +90,6 @@ export function createSubagentUI(pi: ExtensionAPI) {
 		description: "Pick a subagent to view (also while the root is running)",
 		handler: (ctx) => showSwitcher(ctx),
 	});
-
-	const toolRenderers: ToolRenderers = {
-		renderCall: renderSubagentCall,
-		renderResult: renderSubagentResult,
-	};
 
 	return {
 		bind(next: Subagents, ctx: ExtensionContext): void {
@@ -111,6 +112,9 @@ export function createSubagentUI(pi: ExtensionAPI) {
 			};
 		},
 		dispose,
-		toolRenderers,
+		toolRenderers: {
+			renderCall: renderSubagentCall,
+			renderResult: renderSubagentResult,
+		} satisfies ToolRenderers,
 	};
 }

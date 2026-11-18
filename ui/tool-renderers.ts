@@ -1,8 +1,12 @@
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { contentText } from "@earendil-works/pi-ai";
 import type { ToolRenderResultOptions } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
-import { isSubagentReceipt, subagentId } from "../agent/protocol.ts";
+import { Text, truncateToWidth } from "@earendil-works/pi-tui";
+import {
+	isSubagentReceipt,
+	subagentId,
+	subagentInstructions,
+} from "../agent/protocol.ts";
 import { plain, singleLine, type UITheme } from "./text.ts";
 
 /** Collapsed results show this many lines, each cut to PREVIEW_COLUMNS. */
@@ -13,13 +17,10 @@ const CALL_PREVIEW_COLUMNS = 160;
 const viewHint = (id: string) => `\n/subagents ${id} · view conversation`;
 
 export function renderSubagentCall(args: unknown, theme: UITheme): Text {
-	const instructions =
-		args && typeof args === "object" && "instructions" in args
-			? args.instructions
-			: undefined;
+	const instructions = singleLine(subagentInstructions(args) ?? "…");
 	return new Text(
 		theme.fg("toolTitle", "Subagent ") +
-			singleLine(String(instructions ?? "…")).slice(0, CALL_PREVIEW_COLUMNS),
+			truncateToWidth(instructions, CALL_PREVIEW_COLUMNS, ""),
 		0,
 		0,
 	);
@@ -49,7 +50,7 @@ export function renderSubagentResult(
 		? lines
 		: lines
 				.slice(0, PREVIEW_LINES)
-				.map((line) => line.slice(0, PREVIEW_COLUMNS));
+				.map((line) => truncateToWidth(line, PREVIEW_COLUMNS, ""));
 	const hidden = lines.length - preview.length;
 	const more =
 		hidden > 0

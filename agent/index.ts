@@ -16,7 +16,7 @@ import {
 	type SubagentResult,
 	type Subagents,
 } from "../runtime/index.ts";
-import { trackCommands } from "./commands.ts";
+import { type CommandHost, trackCommands } from "./commands.ts";
 import {
 	discardSubagentCompletion,
 	subagentCompletionMessage,
@@ -55,8 +55,7 @@ export function createSubagentRuntime(
 ): Subagents {
 	return createSubagents({
 		rootSessionManager,
-		createSession: (context, owner, onCreated, onError) =>
-			createChildSession(context, owner, onCreated, onError, headlessExtension),
+		createSession: (request) => createChildSession(request, headlessExtension),
 		remindSession: remindChildSession,
 		disposeSession: disposeChildSession,
 		reportOf,
@@ -106,41 +105,42 @@ export function createSubagentIntegration(
 	// Only a delegated session has a parent to report to.
 	if (owner) registerReporting(pi, owner);
 
-	// A delegated session's jobs belong to its run (see delegatedCommands). The
-	// root's are the user's: watched for the model, never ended, and told like
-	// results, which an interrupt must not drop.
-	const commands = owner
-		? undefined
-		: trackCommands(pi, {
-				ownsJobs: false,
-				track(work, ctx) {
-					const source = current(ctx);
-					if (!source) {
-						// No session is left to tell.
-						void work.catch(() => {});
-						return;
-					}
-					source.runtime.trackCompletion(
-						ROOT,
-						work.catch((error: unknown) => {
-							ctx.ui.notify(
-								`Background command tracking failed: ${errorMessage(error)}`,
-								"error",
-							);
-							// Not every mode shows notifications; keep the rejection
-							// for the runtime's shutdown report.
-							throw error;
-						}),
+	// A delegated session's jobs belong to its run (see delegatedCommands).
+	const commands = owner ? undefined : trackCommands(pi, rootCommands());
+
+	/** The root's jobs are the user's: watched for the model, never ended, and
+	 * told like results, which an interrupt must not drop.
+	 */
+	function rootCommands(): CommandHost {
+		return {
+			ownsJobs: false,
+			track(work, ctx) {
+				const source = current(ctx);
+				if (!source) {
+					// No session is left to tell.
+					void work.catch(() => {});
+					return;
+				}
+				const reported = work.catch((error: unknown) => {
+					ctx.ui.notify(
+						`Background command tracking failed: ${errorMessage(error)}`,
+						"error",
 					);
-				},
-				listener(ctx) {
-					const source = current(ctx);
-					if (!source) return undefined;
-					return (message) => {
-						if (isCurrent(source, ctx)) hold(source, ctx, message);
-					};
-				},
-			});
+					// Not every mode shows notifications; keep the rejection for the
+					// runtime's shutdown report.
+					throw error;
+				});
+				source.runtime.trackCompletion(ROOT, reported);
+			},
+			listener(ctx) {
+				const source = current(ctx);
+				if (!source) return undefined;
+				return (message) => {
+					if (isCurrent(source, ctx)) hold(source, ctx, message);
+				};
+			},
+		};
+	}
 
 	function discardPending(source: SessionBinding): Promise<void> {
 		const messages = [...source.pendingCompletions];

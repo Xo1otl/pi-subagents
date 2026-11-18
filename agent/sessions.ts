@@ -10,13 +10,16 @@ import {
 	DefaultResourceLoader,
 	type EventBus,
 	type ExtensionContext,
-	type ExtensionError,
 	type ExtensionFactory,
 	getAgentDir,
 	SessionManager,
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import type { SessionOwner, SpawnContext } from "../runtime/index.ts";
+import type {
+	SessionOwner,
+	SessionRequest,
+	SpawnContext,
+} from "../runtime/index.ts";
 import { delegatedCommands } from "./commands.ts";
 import { REPORT_TOOL, SUBAGENT_REMINDER_TYPE } from "./protocol.ts";
 
@@ -97,11 +100,11 @@ function resolveModel(ctx: ExtensionContext, reference: string): Model<Api> {
 	);
 }
 
+/** A delegated session loads `extension`, the machine-facing integration,
+ * unless a configured installation replaces it.
+ */
 export async function createChildSession(
-	context: SpawnContext,
-	owner: SessionOwner,
-	onCreated: (session: AgentSession) => void,
-	onError: (error: ExtensionError) => void,
+	{ context, owner, onCreated, onError }: SessionRequest,
 	extension: ExtensionFactory,
 ): Promise<void> {
 	const agentDir = context.agentDir ?? getAgentDir();

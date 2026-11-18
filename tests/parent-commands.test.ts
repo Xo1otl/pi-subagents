@@ -13,8 +13,8 @@ import { COMMAND_EXIT_TYPE } from "../agent/protocol.ts";
 import { ROOT } from "../runtime/index.ts";
 import {
 	backgroundJob,
+	checkpoint,
 	customMessages,
-	deferred,
 	lastCustomMessage,
 	lastText,
 	onCleanup,
@@ -24,7 +24,6 @@ import {
 	stream,
 	toolCall,
 	until,
-	waiting,
 } from "./fixtures.ts";
 
 /** A root that starts `job` when told to, with the rest of its replies given. */
@@ -94,21 +93,16 @@ test("a parent's background job resumes it when idle, and private user commands 
 });
 
 test("a job exit waits for a busy parent, survives its interrupt, and does not restart the turn", async () => {
-	const busy = deferred();
-	let running = false;
+	const busy = checkpoint();
 	let notified = 0;
 	const { session, tree, job } = await setup(async (context, signal) => {
-		const text = lastText(context);
-		if (text === "busy prompt") {
-			running = true;
-			await Promise.race([busy.promise, waiting(signal)]);
-		}
+		if (lastText(context) === "busy prompt") await busy.pass(signal);
 		if (lastCustomMessage(context, COMMAND_EXIT_TYPE)) notified++;
 		return checked(context);
 	});
 	await session.prompt("start job");
 	const prompt = session.prompt("busy prompt");
-	await until(() => running);
+	await until(() => busy.reached);
 	await job.release();
 	await waitForGroupToFinish(await job.pgid());
 	await tree.settled(ROOT);

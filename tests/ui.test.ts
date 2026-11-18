@@ -31,52 +31,48 @@ import {
 } from "./fixtures.ts";
 
 type Custom = ExtensionUIContext["custom"];
+type EditorFactory = ReturnType<ExtensionUIContext["getEditorComponent"]>;
 
-test("a real root extension opens the switcher overlay from commands and the root editor, and cleans up on reload", async () => {
-	const dispatch = stream((context, options) => {
-		// The root keeps its turn running; the middle agent replies.
-		if (context.messages.at(-1)?.role === "toolResult")
-			return taskText(context) === "delegate"
-				? waiting(options?.signal)
-				: response(lastText(context));
-		if (lastCustomMessage(context, SUBAGENT_RESULT_TYPE))
-			return response("completion accepted");
-		const text = lastText(context);
-		if (text === "delegate")
-			return toolCall("subagent", { instructions: "nested" });
-		if (text === "nested")
-			return toolCall("subagent", { instructions: "wait" });
-		return waiting(options?.signal);
-	});
+const left = "\x1b[D";
+
+/** The root delegates, keeping its turn running; the middle agent delegates
+ * again, and the leaf runs until stopped.
+ */
+const dispatch = stream((context, options) => {
+	if (context.messages.at(-1)?.role === "toolResult")
+		return taskText(context) === "delegate"
+			? waiting(options?.signal)
+			: response(lastText(context));
+	if (lastCustomMessage(context, SUBAGENT_RESULT_TYPE))
+		return response("completion accepted");
+	const text = lastText(context);
+	if (text === "delegate")
+		return toolCall("subagent", { instructions: "nested" });
+	if (text === "nested") return toolCall("subagent", { instructions: "wait" });
+	return waiting(options?.signal);
+});
+
+/** A root session running the whole extension under a stand-in for pi's
+ * interactive mode: a focused root editor that extensions may replace,
+ * ctx.ui.custom() overlays and widgets.
+ */
+async function interactive() {
 	const session = await parentSession({
 		streamFn: dispatch,
 		extensions: [extension],
 	});
+	onCleanup(() => session.abort());
 	const terminal = fullscreen({ columns: 80 });
-	const tui = terminal.tui;
+	const { tui } = terminal;
 	const keybindings = terminal.keybindings as KeybindingsManager;
 	const editorTheme = {
 		borderColor: (text: string) => text,
 		selectList: getSelectListTheme(),
 	};
-	// Like pi's interactive mode: a focused root editor that extensions may replace.
 	let editor: EditorComponent = new CustomEditor(tui, editorTheme, keybindings);
 	tui.addChild(editor);
 	tui.setFocus(editor);
-	let editorFactory: ReturnType<ExtensionUIContext["getEditorComponent"]>;
-	const getEditorComponent = () => editorFactory;
-	const setEditorComponent = (factory: typeof editorFactory) => {
-		const text = editor.getText();
-		editorFactory = factory;
-		const next =
-			factory?.(tui, editorTheme, keybindings) ??
-			new CustomEditor(tui, editorTheme, keybindings);
-		tui.removeChild(editor);
-		tui.addChild(next);
-		editor = next;
-		editor.setText(text);
-		tui.setFocus(editor);
-	};
+	let editorFactory: EditorFactory;
 	let switcher: Component | undefined;
 	const custom = mock(
 		(factory: Parameters<Custom>[0], options?: Parameters<Custom>[1]) =>
@@ -110,78 +106,117 @@ test("a real root extension opens the switcher overlay from commands and the roo
 	const ui = {
 		custom,
 		setWidget,
-		getEditorComponent,
-		setEditorComponent,
+		getEditorComponent: () => editorFactory,
+		setEditorComponent(factory: EditorFactory) {
+			const text = editor.getText();
+			editorFactory = factory;
+			const next =
+				factory?.(tui, editorTheme, keybindings) ??
+				new CustomEditor(tui, editorTheme, keybindings);
+			tui.removeChild(editor);
+			tui.addChild(next);
+			editor = next;
+			editor.setText(text);
+			tui.setFocus(editor);
+		},
 		notify() {},
 	} as unknown as ExtensionUIContext;
-	const indicator = () =>
-		[...widgets.values()].flatMap((widget) => widget.render(100)).join("\n");
-	const header = () =>
-		terminal.screen().find((line) => line.startsWith("Subagent")) ?? "";
-	const left = "\x1b[D";
-	onCleanup(() => session.abort());
-	const rootEditor = editor;
-	await session.bindExtensions({ mode: "tui", uiContext: ui });
-	expect(editor).toBe(rootEditor);
-	expect(getEditorComponent()).toBeDefined();
+	return {
+		session,
+		terminal,
+		custom,
+		setWidget,
+		widgets,
+		editor: () => editor,
+		editorFactory: () => editorFactory,
+		switcherOpen: () => switcher !== undefined,
+		bind: () => session.bindExtensions({ mode: "tui", uiContext: ui }),
+		/** The running indicator, as the root's widgets render it. */
+		indicator: () =>
+			[...widgets.values()].flatMap((widget) => widget.render(100)).join("\n"),
+		/** The picker's or the chat's first line. */
+		header: () =>
+			terminal.screen().find((line) => line.startsWith("Subagent")) ?? "",
+	};
+}
+
+test("the root opens the switcher from /subagents and from Left-Left at its editor's text start, during and after its own run", async () => {
+	const { session, terminal, custom, widgets, editor, ...ui } =
+		await interactive();
+	const rootEditor = editor();
+	await ui.bind();
+	// The live editor is wrapped, not replaced, keeping its undo and history.
+	expect(editor()).toBe(rootEditor);
 	terminal.input(left);
 	terminal.input(left);
-	expect(custom).not.toHaveBeenCalled();
+	expect(custom).not.toHaveBeenCalled(); // No agents yet.
 	const run = session.prompt("delegate");
-	await until(() => indicator().includes("2 running"));
-	expect(indicator()).toContain("1, 1.1");
+	await until(() => ui.indicator().includes("2 running"));
+	expect(ui.indicator()).toContain("1, 1.1");
+
 	const open = session.prompt("/subagents 1.1");
-	await until(() => Boolean(switcher));
+	await until(ui.switcherOpen);
 	expect(custom.mock.calls[0]?.[1]).toEqual({
 		overlay: true,
 		overlayOptions: SWITCHER_OVERLAY,
 	});
-	expect(header()).toContain("Subagent 1.1");
+	expect(ui.header()).toContain("Subagent 1.1");
 	terminal.input("\x1b");
 	await open;
 	expect(terminal.text()).toContain("ROOT_TRANSCRIPT");
-	expect(indicator()).toContain("2 running");
-	// The root chord opens the picker during a run without losing its draft.
-	editor.setText("root draft");
+
+	// The chord opens the picker during the root's run, keeping its draft.
+	editor().setText("root draft");
 	terminal.input("\x01");
 	terminal.input(left);
 	terminal.input(left);
-	await until(() => Boolean(switcher));
-	expect(editor.getText()).toBe("root draft");
-	expect(header()).toContain("Subagents · 2");
-	expect(custom).toHaveBeenCalledTimes(2);
+	await until(ui.switcherOpen);
+	expect(editor().getText()).toBe("root draft");
+	expect(ui.header()).toContain("Subagents · 2");
 	terminal.input("\x1b");
-	await until(() => !switcher);
-	expect(tui.getFocusedComponent()).toBe(editor);
+	await until(() => !ui.switcherOpen());
+	expect(terminal.tui.getFocusedComponent()).toBe(editor());
+
+	// Subagents outlive the root's turn, until stopped in the switcher.
 	await session.abort();
 	await run;
-	// Background jobs outlive the root turn. Stop them explicitly in the switcher.
-	expect(indicator()).toContain("2 running");
+	expect(ui.indicator()).toContain("2 running");
 	const stopping = session.prompt("/subagents 1");
-	await until(() => Boolean(switcher));
+	await until(ui.switcherOpen);
 	terminal.input("\x03");
 	await until(() => widgets.size === 0);
 	terminal.input("\x1b");
 	await stopping;
+});
+
+test("reload releases the indicator and the editor of running subagents; a rebound root starts empty, and quitting releases it too", async () => {
+	const { session, terminal, custom, setWidget, widgets, ...ui } =
+		await interactive();
+	await ui.bind();
+	const run = session.prompt("delegate");
+	await until(() => ui.indicator().includes("2 running"));
+	await session.abort();
+	await run;
+	expect(widgets.size).toBe(1);
 
 	await session.extensionRunner.emit({
 		type: "session_shutdown",
 		reason: "reload",
 	});
 	expect(widgets.size).toBe(0);
-	expect(getEditorComponent()).toBeUndefined();
+	expect(ui.editorFactory()).toBeUndefined();
+
 	setWidget.mockClear();
-	await session.bindExtensions({ mode: "tui", uiContext: ui });
-	expect(getEditorComponent()).toBeDefined();
+	await ui.bind();
+	expect(ui.editorFactory()).toBeDefined();
 	expect(setWidget).not.toHaveBeenCalled();
-	custom.mockClear();
-	editor.setText("");
 	terminal.input(left);
 	terminal.input(left);
-	expect(custom).not.toHaveBeenCalled();
+	expect(custom).not.toHaveBeenCalled(); // The old agents are gone.
+
 	await session.extensionRunner.emit({
 		type: "session_shutdown",
 		reason: "quit",
 	});
-	expect(getEditorComponent()).toBeUndefined();
+	expect(ui.editorFactory()).toBeUndefined();
 });
