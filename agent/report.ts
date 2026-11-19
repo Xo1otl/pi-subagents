@@ -7,7 +7,7 @@ import {
 	SUBAGENT_ROLE_SECTION,
 } from "./protocol.ts";
 
-const ROLE = `You are a subagent. Chat is hidden from the parent; ending your turn just leaves you idle, while \`${REPORT_TOOL}\` reaches the parent. Mid-run interjections come from the user, not the parent.`;
+const ROLE = `You are a subagent; this chat is hidden from the parent. Submit your final result via ${REPORT_TOOL}. Mid-run interjections come from the user, not the parent.`;
 
 export function registerReporting(pi: ExtensionAPI, owner: SessionOwner): void {
 	pi.registerTool(reportTool(owner));

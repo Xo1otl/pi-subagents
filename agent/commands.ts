@@ -211,7 +211,9 @@ export function trackCommands(
 				).catch(fail);
 				if (pgid !== undefined)
 					options.onData(
-						Buffer.from(`${endsLine ? "" : "\n"}[PGID ${pgid} tracked]\n`),
+						Buffer.from(
+							`${endsLine ? "" : "\n"}[PGID ${pgid} tracked]\nYou will be notified on completion—don't poll the log or sleep while waiting. Read the log only if the user asks for progress or you need its output to proceed (e.g., a server's ready line or port).\n`,
+						),
 					);
 				await rm(directory, { recursive: true, force: true }).catch(fail);
 			}
@@ -245,7 +247,7 @@ export function trackCommands(
 			...bash,
 			promptGuidelines: [
 				...(bash.promptGuidelines ?? []),
-				"BG jobs tracked -> wake you on exit. To wait for a condition, background an until-loop (e.g. `until <check>; do …; done > log 2>&1 &`). Meanwhile, do other work or end your turn.",
+				"Background jobs are tracked—you'll be notified (re-invoked if idle). To await a condition, background an `until` loop (`until <check>; do …; done > log 2>&1 &`).",
 			],
 			defaultActive: false,
 		});
@@ -259,7 +261,8 @@ export function trackCommands(
 			return undefined;
 		return {
 			block: true,
-			reason: `Blocked: FG sleep ≥${SLEEP_LIMIT_SECONDS}s. BG jobs wake you on exit: end your turn, or background the wait first (e.g. an until-loop).`,
+			reason:
+				"Blocked: foreground sleep. To await a condition, background an until loop. To wait for a tracked job, end your turn—you're re-invoked automatically on completion, so don't poll.",
 		};
 	});
 	pi.on("user_bash", (event) =>
