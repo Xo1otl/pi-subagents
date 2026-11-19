@@ -7,7 +7,7 @@ import {
 	SUBAGENT_ROLE_SECTION,
 } from "./protocol.ts";
 
-const ROLE = `You are a subagent; this chat is hidden from the parent. Submit your final result via ${REPORT_TOOL}. Mid-run interjections come from the user, not the parent.`;
+const ROLE = `You are a subagent. Chat is hidden from the parent; ending your turn just leaves you idle, while \`${REPORT_TOOL}\` reaches the parent and ends the task. Mid-run interjections come from the user, not the parent.`;
 
 export function registerReporting(pi: ExtensionAPI, owner: SessionOwner): void {
 	pi.registerTool(reportTool(owner));
@@ -27,7 +27,7 @@ function reportTool({ runtime, id }: SessionOwner) {
 	return defineTool({
 		name: REPORT_TOOL,
 		label: "Report",
-		description: "Declares the task complete and submits the final report.",
+		description: "Declare the task complete and submit the final report.",
 		parameters: Type.Object({ result: Type.String({ minLength: 1 }) }),
 		exposure: "model-only",
 		async execute(_toolCallId, { result }) {
@@ -43,7 +43,7 @@ function reportTool({ runtime, id }: SessionOwner) {
 			if (children.length)
 				return {
 					content: reply(
-						`Not sent: subagents still running: ${children.join(", ")}.`,
+						`Not sent—subagents still running: ${children.join(", ")}.`,
 					),
 					details,
 					isError: true,
