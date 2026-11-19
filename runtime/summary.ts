@@ -105,15 +105,12 @@ export function summarizeRun(
 	if (report !== undefined) return done(report);
 	if (cancelled || final?.stopReason === "aborted")
 		return failed("aborted", "Subagent was aborted.");
-	if (
-		error ||
-		(final && final.stopReason !== "stop" && final.stopReason !== "toolUse")
-	)
+	if (error) return failed("error", error);
+	if (final && final.stopReason !== "stop" && final.stopReason !== "toolUse")
 		return failed(
 			"error",
-			error ||
-				final?.errorMessage ||
-				`Subagent ended without a complete response (${final?.stopReason ?? "no response"}).`,
+			final.errorMessage ||
+				`Subagent ended without a complete response (${final.stopReason}).`,
 		);
 	const last = final ? contentText(final.content) : "";
 	if (!reportOf) return done(last);

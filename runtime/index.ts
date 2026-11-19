@@ -1,24 +1,25 @@
 import { setImmediate } from "node:timers/promises";
-import type {
-	AgentToolResult,
-	ThinkingLevel,
-} from "@earendil-works/pi-agent-core";
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Api, Model, Usage } from "@earendil-works/pi-ai";
 import type {
 	AgentSession,
-	AgentSessionEvent,
 	CreateAgentSessionOptions,
 	ExtensionError,
 	SessionEntry,
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { errorMessage } from "./errors.ts";
+import { type SubagentToolExecution, updateLiveTools } from "./live-tools.ts";
+import { createPendingWork, type Leftover } from "./pending-work.ts";
 import {
 	type RunSummary,
 	SUBAGENT_USAGE_KIND,
 	summarizeOwnUsage,
 	summarizeRun,
 } from "./summary.ts";
+
+export type { SubagentToolExecution } from "./live-tools.ts";
+export type { Leftover } from "./pending-work.ts";
 
 export interface SpawnContext
 	extends Pick<CreateAgentSessionOptions, "agentDir" | "modelRuntime"> {
@@ -32,12 +33,6 @@ export interface SpawnContext
 export interface SessionOwner {
 	runtime: Subagents;
 	id: string;
-}
-
-export interface Leftover {
-	readonly label: string;
-	running(): boolean;
-	detach(): void;
 }
 
 export interface Leftovers {
@@ -63,15 +58,6 @@ export interface SubagentsOptions {
 export const ROOT = "root";
 
 export type Notice = Parameters<AgentSession["sendCustomMessage"]>[0];
-
-export interface SubagentToolExecution {
-	toolCallId: string;
-	toolName: string;
-	args: unknown;
-	result?: AgentToolResult<unknown>;
-	status: "running" | "done" | "error";
-	parentToolCallId?: string;
-}
 
 export interface Subagent {
 	readonly id: string;
@@ -121,12 +107,12 @@ export interface Subagents {
 	dispose(): Promise<void>;
 }
 
+type InputOrigin = "parent" | "user";
+
 interface ActiveRun {
-	readonly userLed: boolean;
+	readonly origin: InputOrigin;
 	reminded: boolean;
-	reminder?: Promise<void>;
-	preflight: Promise<void>;
-	settled: Promise<void>;
+	preflight: Promise<unknown>;
 }
 
 interface SubagentNode extends Subagent {
@@ -140,7 +126,7 @@ interface SubagentNode extends Subagent {
 	readonly queuedNotices: Set<Notice>;
 	readonly heldNotices: Notice[];
 	run?: ActiveRun;
-	unsubscribe: () => void;
+	unsubscribe?: () => void;
 }
 
 interface UsageLedger {
@@ -197,50 +183,6 @@ function recordError(node: SubagentNode, error: unknown): void {
 	node.error ??= errorMessage(error);
 }
 
-type ToolExecutionEvent = Extract<
-	AgentSessionEvent,
-	{ type: `tool_execution_${"start" | "update" | "end"}` }
->;
-
-function isToolExecution(
-	event: AgentSessionEvent,
-): event is ToolExecutionEvent {
-	return (
-		event.type === "tool_execution_start" ||
-		event.type === "tool_execution_update" ||
-		event.type === "tool_execution_end"
-	);
-}
-
-function toolSnapshot(
-	event: ToolExecutionEvent,
-	previous: SubagentToolExecution | undefined,
-): SubagentToolExecution {
-	const call = {
-		toolCallId: event.toolCallId,
-		toolName: event.toolName,
-		parentToolCallId: event.parentToolCallId ?? previous?.parentToolCallId,
-	};
-	switch (event.type) {
-		case "tool_execution_start":
-			return { ...call, args: event.args, status: "running" };
-		case "tool_execution_update":
-			return {
-				...call,
-				args: event.args,
-				result: event.partialResult,
-				status: "running",
-			};
-		case "tool_execution_end":
-			return {
-				...call,
-				args: previous?.args,
-				result: event.result,
-				status: event.isError ? "error" : "done",
-			};
-	}
-}
-
 export function createSubagents({
 	createSession,
 	remindSession,
@@ -250,9 +192,8 @@ export function createSubagents({
 }: SubagentsOptions): Subagents {
 	const rootLedger = rootSessionManager && usageLedger(rootSessionManager);
 	const nodes = new Map<string, SubagentNode>();
-	const completions = new Map<string, Set<Promise<void>>>();
-	const handles = new Map<Promise<void>, Leftover>();
-	const completionErrors: unknown[] = [];
+	const pending = createPendingWork(fail);
+	const cleanupErrors: unknown[] = [];
 	const listeners = new Set<() => void>();
 	let closing: Promise<void> | undefined;
 
@@ -271,7 +212,7 @@ export function createSubagents({
 	function fail(id: string, error: unknown): void {
 		const node = nodes.get(id);
 		if (node?.run) recordError(node, error);
-		else completionErrors.push(error);
+		else cleanupErrors.push(error);
 	}
 
 	function start(
@@ -296,7 +237,6 @@ export function createSubagents({
 			context,
 			status: "running",
 			cancelled: false,
-			unsubscribe: () => {},
 			liveTools: new Map(),
 			pendingInput: new Set(),
 			queuedNotices: new Set(),
@@ -305,7 +245,7 @@ export function createSubagents({
 				return node.interruption !== undefined;
 			},
 			get delegated() {
-				return node.run !== undefined && !node.run.userLed;
+				return node.run?.origin === "parent";
 			},
 			get queuedInput() {
 				return [
@@ -316,7 +256,7 @@ export function createSubagents({
 			},
 		};
 		nodes.set(id, node);
-		const result = run(node, instructions);
+		const result = run(node, instructions, "parent");
 		void result.catch(() => {});
 		return { id, result };
 	}
@@ -326,62 +266,37 @@ export function createSubagents({
 		completion: Promise<void>,
 		leftover?: Leftover,
 	): void {
-		const pending = completions.get(parentId) ?? new Set();
-		completions.set(parentId, pending);
-		pending.add(completion);
-		if (leftover) handles.set(completion, leftover);
-		const remove = () => {
-			pending.delete(completion);
-			handles.delete(completion);
-			if (!pending.size && completions.get(parentId) === pending)
-				completions.delete(parentId);
-			const node = nodes.get(parentId);
-			if (node?.run && completion !== node.run.reminder)
-				node.run.reminded = false;
-		};
-		void completion.then(remove, (error: unknown) => {
-			fail(parentId, error);
-			remove();
-		});
-	}
-
-	async function settled(parentId: string): Promise<void> {
-		for (
-			let pending = completions.get(parentId);
-			pending?.size;
-			pending = completions.get(parentId)
-		)
-			await Promise.allSettled(pending);
+		const run = nodes.get(parentId)?.run;
+		if (run) run.reminded = false;
+		pending.track(parentId, completion, leftover);
 	}
 
 	function submit(
 		node: SubagentNode,
 		active: ActiveRun,
 		instructions: string,
-		fromUser: boolean,
+		origin: InputOrigin,
 	): Promise<void> {
 		const previous = active.preflight;
 		const preflight = Promise.withResolvers<void>();
 		active.preflight = preflight.promise;
-		const input = { text: instructions };
-		if (fromUser) node.pendingInput.add(input);
+		const input = origin === "user" ? { text: instructions } : undefined;
+		if (input) node.pendingInput.add(input);
 		const accepted = (disposition?: string) => {
-			const withdrawn = fromUser && !node.pendingInput.delete(input);
+			const withdrawn = input && !node.pendingInput.delete(input);
 			if (withdrawn && disposition === "queued") clearQueue(node);
 			releaseHeld(node);
 			preflight.resolve();
 		};
 		const live = () =>
-			!node.cancelled &&
-			!closing &&
-			(!fromUser || node.pendingInput.has(input));
+			!node.cancelled && !closing && (!input || node.pendingInput.has(input));
 		const prompt = previous.then(async () => {
 			try {
-				if (fromUser && node.interruption && live())
+				if (input && node.interruption && live())
 					await node.session?.waitForIdle();
 				const session = node.session;
 				if (!session || !live()) return;
-				if (fromUser) endInterruption(node);
+				if (input) endInterruption(node);
 				await session.prompt(instructions, {
 					streamingBehavior: "steer",
 					preflightResult: accepted,
@@ -401,11 +316,11 @@ export function createSubagents({
 		if (!instructions.trim()) return;
 		if (node.run) {
 			if (node.cancelled) throw new Error(`Subagent ${id} is stopping.`);
-			const prompt = submit(node, node.run, instructions, true);
+			const prompt = submit(node, node.run, instructions, "user");
 			changed();
 			await prompt;
 			changed();
-		} else await run(node, instructions, true);
+		} else await run(node, instructions, "user");
 	}
 
 	function wake(
@@ -465,68 +380,57 @@ export function createSubagents({
 			const session = node.session;
 			node.session = undefined;
 			if (session) await detach(node, session);
-			throw error;
 		}
+	}
+
+	async function prepareRun(node: SubagentNode): Promise<number> {
+		let firstEntry: number | undefined;
+		try {
+			firstEntry = node.session?.sessionManager.getEntries().length;
+			// Publish the running receipt before loading the child session.
+			await setImmediate();
+			if (!node.session && !node.cancelled && !closing) await initialize(node);
+			if (node.cancelled || closing) abort(node.id);
+			firstEntry ??= node.session?.sessionManager.getEntries().length;
+		} catch (error) {
+			recordError(node, error);
+		}
+		return firstEntry ?? 0;
 	}
 
 	async function run(
 		node: SubagentNode,
 		instructions: string,
-		userLed = false,
+		origin: InputOrigin,
 	): Promise<SubagentResult> {
 		node.cancelled = false;
 		node.status = "running";
 		node.error = undefined;
 		node.liveTools.clear();
-		const initialization = Promise.withResolvers<void>();
-		const settlement = Promise.withResolvers<void>();
+		const ready = prepareRun(node);
 		const active: ActiveRun = {
-			userLed,
+			origin,
 			reminded: false,
-			preflight: initialization.promise,
-			settled: settlement.promise,
+			preflight: ready,
 		};
+		const settlement = Promise.withResolvers<void>();
 		node.run = active;
 		const ledgers: UsageLedger[] = rootLedger ? [rootLedger] : [];
 		for (const ancestor of ancestors(nodes, node)) {
 			if (ancestor.session)
 				ledgers.push(usageLedger(ancestor.session.sessionManager));
-			if (ancestor.run) trackCompletion(ancestor.id, active.settled);
+			if (ancestor.run) trackCompletion(ancestor.id, settlement.promise);
 		}
-		trackCompletion(ROOT, active.settled);
-		let firstEntry = node.session?.sessionManager.getEntries().length;
-		void submit(node, active, instructions, userLed);
-		const finish = () => {
-			if (node.run === active) node.run = undefined;
-			settlement.resolve();
-		};
+		trackCompletion(ROOT, settlement.promise);
+		void submit(node, active, instructions, origin);
 		try {
 			changed();
-			try {
-				await setImmediate();
-				if (!node.session && !node.cancelled && !closing)
-					await initialize(node);
-				if (node.cancelled || closing) abort(node.id);
-				if (node.session)
-					firstEntry ??= node.session.sessionManager.getEntries().length;
-			} catch (error) {
-				recordError(node, error);
-			} finally {
-				initialization.resolve();
-			}
-
-			const taskReportOf = active.userLed ? undefined : reportOf;
-			let entries: SessionEntry[];
-			let summary: RunSummary & { unreported: boolean };
+			const firstEntry = await ready;
 			for (;;) {
 				try {
-					do {
-						await settled(node.id);
-						await node.session?.waitForIdle();
-					} while (
-						completions.get(node.id)?.size ||
-						node.session?.isIdle === false
-					);
+					await pending.settled(node.id);
+					await node.session?.waitForIdle();
+					if (pending.has(node.id) || node.session?.isIdle === false) continue;
 				} catch (error) {
 					recordError(node, error);
 				}
@@ -534,58 +438,45 @@ export function createSubagents({
 					await node.interruption.promise;
 					continue;
 				}
-				entries =
-					node.session?.sessionManager.getEntries().slice(firstEntry ?? 0) ??
-					[];
-				summary = summarizeRun(entries, {
+				const entries =
+					node.session?.sessionManager.getEntries().slice(firstEntry) ?? [];
+				const { unreported, ...summary } = summarizeRun(entries, {
 					cancelled: node.cancelled,
 					error: node.error,
-					reportOf: taskReportOf,
+					reportOf: origin === "parent" ? reportOf : undefined,
 				});
-				if (
-					!summary.unreported ||
-					active.reminded ||
-					!node.session ||
-					node.cancelled ||
-					closing
-				)
-					break;
-				active.reminded = true;
-				active.reminder = Promise.resolve(node.session).then(remindSession);
-				trackCompletion(node.id, active.reminder);
-			}
-			try {
-				bill(ledgers, node, summarizeOwnUsage(entries));
-			} finally {
+				if (unreported && !active.reminded && node.session && !closing) {
+					active.reminded = true;
+					// Wait for the reminder without counting it as new work to remind about.
+					pending.track(
+						node.id,
+						Promise.resolve(node.session).then(remindSession),
+					);
+					continue;
+				}
 				node.status = summary.status;
 				node.error = summary.error;
-				finish();
-				changed();
+				bill(ledgers, node, summarizeOwnUsage(entries));
+				return { id: node.id, ...summary };
 			}
-			const { status, error, output, usage } = summary;
-			return { id: node.id, status, error, output, usage };
 		} finally {
-			initialization.resolve();
-			finish();
+			node.run = undefined;
+			settlement.resolve();
+			changed();
 		}
 	}
 
 	function leftovers(id: string): Leftovers {
-		const work: Leftover[] = [];
-		for (const completion of completions.get(id) ?? []) {
-			const leftover = handles.get(completion);
-			if (leftover?.running()) work.push(leftover);
-		}
 		return {
 			children: childrenOf(id)
 				.filter((child) => child.delegated && !child.cancelled)
 				.map((child) => child.id),
-			work,
+			work: pending.running(id),
 		};
 	}
 
 	function attach(node: SubagentNode, session: AgentSession): void {
-		node.unsubscribe();
+		node.unsubscribe?.();
 		node.session = session;
 		node.unsubscribe = session.subscribe((event) => {
 			if ((node.cancelled || node.interruption) && event.type === "agent_start")
@@ -597,11 +488,7 @@ export function createSubagents({
 						notice.details === event.message.details
 					)
 						node.queuedNotices.delete(notice);
-			if (isToolExecution(event))
-				node.liveTools.set(
-					event.toolCallId,
-					toolSnapshot(event, node.liveTools.get(event.toolCallId)),
-				);
+			updateLiveTools(node.liveTools, event);
 			changed();
 		});
 		changed();
@@ -614,22 +501,21 @@ export function createSubagents({
 		try {
 			if (session) await disposeSession(session);
 		} catch (error) {
-			completionErrors.push(error);
-		} finally {
-			try {
-				node.unsubscribe();
-			} catch (error) {
-				completionErrors.push(error);
-			}
-			node.unsubscribe = () => {};
+			cleanupErrors.push(error);
 		}
+		try {
+			node.unsubscribe?.();
+		} catch (error) {
+			cleanupErrors.push(error);
+		}
+		node.unsubscribe = undefined;
 	}
 
 	function stopSession(session: AgentSession): void {
 		try {
 			trackCompletion(ROOT, session.abort());
 		} catch (error) {
-			completionErrors.push(error);
+			cleanupErrors.push(error);
 		}
 	}
 
@@ -641,7 +527,7 @@ export function createSubagents({
 			const queued = node.session?.clearQueue();
 			if (queued) input = [...queued.steering, ...queued.followUp];
 		} catch (error) {
-			completionErrors.push(error);
+			cleanupErrors.push(error);
 		}
 		if (!node.cancelled && !closing) {
 			node.heldNotices.push(...lost);
@@ -651,9 +537,9 @@ export function createSubagents({
 	}
 
 	function withdraw(node: SubagentNode): string[] {
-		const pending = Array.from(node.pendingInput, ({ text }) => text);
+		const input = Array.from(node.pendingInput, ({ text }) => text);
 		node.pendingInput.clear();
-		return [...clearQueue(node), ...pending];
+		return [...clearQueue(node), ...input];
 	}
 
 	function interrupt(id: string): string[] {
@@ -690,18 +576,14 @@ export function createSubagents({
 	function dispose(): Promise<void> {
 		if (closing) return closing;
 		closing = Promise.resolve().then(async () => {
-			while (completions.size)
-				await Promise.allSettled(
-					[...completions.values()].flatMap((pending) => [...pending]),
-				);
+			await pending.settleAll();
 			await Promise.all(
 				Array.from(nodes.values(), (node) => detach(node, node.session)),
 			);
 			listeners.clear();
 			nodes.clear();
-			completions.clear();
-			if (completionErrors.length)
-				throw new AggregateError(completionErrors, "Subagent cleanup failed.");
+			if (cleanupErrors.length)
+				throw new AggregateError(cleanupErrors, "Subagent cleanup failed.");
 		});
 		abort();
 		changed();
@@ -721,7 +603,7 @@ export function createSubagents({
 		start,
 		trackCompletion,
 		leftovers,
-		settled,
+		settled: pending.settled,
 		send,
 		notify,
 		interrupt,

@@ -13,7 +13,6 @@ import {
 	report,
 	response,
 	spawnContext,
-	stillPending,
 	stream,
 	testRuntime,
 	theme,
@@ -216,9 +215,10 @@ test("Ctrl+C interrupts a turn, returning queued input to the draft; pressed aga
 				: response(lastText(context)),
 		),
 	);
-	await blockingTool(context);
+	const blocking = await blockingTool(context);
 	const result = tree.start(ROOT, "monitor", context).result;
-	await until(() => hasRunningTool(tree.get("1")));
+	await blocking.reached;
+	expect(hasRunningTool(tree.get("1"))).toBe(true);
 	expect(terminal.text()).toContain("Ctrl+C interrupt");
 	terminal.input("QUEUED_MESSAGE");
 	terminal.input("\r");
@@ -229,10 +229,11 @@ test("Ctrl+C interrupts a turn, returning queued input to the draft; pressed aga
 	terminal.input("\x03");
 	expect(composer()).toContain("QUEUED_MESSAGE\n\nnewer draft");
 	expect(terminal.text()).not.toContain("queued");
-	await until(() => tree.get("1")?.session?.isIdle === true);
+	await tree.settled("1");
+	await tree.get("1")?.session?.waitForIdle();
 	expect(header()).toContain("Subagent 1 · 1/1 · interrupted");
 	expect(terminal.text()).toContain("Ctrl+C stop");
-	expect(await stillPending(result)).toBe(true);
+	expect(Bun.peek.status(result)).toBe("pending");
 	terminal.input("\x03");
 	expect((await result).status).toBe("aborted");
 	expect(composer()).toContain("QUEUED_MESSAGE\n\nnewer draft");

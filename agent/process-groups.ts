@@ -15,27 +15,40 @@ export interface GroupWatch {
 
 export async function waitForGroupToFinish(
 	pgid: number,
-	{ signal, onUnknown }: GroupWatch = {},
+	watch: GroupWatch = {},
 ): Promise<void> {
 	assertProcessGroup(pgid);
+	const { signal } = watch;
+	return pollGroup(() => isProcessGroupActive(pgid, signal), watch);
+}
+
+const pollClock = {
+	now: () => performance.now(),
+	sleep: (delay: number, signal?: AbortSignal) =>
+		setTimeout(delay, undefined, { signal }),
+};
+
+export async function pollGroup(
+	isActive: () => Promise<boolean>,
+	{ signal, onUnknown }: GroupWatch,
+	clock = pollClock,
+): Promise<void> {
 	let unknownSince: number | undefined;
 	let told = false;
 	for (let delay = 100; ; delay = Math.min(delay * 2, 1000)) {
 		try {
-			if (!(await isProcessGroupActive(pgid, signal))) return;
+			if (!(await isActive())) return;
 			unknownSince = undefined;
 		} catch (error) {
 			signal?.throwIfAborted();
-			unknownSince ??= performance.now();
-			if (
-				!told &&
-				performance.now() - unknownSince >= UNKNOWN_STATUS_REPORT_MS
-			) {
+			const now = clock.now();
+			unknownSince ??= now;
+			if (!told && now - unknownSince >= UNKNOWN_STATUS_REPORT_MS) {
 				told = true;
 				await onUnknown?.(error);
 			}
 		}
-		await setTimeout(delay, undefined, { signal });
+		await clock.sleep(delay, signal);
 	}
 }
 
@@ -74,6 +87,13 @@ function assertProcessGroup(pgid: number): void {
 		);
 }
 
+export function liveProcessGroup(stat: string): number | undefined {
+	// Linux's comm field is parenthesized and may itself contain spaces or ')'.
+	const [state, , group] = stat.slice(stat.lastIndexOf(")") + 2).split(" ", 3);
+	if (!state || !group) throw new Error(`Invalid process status: ${stat}`);
+	return /^[ZXx]/.test(state) ? undefined : Number(group);
+}
+
 async function hasLiveMember(pgid: number): Promise<boolean> {
 	for (const entry of await readdir("/proc")) {
 		if (!/^\d+$/.test(entry)) continue;
@@ -85,11 +105,7 @@ async function hasLiveMember(pgid: number): Promise<boolean> {
 				continue;
 			throw error;
 		}
-		const [state, , group] = stat
-			.slice(stat.lastIndexOf(")") + 2)
-			.split(" ", 3);
-		if (!state || !group) throw new Error(`Invalid process status: ${stat}`);
-		if (Number(group) === pgid && !/^[ZXx]/.test(state)) return true;
+		if (liveProcessGroup(stat) === pgid) return true;
 	}
 	return false;
 }

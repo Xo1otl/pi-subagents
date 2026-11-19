@@ -75,7 +75,7 @@ interface SessionBinding {
 	manager: SessionManager;
 	sessionId: string;
 	abortEpoch: number;
-	stopWatchingAbort: () => void;
+	stopWatchingAbort?: () => void;
 	accounting: CompletionRecord[];
 	pendingCompletions: Set<SubagentCompletionMessage>;
 	held: Notice[];
@@ -89,8 +89,7 @@ export function createSubagentIntegration(
 	const parentId = owner?.id ?? ROOT;
 	let binding: SessionBinding | undefined;
 	if (owner) registerReporting(pi, owner);
-
-	const commands = owner ? undefined : trackCommands(pi, rootCommands());
+	else trackCommands(pi, rootCommands());
 
 	function rootCommands(): CommandHost {
 		return {
@@ -139,8 +138,7 @@ export function createSubagentIntegration(
 		try {
 			view?.dispose();
 		} finally {
-			source?.stopWatchingAbort();
-			commands?.stop();
+			source?.stopWatchingAbort?.();
 			binding = undefined;
 			const cleanup = source ? discardPending(source) : Promise.resolve();
 			if (!owner) await source?.runtime.dispose();
@@ -252,7 +250,7 @@ export function createSubagentIntegration(
 	pi.on("agent_start", (_event, ctx) => {
 		const source = current(ctx);
 		if (!owner || !source) return;
-		source.stopWatchingAbort();
+		source.stopWatchingAbort?.();
 		const signal = ctx.signal;
 		const fence = () => {
 			if (!source.runtime.get(owner.id)?.interrupted) source.abortEpoch++;
@@ -277,7 +275,7 @@ export function createSubagentIntegration(
 	pi.on("agent_settled", async (event, ctx) => {
 		const source = current(ctx);
 		if (source) {
-			source.stopWatchingAbort();
+			source.stopWatchingAbort?.();
 			if (!owner) release(source, !event.aborted);
 			else if (event.aborted) {
 				const node = source.runtime.get(owner.id);
@@ -304,7 +302,6 @@ export function createSubagentIntegration(
 			manager,
 			sessionId: manager.getSessionId(),
 			abortEpoch: 0,
-			stopWatchingAbort: () => {},
 			accounting: [],
 			pendingCompletions: new Set(),
 			held: [],

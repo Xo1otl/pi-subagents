@@ -97,6 +97,10 @@ async function recordedGroup(path: string): Promise<number | undefined> {
 export function trackCommands(
 	pi: ExtensionAPI,
 	host: CommandHost,
+	processGroups = {
+		isActive: isProcessGroupActive,
+		waitForExit: waitForGroupToFinish,
+	},
 ): CommandTracking {
 	const groups = new Map<number, ExtensionContext>();
 	let scope = new AbortController();
@@ -131,7 +135,7 @@ export function trackCommands(
 		groups.set(pgid, ctx);
 		const follow = async () => {
 			try {
-				await waitForGroupToFinish(pgid, {
+				await processGroups.waitForExit(pgid, {
 					signal,
 					onUnknown: (error) => notify(commandUnknown(job, error), signal),
 				});
@@ -164,7 +168,7 @@ export function trackCommands(
 		const pgid = await recordedGroup(path);
 		if (
 			pgid === undefined ||
-			!(await isProcessGroupActive(pgid).catch(() => true))
+			!(await processGroups.isActive(pgid).catch(() => true))
 		)
 			return undefined;
 		const { ctx } = from;

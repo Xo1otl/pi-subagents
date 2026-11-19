@@ -99,32 +99,18 @@ export function deferred() {
 }
 
 export function checkpoint() {
+	const arrival = Promise.withResolvers<void>();
 	const gate = deferred();
-	let reached = false;
 	return {
-		get reached() {
-			return reached;
-		},
-		async pass(signal?: AbortSignal): Promise<void> {
-			reached = true;
-			await Promise.race([gate.promise, waiting(signal)]);
+		reached: arrival.promise,
+		pass(signal?: AbortSignal): Promise<void> {
+			arrival.resolve();
+			return signal
+				? Promise.race([gate.promise, waiting(signal)])
+				: gate.promise;
 		},
 		open: () => gate.resolve(),
 	};
-}
-
-export async function stillPending(
-	promise: Promise<unknown>,
-): Promise<boolean> {
-	const pending = Symbol("pending");
-	const outcome = await Promise.race([
-		promise.then(
-			() => undefined,
-			() => undefined,
-		),
-		Bun.sleep(10).then(() => pending),
-	]);
-	return outcome === pending;
 }
 
 export function removeOutputOnCleanup(path: string): void {

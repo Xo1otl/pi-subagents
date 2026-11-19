@@ -5,11 +5,11 @@ import { ROOT, type Subagents } from "../runtime/index.ts";
 import {
 	charges,
 	checkpoint,
+	deferred,
 	hierarchyStream,
 	lastText,
 	response,
 	rootSession,
-	stillPending,
 	stream,
 	until,
 	waiting,
@@ -160,8 +160,11 @@ test("a resumed parent that delegates again bills only new local and descendant 
 
 test("a running ancestor drains a resumed descendant through an idle intermediate parent", async () => {
 	const descendant = checkpoint();
+	const ancestorPrompted = deferred();
 	const dispatch = stream(async (context, options) => {
-		if (lastText(context) === "slow resume") {
+		const text = lastText(context);
+		if (text === "continue ancestor") ancestorPrompted.resolve();
+		if (text === "slow resume") {
 			await descendant.pass(options?.signal);
 			return response("resumed", { usage: resumedUsage });
 		}
@@ -180,13 +183,17 @@ test("a running ancestor drains a resumed descendant through an idle intermediat
 		resumed = tree.send("1.1.1", "slow resume");
 	});
 	const ancestor = tree.send("1", "continue ancestor");
-	await until(() => descendant.reached);
+	await descendant.reached;
 	unsubscribe();
-	await until(() => Boolean(tree.get("1")?.session?.isIdle));
-	expect(await stillPending(ancestor)).toBe(true);
+	await ancestorPrompted.promise;
+	const parent = tree.get("1")?.session;
+	await parent?.waitForIdle();
+	expect(parent?.getLastAssistantText()).toBe("continue ancestor");
+	expect(Bun.peek.status(ancestor)).toBe("pending");
 	descendant.open();
-	await resumed;
 	await ancestor;
+	expect(tree.get("1.1.1")?.status).toBe("done");
+	await resumed;
 	expectDelta(session, rootBefore, {
 		...resumedUsage,
 		input: resumedUsage.input + 1,

@@ -115,7 +115,7 @@ test("a job exit reaching a busy session is answered after its reply", async () 
 	const started = tree.start(ROOT, "start", context);
 	await until(() => idle(tree));
 	const sent = tree.send("1", "still thinking");
-	await until(() => reply.reached);
+	await reply.reached;
 	await job.release();
 	await waitForGroupToFinish(await job.pgid());
 	await until(() => tree.get("1")?.session?.agent.hasQueuedMessages() === true);
@@ -221,7 +221,8 @@ test.each(["command", "child"] as const)(
 		);
 		const job = backgroundJob(context.cwd, "nested");
 		const started = tree.start(ROOT, "start", context);
-		await until(() => idle(tree) && child.reached);
+		await child.reached;
+		await until(() => idle(tree));
 		if (first === "command") {
 			await job.release();
 			await waitForGroupToFinish(await job.pgid());
@@ -416,7 +417,7 @@ test("a report waits for messages already queued, and a later report replaces it
 	const started = tree.start(ROOT, "start", context);
 	await until(() => idle(tree));
 	const sent = tree.send("1", "report now");
-	await until(() => reply.reached);
+	await reply.reached;
 	await job.release();
 	await waitForGroupToFinish(await job.pgid());
 	await until(() => tree.get("1")?.session?.agent.hasQueuedMessages() === true);

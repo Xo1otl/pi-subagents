@@ -100,7 +100,7 @@ test("a job exit waits for a busy parent, survives its interrupt, and does not r
 	});
 	await session.prompt("start job");
 	const prompt = session.prompt("busy prompt");
-	await until(() => busy.reached);
+	await busy.reached;
 	await job.release();
 	await waitForGroupToFinish(await job.pgid());
 	await tree.settled(ROOT);

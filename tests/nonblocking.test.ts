@@ -39,7 +39,6 @@ import {
 	report,
 	response,
 	rootSession,
-	stillPending,
 	stream,
 	testProvider,
 	toolCall,
@@ -145,7 +144,7 @@ test("root returns a receipt and accepts another prompt while child session init
 	expect(tree.get("1")?.status).toBe("running");
 	await session.prompt("another prompt");
 	expect(session.getLastAssistantText()).toBe("another prompt accepted");
-	await until(() => initialization.reached);
+	await initialization.reached;
 	initialization.open();
 	await until(() => completions(session).length === 1 && session.isIdle);
 	expect(completionDetails(session)).toMatchObject({
@@ -194,7 +193,7 @@ test.each(["initializing", "running"] as const)(
 			],
 		});
 		await session.prompt("delegate");
-		await until(() => child.reached);
+		await child.reached;
 		await session.setModel(alternate);
 		expect(session.model).toEqual(alternate);
 		expect(tree.get("1")?.status).toBe("running");
@@ -244,9 +243,9 @@ test.each(["finishes", "is interrupted"] as const)(
 		});
 		const { session, tree } = await rootSession({ streamFn: dispatch });
 		await session.prompt("delegate");
-		await until(() => child.reached);
+		await child.reached;
 		const busy = session.prompt("busy prompt");
-		await until(() => parent.reached);
+		await parent.reached;
 		child.open();
 		await tree.settled(ROOT);
 		expect(session.agent.hasQueuedMessages()).toBe(false);
@@ -322,7 +321,7 @@ test("an already-aborted tool call rejects, but aborting its signal after receip
 	);
 	expect(receipt.details).toMatchObject({ id: "1", status: "running" });
 	controller.abort();
-	await until(() => child.reached);
+	await child.reached;
 	expect(tree.get("1")?.cancelled).toBe(false);
 	expect(aborted).toBe(false);
 	tree.abort("1");
@@ -348,10 +347,9 @@ test("interrupting the originating parent leaves the child running and still del
 	});
 	const { session, tree } = await rootSession({ streamFn: dispatch });
 	const prompt = session.prompt("delegate");
-	await until(
-		() =>
-			child.reached &&
-			session.messages.some((message) => message.role === "toolResult"),
+	await child.reached;
+	await until(() =>
+		session.messages.some((message) => message.role === "toolResult"),
 	);
 	session.clearQueue();
 	await session.abort();
@@ -397,12 +395,12 @@ test("a result arriving during an interrupt is kept without restarting the turn"
 		],
 	});
 	await session.prompt("delegate");
-	await until(() => child.reached);
+	await child.reached;
 	const prompt = session.prompt("newer root prompt");
-	await until(() => parent.reached);
+	await parent.reached;
 	session.clearQueue();
 	const aborted = session.abort();
-	await until(() => agentEnd.reached);
+	await agentEnd.reached;
 	child.open();
 	await until(() => charges(session).length > 0);
 	expect(tree.get("1")?.status).toBe("done");
@@ -451,13 +449,10 @@ test("results held by a busy parent are released together, starting one turn", a
 	});
 	const { session, tree } = await rootSession({ streamFn: dispatch });
 	const prompt = session.prompt("delegate twice");
-	await until(
-		() =>
-			parent.reached &&
-			children === 2 &&
-			tree.tree().every((node) => node.status === "done"),
-	);
+	await parent.reached;
 	await tree.settled(ROOT);
+	expect(children).toBe(2);
+	expect(tree.tree().map((node) => node.status)).toEqual(["done", "done"]);
 	expect(completions(session)).toHaveLength(0);
 	parent.open();
 	await prompt;
@@ -536,35 +531,45 @@ test.each([false, true])(
 				session.extensionRunner.createToolContext("original", undefined),
 			),
 		);
-		await until(() => original.reached);
+		await original.reached;
 		const node = tree.get(started.id);
-		if (!node) throw new Error("Missing child");
-		const sent = tree.send(started.id, "late input");
-		await until(() => input.reached);
+		if (!node?.session) throw new Error("Missing child");
+		const order: string[] = [];
+		const sent = tree
+			.send(started.id, "late input")
+			.then(() => order.push("send"));
+		const result = started.result.then((summary) => {
+			order.push("result");
+			return summary;
+		});
+		await input.reached;
 		original.open();
-		await until(() => Boolean(node.session?.isIdle));
-		expect(await stillPending(started.result)).toBe(true);
+		await node.session.waitForIdle();
+		expect(node.queuedInput).toEqual(["late input"]);
+		expect(order).toEqual([]);
+		const closing = dispose
+			? tree.dispose().then(() => order.push("dispose"))
+			: undefined;
+		input.open();
+		await sent;
+		const summary = await result;
 		if (!dispose) {
-			input.open();
-			await sent;
-			expect(await started.result).toMatchObject({
+			expect(order).toEqual(["send", "result"]);
+			expect(summary).toMatchObject({
 				status: "done",
 				output: "original finished",
 				usage: { totalTokens: 9 },
 			});
-			expect(JSON.stringify(node.session?.messages)).toContain("late input");
+			expect(JSON.stringify(node.session.messages)).toContain("late input");
 			return;
 		}
-		const closing = tree.dispose();
-		expect(await stillPending(closing)).toBe(true);
-		input.open();
-		await sent;
-		expect(await started.result).toMatchObject({
+		await closing;
+		expect(order).toEqual(["send", "result", "dispose"]);
+		expect(summary).toMatchObject({
 			status: "aborted",
 			usage: { totalTokens: 3 },
 		});
-		await closing;
-		expect(node.session?.isStreaming).toBe(false);
+		expect(node.session.isStreaming).toBe(false);
 		expect(tree.closed).toBe(true);
 	},
 );
@@ -613,7 +618,7 @@ test("shutdown preserves billed child usage in the old parent's ledger without t
 	});
 	const { session, tree } = await rootSession({ streamFn: dispatch });
 	await session.prompt("delegate");
-	await until(() => child.reached);
+	await child.reached;
 	await session.extensionRunner.emit({
 		type: "session_shutdown",
 		reason: "quit",

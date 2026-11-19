@@ -24,7 +24,6 @@ import {
 	report,
 	response,
 	spawnContext,
-	stillPending,
 	stream,
 	testRuntime,
 	toolCall,
@@ -156,14 +155,15 @@ describe("silent hierarchy", () => {
 			return hierarchyStream.respond(context, options);
 		});
 		const started = tree.start(ROOT, "nest:1", await spawnContext(paused));
-		await until(() => leaf.reached && Boolean(tree.get("1")?.session?.isIdle));
+		await leaf.reached;
 		const node = tree.get("1");
-		if (!node) throw new Error("Missing parent");
+		if (!node?.session) throw new Error("Missing parent");
+		await node.session.waitForIdle();
 		const tools = [...node.liveTools.keys()];
 		await tree.send("1", "live continuation");
-		expect(await stillPending(started.result)).toBe(true);
+		expect(Bun.peek.status(started.result)).toBe("pending");
 		expect(node.status).toBe("running");
-		expect(node.session?.getLastAssistantText()).toBe("live continuation");
+		expect(node.session.getLastAssistantText()).toBe("live continuation");
 		expect([...node.liveTools.keys()]).toEqual(tools);
 		leaf.open();
 		expect(await started.result).toMatchObject({
@@ -187,7 +187,8 @@ describe("silent hierarchy", () => {
 			"nest:1",
 			await spawnContext(paused),
 		).result;
-		await until(() => leaf.reached && Boolean(tree.get("1")?.session?.isIdle));
+		await leaf.reached;
+		await tree.get("1")?.session?.waitForIdle();
 		tree.abort("1");
 		expect((await result).status).toBe("aborted");
 		expect(tree.get("1.1")?.status).toBe("aborted");
@@ -211,9 +212,10 @@ describe("task results", () => {
 			"nest:1",
 			await spawnContext(paused),
 		).result;
-		await until(() => leaf.reached && Boolean(tree.get("1")?.session?.isIdle));
+		await leaf.reached;
 		const parent = tree.get("1")?.session;
 		if (!parent) throw new Error("Missing parent");
+		await parent.waitForIdle();
 		let path: string | undefined;
 		spyOn(parent, "sendCustomMessage").mockImplementation(async (message) => {
 			path = (message.details as SubagentCompletionDetails).fullOutputPath;
@@ -249,9 +251,10 @@ describe("task results", () => {
 			"nest:1",
 			await spawnContext(paused),
 		).result;
-		await until(() => child.reached && Boolean(tree.get("1")?.session?.isIdle));
+		await child.reached;
+		await tree.get("1")?.session?.waitForIdle();
 		const sent = tree.send("1", "busy parent");
-		await until(() => parent.reached);
+		await parent.reached;
 		child.open();
 		const session = tree.get("1")?.session;
 		let path: string | undefined;
@@ -469,7 +472,7 @@ describe("interaction and cleanup", () => {
 		const node = tree.get("1");
 		await until(() => hasRunningTool(node));
 		const sent = tree.send("1", "in flight");
-		await until(() => hook.reached);
+		await hook.reached;
 		expect(tree.abort("1")).toEqual(new Map([["1", ["in flight"]]]));
 		hook.open();
 		await sent;
@@ -567,18 +570,19 @@ describe("interaction and cleanup", () => {
 	test("interrupting a task's turn keeps its run: it waits, unreminded, for input that resumes it, and still reports", async () => {
 		const tree = testRuntime();
 		const context = await spawnContext(echo);
-		await blockingTool(context);
+		const blocking = await blockingTool(context);
 		const started = tree.start(ROOT, "monitor", context);
 		const node = tree.get("1");
-		await until(() => hasRunningTool(node));
+		await blocking.reached;
 		expect(tree.interrupt("1")).toEqual([]);
 		expect(node).toMatchObject({
 			status: "running",
 			interrupted: true,
 			cancelled: false,
 		});
+		await tree.settled("1");
 		await node?.session?.waitForIdle();
-		expect(await stillPending(started.result)).toBe(true);
+		expect(Bun.peek.status(started.result)).toBe("pending");
 		expect(reminders(tree, "1")).toBe(0);
 		await tree.send("1", "carry on");
 		expect(node?.interrupted).toBe(false);
@@ -639,28 +643,28 @@ describe("interaction and cleanup", () => {
 					return response(text);
 				}),
 			);
-			await blockingTool(context);
+			const blocking = await blockingTool(context);
 			const started = tree.start(ROOT, "parent task", context);
-			const parent = tree.get("1");
+			await child.reached;
+			const parent = tree.get("1")?.session;
+			if (!parent) throw new Error("Missing parent");
 			const results = () =>
-				customMessages(parent?.session?.messages, SUBAGENT_RESULT_TYPE);
-			await until(
-				() =>
-					child.reached &&
-					(busy ? hasRunningTool(parent) : parent?.session?.isIdle === true),
-			);
+				customMessages(parent.messages, SUBAGENT_RESULT_TYPE);
+			if (busy) await blocking.reached;
+			else await parent.waitForIdle();
 			if (early) {
 				child.open();
-				await until(() => parent?.session?.agent.hasQueuedMessages() === true);
+				await until(() => parent.agent.hasQueuedMessages());
 			}
 			tree.interrupt("1");
+			await parent.waitForIdle();
+			const transcript = parent.messages.length;
 			child.open();
-			await until(() => tree.get("1.1")?.status === "done");
 			await tree.settled("1");
-			await parent?.session?.waitForIdle();
-			const transcript = parent?.session?.messages.length;
-			expect(await stillPending(started.result)).toBe(true);
-			expect(parent?.session?.messages.length).toBe(transcript);
+			await parent.waitForIdle();
+			expect(tree.get("1.1")?.status).toBe("done");
+			expect(Bun.peek.status(started.result)).toBe("pending");
+			expect(parent.messages).toHaveLength(transcript);
 			expect(results()).toHaveLength(0);
 			await tree.send("1", "resume");
 			expect(await started.result).toMatchObject({
@@ -705,7 +709,7 @@ describe("interaction and cleanup", () => {
 		});
 		const started = tree.start(ROOT, "parent task", context);
 		const parent = tree.get("1");
-		await until(() => child.reached && hasRunningTool(parent));
+		await Promise.all([child.reached, release.reached]);
 		child.open();
 		await until(() => parent?.session?.agent.hasQueuedMessages() === true);
 		release.open();

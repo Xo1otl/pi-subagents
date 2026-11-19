@@ -10,7 +10,6 @@ import { errorMessage } from "../runtime/errors.ts";
 import {
 	createSubagents,
 	type Leftover,
-	type Leftovers,
 	ROOT,
 	type SpawnContext,
 	type SubagentsOptions,
@@ -21,7 +20,6 @@ import {
 	model,
 	onCleanup,
 	response,
-	stillPending,
 	until,
 } from "./fixtures.ts";
 
@@ -139,17 +137,17 @@ test("ledger write failures do not leave completed runs stuck running or prevent
 });
 
 test("start reserves a running receipt synchronously, before session initialization", async () => {
-	const initialized = deferred();
-	const finished = deferred();
+	const initialization = checkpoint();
+	const prompt = checkpoint();
 	const session = sessionStub({
 		prompt: async () => {
-			await finished.promise;
+			await prompt.pass();
 			reply(session, "child finished");
 		},
 	});
 	const createSession = mock<SubagentsOptions["createSession"]>(
 		async ({ onCreated }) => {
-			await initialized.promise;
+			await initialization.pass();
 			onCreated(session);
 		},
 	);
@@ -157,16 +155,16 @@ test("start reserves a running receipt synchronously, before session initializat
 	const started = runtime.start(ROOT, "delayed child", context);
 	expect(started.id).toBe("1");
 	expect(createSession).not.toHaveBeenCalled();
-	await Promise.resolve(started);
-	expect(createSession).not.toHaveBeenCalled();
 	expect(runtime.get("1")?.status).toBe("running");
 	expect(runtime.get("1")?.session).toBeUndefined();
-	await until(() => createSession.mock.calls.length === 1);
-	expect(await stillPending(started.result)).toBe(true);
-	initialized.resolve();
-	await until(() => runtime.get("1")?.session !== undefined);
-	expect(await stillPending(started.result)).toBe(true);
-	finished.resolve();
+	await initialization.reached;
+	expect(createSession).toHaveBeenCalledTimes(1);
+	expect(Bun.peek.status(started.result)).toBe("pending");
+	initialization.open();
+	await prompt.reached;
+	expect(runtime.get("1")?.session).toBe(session);
+	expect(Bun.peek.status(started.result)).toBe("pending");
+	prompt.open();
 	expect(await started.result).toMatchObject({
 		status: "done",
 		output: "child finished",
@@ -202,7 +200,7 @@ test("cancellation during session initialization prevents prompting and disposes
 		disposeSession,
 	});
 	const started = runtime.start(ROOT, "hello", context);
-	await until(() => initialization.reached);
+	await initialization.reached;
 	runtime.abort("1");
 	const closing = runtime.dispose();
 	initialization.open();
@@ -212,7 +210,7 @@ test("cancellation during session initialization prevents prompting and disposes
 	expect(disposeSession).toHaveBeenCalledTimes(1);
 });
 
-test("initialization failures are run data, and orphaned completion failures are reported at shutdown", async () => {
+test("initialization failures are run data, and orphaned completion failures are reported once at shutdown", async () => {
 	const disposeSession = mock(async (_session: AgentSession) => {});
 	const runtime = runtimeWith({
 		createSession: async () => {
@@ -221,7 +219,9 @@ test("initialization failures are run data, and orphaned completion failures are
 		disposeSession,
 	});
 	const { result } = runtime.start(ROOT, "task", context);
-	runtime.trackCompletion(ROOT, Promise.reject(new Error("delivery failed")));
+	const delivery = Promise.reject(new Error("delivery failed"));
+	runtime.trackCompletion(ROOT, delivery);
+	runtime.trackCompletion(ROOT, delivery);
 	expect(await result).toMatchObject({
 		status: "error",
 		error: "session unavailable",
@@ -315,54 +315,36 @@ test("an ignored reminder is repeated only once the task's work changes, e.g. wi
 	expect(remindSession).toHaveBeenCalledTimes(2);
 });
 
-test("a task's leftovers are its delegated children and its running work with a leftover handle, none of them stopped", async () => {
-	const childWork = deferred();
+test("leftovers list only the owner's delegated children and running jobs", async () => {
+	const runtime = runtimeWith({
+		createSession: async ({ onCreated }) => onCreated(sessionStub()),
+	});
+	const parent = runtime.start(ROOT, "parent task", context);
+	const child = runtime.start(parent.id, "child task", context);
 	const job = deferred();
-	const detach = mock(() => {});
 	const running: Leftover = {
 		label: "PGID 42: job",
 		running: () => true,
-		detach,
+		detach: mock(() => {}),
 	};
-	let found: Leftovers | undefined;
-	const parent = sessionStub({
-		prompt: async (text) => {
-			if (text !== "task") return reply(parent, text);
-			runtime.start("1", "child task", context);
-			runtime.trackCompletion("1", job.promise, running);
-			runtime.trackCompletion("1", Promise.resolve(), {
-				label: "PGID 43: ended",
-				running: () => false,
-				detach,
-			});
-			runtime.trackCompletion("1", job.promise);
-			found = runtime.leftovers("1");
-			reply(parent, "parent report");
-			job.resolve();
-			childWork.resolve();
-		},
+	runtime.trackCompletion(parent.id, job.promise, running);
+	runtime.trackCompletion(parent.id, job.promise);
+	runtime.trackCompletion(ROOT, job.promise);
+	runtime.trackCompletion(parent.id, Promise.resolve(), {
+		...running,
+		running: () => false,
 	});
-	const runtime = runtimeWith({
-		createSession: async ({ owner: { id }, onCreated }) => {
-			if (id === "1") return onCreated(parent);
-			const child = sessionStub({
-				prompt: async (text) => {
-					await childWork.promise;
-					reply(child, text);
-				},
-			});
-			onCreated(child);
-		},
+
+	expect(runtime.leftovers(parent.id)).toEqual({
+		children: [child.id],
+		work: [running],
 	});
-	expect(await runtime.start(ROOT, "task", context).result).toMatchObject({
-		status: "done",
-		output: "parent report",
-	});
-	expect(found?.children).toEqual(["1.1"]);
-	expect(found?.work).toHaveLength(1);
-	expect(found?.work[0]).toBe(running);
-	expect(detach).not.toHaveBeenCalled();
-	expect(runtime.get("1.1")?.status).toBe("done");
+	expect(runtime.leftovers(ROOT).work).toEqual([]);
+	job.resolve();
+	await parent.result;
+	expect(runtime.get(child.id)?.status).toBe("done");
+	expect(runtime.leftovers(parent.id)).toEqual({ children: [], work: [] });
+	expect(running.detach).not.toHaveBeenCalled();
 });
 
 test("failed binding revokes a published session and retry creates a fresh one", async () => {

@@ -1,90 +1,164 @@
-import { expect, spyOn, test } from "bun:test";
+import { expect, test } from "bun:test";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, readFileSync } from "node:fs";
-import { chmod, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { existsSync } from "node:fs";
+import { trackCommands } from "../agent/commands.ts";
 import {
+	type GroupWatch,
 	isProcessGroupActive,
+	liveProcessGroup,
+	pollGroup,
 	UNKNOWN_STATUS_REPORT_MS,
 	waitForGroupToFinish,
 } from "../agent/process-groups.ts";
-import { COMMAND_EXIT_TYPE, COMMAND_UNKNOWN_TYPE } from "../agent/protocol.ts";
-import { ROOT } from "../runtime/index.ts";
+import {
+	COMMAND_EXIT_TYPE,
+	COMMAND_UNKNOWN_TYPE,
+	type CommandMessage,
+} from "../agent/protocol.ts";
 import {
 	backgroundJob,
-	customMessages,
 	killGroup,
-	lastCustomMessage,
 	lastText,
 	onCleanup,
-	report,
+	parentSession,
 	response,
-	rootSession,
 	spawnContext,
 	stream,
-	testRuntime,
 	toolCall,
-	until,
 } from "./fixtures.ts";
 
-const STATUS_ERROR = "Command failed: ps -A -o pgid=,stat=";
+async function pollSamples(
+	samples: [at: number, active: boolean | Error][],
+	onUnknown?: GroupWatch["onUnknown"],
+) {
+	let now = 0;
+	const notices: { at: number; error: unknown }[] = [];
+	await pollGroup(
+		async () => {
+			const sample = samples.shift();
+			if (!sample) throw new Error("No more status samples");
+			const [at, active] = sample;
+			now = at;
+			if (active instanceof Error) throw active;
+			return active;
+		},
+		{
+			onUnknown(error) {
+				notices.push({ at: now, error });
+				return onUnknown?.(error);
+			},
+		},
+		{
+			now: () => now,
+			sleep: async () => {
+				if (!samples.length) throw new Error("Polled past exit");
+			},
+		},
+	);
+	expect(samples).toHaveLength(0);
+	return notices;
+}
 
-function statusChecks(pgid: () => number | undefined, failures: number) {
-	const kill = process.kill.bind(process);
-	let calls = 0;
-	let failed = 0;
-	let recovered = false;
-	const spy = spyOn(process, "kill").mockImplementation((pid, signal) => {
-		const target = pgid();
-		if (signal === 0 && target && pid === -target) {
-			calls++;
-			if (!recovered && failed < failures) {
-				failed++;
-				throw new Error(STATUS_ERROR);
-			}
-		}
-		return kill(pid, signal);
+test("recovery resets the time spent unknown; transient failures are not exits", async () => {
+	const limit = UNKNOWN_STATUS_REPORT_MS;
+	const error = new Error("unreadable status");
+	const notices = await pollSamples([
+		[0, error],
+		[limit - 1, true],
+		[limit, error],
+		[2 * limit - 1, error],
+		[2 * limit, false],
+	]);
+	expect(notices).toEqual([]);
+});
+
+test("a sustained unknown status is reported once and watching continues until exit", async () => {
+	const limit = UNKNOWN_STATUS_REPORT_MS;
+	const first = new Error("unreadable status");
+	const latest = new Error("still unreadable");
+	const notices = await pollSamples([
+		[0, true],
+		[limit, first],
+		[2 * limit - 1, first],
+		[2 * limit, latest],
+		[3 * limit, latest],
+		[4 * limit, true],
+		[5 * limit, first],
+		[6 * limit, latest],
+		[7 * limit, false],
+	]);
+	expect(notices).toEqual([{ error: latest, at: 2 * limit }]);
+});
+
+test("failure to deliver the unknown notice rejects the wait", async () => {
+	const error = new Error("unreadable status");
+	await expect(
+		pollSamples(
+			[
+				[0, error],
+				[UNKNOWN_STATUS_REPORT_MS, error],
+			],
+			async () => {
+				throw new Error("telling failed");
+			},
+		),
+	).rejects.toThrow("telling failed");
+});
+
+test("an unreadable group is tracked and its listener gets the unknown notice then the exit", async () => {
+	const unreadable = new Error("status unavailable");
+	const notices: CommandMessage[] = [];
+	const completion = Promise.withResolvers<void>();
+	const session = await parentSession({
+		streamFn: stream((ctx) =>
+			lastText(ctx) === "start"
+				? toolCall("bash", { command: job.command })
+				: response("waiting"),
+		),
+		extensions: [
+			(pi) => {
+				trackCommands(
+					pi,
+					{
+						ownsJobs: true,
+						track: (work) => completion.resolve(work),
+						listener: () => (message) => {
+							notices.push(message);
+						},
+					},
+					{
+						isActive: async () => {
+							throw unreadable;
+						},
+						waitForExit: async (pgid, watch = {}) => {
+							await watch.onUnknown?.(unreadable);
+							await waitForGroupToFinish(pgid, watch);
+						},
+					},
+				);
+			},
+		],
 	});
-	onCleanup(() => spy.mockRestore());
-	return {
-		calls: () => calls,
-		failures: () => failed,
-		recover: () => {
-			recovered = true;
+	const job = backgroundJob(session.sessionManager.getCwd(), "unreadable");
+	onCleanup(job.release);
+	await session.prompt("start");
+	const pgid = await job.pgid();
+	expect(notices).toMatchObject([
+		{
+			customType: COMMAND_UNKNOWN_TYPE,
+			details: { pgid, error: unreadable.message },
 		},
-	};
-}
-
-function groupOf(job: ReturnType<typeof backgroundJob>) {
-	return () =>
-		existsSync(job.group) ? Number(readFileSync(job.group, "utf8")) : undefined;
-}
-
-function clock() {
-	const now = performance.now.bind(performance);
-	let skew = 0;
-	const spy = spyOn(performance, "now").mockImplementation(() => now() + skew);
-	onCleanup(() => spy.mockRestore());
-	return {
-		elapse: () => {
-			skew += UNKNOWN_STATUS_REPORT_MS;
-		},
-	};
-}
-
-function sleeper() {
-	const child = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
-	const exited = once(child, "exit");
-	const pgid = child.pid;
-	if (!pgid) throw new Error("Missing child pid");
-	const stop = () => {
-		killGroup(pgid);
-		return exited;
-	};
-	onCleanup(stop);
-	return { pgid, stop };
-}
+	]);
+	expect(await isProcessGroupActive(pgid)).toBe(true);
+	await job.release();
+	await completion.promise;
+	expect(existsSync(job.finished)).toBe(true);
+	expect(notices.map((message) => message.customType)).toEqual([
+		COMMAND_UNKNOWN_TYPE,
+		COMMAND_EXIT_TYPE,
+	]);
+});
 
 test.each([0, 1, -123, Number.NaN, 1.5, Number.MAX_SAFE_INTEGER + 1])(
 	"rejects unsafe process group %p",
@@ -95,7 +169,7 @@ test.each([0, 1, -123, Number.NaN, 1.5, Number.MAX_SAFE_INTEGER + 1])(
 	},
 );
 
-test("waits past shell exit for nohup and resolves when only zombies remain", async () => {
+test("waits past shell exit for nohup and can cancel a wait without ending the job", async () => {
 	const context = await spawnContext();
 	const job = backgroundJob(context.cwd, "orphan");
 	const shell = spawn("bash", ["-c", job.command], {
@@ -107,6 +181,10 @@ test("waits past shell exit for nohup and resolves when only zombies remain", as
 	if (!pgid) throw new Error("Missing shell pid");
 	onCleanup(() => killGroup(pgid));
 	await exited;
+	const controller = new AbortController();
+	const cancelled = waitForGroupToFinish(pgid, { signal: controller.signal });
+	controller.abort();
+	await expect(cancelled).rejects.toMatchObject({ name: "AbortError" });
 	expect(await isProcessGroupActive(pgid)).toBe(true);
 	const waiting = waitForGroupToFinish(pgid);
 	await job.release();
@@ -114,198 +192,9 @@ test("waits past shell exit for nohup and resolves when only zombies remain", as
 	expect(existsSync(job.finished)).toBe(true);
 });
 
-test("group waiting can be cancelled", async () => {
-	const { pgid } = sleeper();
-	const controller = new AbortController();
-	const waiting = waitForGroupToFinish(pgid, { signal: controller.signal });
-	controller.abort();
-	await expect(waiting).rejects.toThrow();
-});
-
-test("waiting outlasts transient status-check failures", async () => {
-	const { pgid, stop } = sleeper();
-	const checks = statusChecks(() => pgid, 2);
-	let finished = false;
-	const waiting = waitForGroupToFinish(pgid).then(() => {
-		finished = true;
-	});
-	await until(() => checks.calls() > 2);
-	expect(finished).toBe(false);
-	await stop();
-	await waiting;
-});
-
-test("a status that stays unknown is told once, and watching continues", async () => {
-	const time = clock();
-	const { pgid } = sleeper();
-	const checks = statusChecks(() => pgid, Number.POSITIVE_INFINITY);
-	const told: unknown[] = [];
-	const controller = new AbortController();
-	const waiting = waitForGroupToFinish(pgid, {
-		signal: controller.signal,
-		onUnknown: (error) => {
-			told.push(error);
-		},
-	});
-	await until(() => checks.failures() >= 2);
-	expect(told).toHaveLength(0);
-	time.elapse();
-	await until(() => told.length === 1);
-	expect(String(told[0])).toContain(STATUS_ERROR);
-	const failures = checks.failures();
-	await until(() => checks.failures() > failures);
-	expect(told).toHaveLength(1);
-	controller.abort();
-	await expect(waiting).rejects.toThrow();
-});
-
-test("a failure to tell of an unknown status ends the wait", async () => {
-	const time = clock();
-	const { pgid } = sleeper();
-	const checks = statusChecks(() => pgid, Number.POSITIVE_INFINITY);
-	const waiting = waitForGroupToFinish(pgid, {
-		onUnknown: () => {
-			throw new Error("telling failed");
-		},
-	});
-	await until(() => checks.failures() >= 2);
-	time.elapse();
-	await expect(waiting).rejects.toThrow("telling failed");
-});
-
-test.skipIf(process.platform !== "linux")(
-	"process names cannot impersonate a finished state",
-	async () => {
-		const context = await spawnContext();
-		const script = join(context.cwd, "a) Z 1 2 (b");
-		await writeFile(script, "#!/bin/sh\nread line\n");
-		await chmod(script, 0o755);
-		const child = spawn(script, [], {
-			detached: true,
-			stdio: ["pipe", "ignore", "ignore"],
-		});
-		const exited = once(child, "exit");
-		const pgid = child.pid;
-		if (!pgid) throw new Error("Missing child pid");
-		onCleanup(() => child.stdin.end());
-		await until(() =>
-			readFileSync(`/proc/${pgid}/stat`, "utf8").includes("(b)"),
-		);
-		expect(await isProcessGroupActive(pgid)).toBe(true);
-		child.stdin.end();
-		await exited;
-		expect(await isProcessGroupActive(pgid)).toBe(false);
-	},
-);
-
-test("transient status-check failures neither stop a subagent's job nor lose its exit", async () => {
-	const tree = testRuntime();
-	const context = await spawnContext(
-		stream((ctx) => {
-			if (lastText(ctx) === "start")
-				return toolCall("bash", { command: job.command });
-			return lastCustomMessage(ctx, COMMAND_EXIT_TYPE)
-				? report("checked after exit")
-				: response("waiting");
-		}),
-	);
-	const job = backgroundJob(context.cwd, "flaky");
-	const checks = statusChecks(groupOf(job), 3);
-	const started = tree.start(ROOT, "start", context);
-	await until(
-		() =>
-			checks.failures() === 3 &&
-			tree.get("1")?.session?.getLastAssistantText() === "waiting",
-	);
-	expect(tree.get("1")?.status).toBe("running");
-	expect(tree.get("1")?.error).toBeUndefined();
-	await job.release();
-	expect(await started.result).toMatchObject({
-		status: "done",
-		output: "checked after exit",
-	});
-	expect(existsSync(job.finished)).toBe(true);
-	const messages = tree.get("1")?.session?.messages;
-	expect(customMessages(messages, COMMAND_UNKNOWN_TYPE)).toHaveLength(0);
-});
-
-test("a subagent told its job's status stays unknown keeps the job and still learns of its exit", async () => {
-	const time = clock();
-	const tree = testRuntime();
-	const context = await spawnContext(
-		stream((ctx) => {
-			if (lastText(ctx) === "start")
-				return toolCall("bash", { command: job.command });
-			if (lastCustomMessage(ctx, COMMAND_UNKNOWN_TYPE))
-				return response("noted unknown");
-			return lastCustomMessage(ctx, COMMAND_EXIT_TYPE)
-				? report("checked after exit")
-				: response("waiting");
-		}),
-	);
-	const job = backgroundJob(context.cwd, "unknown");
-	const checks = statusChecks(groupOf(job), Number.POSITIVE_INFINITY);
-	const started = tree.start(ROOT, "start", context);
-	await until(() => checks.failures() >= 2);
-	time.elapse();
-	const session = () => tree.get("1")?.session;
-	await until(
-		() =>
-			session()?.isIdle === true &&
-			session()?.getLastAssistantText() === "noted unknown",
-	);
-	const pgid = await job.pgid();
-	expect(
-		customMessages(session()?.messages, COMMAND_UNKNOWN_TYPE),
-	).toMatchObject([{ details: { pgid, error: STATUS_ERROR } }]);
-	expect(tree.get("1")?.status).toBe("running");
-	expect(tree.get("1")?.error).toBeUndefined();
-	checks.recover();
-	expect(await isProcessGroupActive(pgid)).toBe(true);
-	await job.release();
-	expect(await started.result).toMatchObject({
-		status: "done",
-		output: "checked after exit",
-	});
-	expect(existsSync(job.finished)).toBe(true);
-	expect(
-		customMessages(session()?.messages, COMMAND_UNKNOWN_TYPE),
-	).toHaveLength(1);
-});
-
-test("a parent told its job's status stays unknown still learns of its exit", async () => {
-	const time = clock();
-	let job: ReturnType<typeof backgroundJob> | undefined;
-	const { session, tree } = await rootSession({
-		streamFn: stream((context) => {
-			if (lastText(context) === "start job" && job)
-				return toolCall("bash", { command: job.command });
-			if (lastCustomMessage(context, COMMAND_UNKNOWN_TYPE))
-				return response("noted unknown");
-			if (lastCustomMessage(context, COMMAND_EXIT_TYPE))
-				return response("checked after exit");
-			return response("job started");
-		}),
-	});
-	job = backgroundJob(session.sessionManager.getCwd(), "parent-unknown");
-	onCleanup(job.release);
-	const checks = statusChecks(groupOf(job), Number.POSITIVE_INFINITY);
-	await session.prompt("start job");
-	await until(() => checks.failures() >= 2);
-	time.elapse();
-	await until(
-		() => session.isIdle && session.getLastAssistantText() === "noted unknown",
-	);
-	checks.recover();
-	await job.release();
-	await until(
-		() =>
-			session.isIdle && session.getLastAssistantText() === "checked after exit",
-	);
-	await tree.settled(ROOT);
-	expect(existsSync(job.finished)).toBe(true);
-	expect(customMessages(session.messages, COMMAND_UNKNOWN_TYPE)).toHaveLength(
-		1,
-	);
-	expect(customMessages(session.messages, COMMAND_EXIT_TYPE)).toHaveLength(1);
+test("Linux process names cannot impersonate a zombie state or a group ID", () => {
+	const stat = (state: string) => `108 (a) Z 1 2 (b) ${state} 17 42 108 0`;
+	expect(liveProcessGroup(stat("S"))).toBe(42);
+	for (const state of ["Z", "X", "x"])
+		expect(liveProcessGroup(stat(state))).toBeUndefined();
 });

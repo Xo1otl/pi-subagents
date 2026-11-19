@@ -38,7 +38,6 @@ import {
 	testProvider,
 	testRuntime,
 	toolCall,
-	until,
 } from "./fixtures.ts";
 
 function addedGuidance(guidelines: readonly string[] | undefined): string {
@@ -681,7 +680,7 @@ test("cancellation during async standard input hooks stops the later agent loop"
 		pi.on("input", () => hook.pass());
 	});
 	const result = tree.start(ROOT, "wait", context).result;
-	await until(() => hook.reached);
+	await hook.reached;
 	tree.abort("1");
 	hook.open();
 	expect((await result).status).toBe("aborted");
