@@ -11,7 +11,13 @@ import type { Subagent, Subagents } from "../runtime/index.ts";
 import { ChatEditor } from "./composer.ts";
 import { readContextUsage, renderContextUsage } from "./context-usage.ts";
 import { createDoubleLeft } from "./navigation.ts";
-import { fitHints, singleLine, statusLabel, type UITheme } from "./text.ts";
+import {
+	fitHints,
+	singleLine,
+	statusLabel,
+	stopHint,
+	type UITheme,
+} from "./text.ts";
 import { createTranscriptRenderer, type TranscriptRow } from "./transcript.ts";
 
 export interface ChatProps {
@@ -33,7 +39,7 @@ export interface Chat extends Focusable {
 	dispose(): void;
 }
 
-function hints(width: number): string[] {
+function hints(width: number, node: Subagent | undefined): string[] {
 	return [
 		"Enter send",
 		width < 75 ? "Ctrl+J newline" : "Shift+Enter newline",
@@ -42,7 +48,7 @@ function hints(width: number): string[] {
 		"Tab next",
 		"Ctrl+O tools",
 		"Ctrl+T thinking",
-		"Ctrl+C stop",
+		stopHint(node),
 		"PgUp/PgDn",
 		"Ctrl+End live",
 	];
@@ -152,7 +158,7 @@ export function createChat({
 				...visible.map((row) => row.text),
 				...Array<string>(bodyHeight - visible.length).fill(""),
 				...composer,
-				theme.fg("dim", fitHints(hints(width), width)),
+				theme.fg("dim", fitHints(hints(width, node), width)),
 			];
 		},
 		handleInput(data) {

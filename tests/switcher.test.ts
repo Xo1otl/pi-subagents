@@ -13,6 +13,7 @@ import {
 	report,
 	response,
 	spawnContext,
+	stillPending,
 	stream,
 	testRuntime,
 	theme,
@@ -202,10 +203,11 @@ test("Ctrl+C stops the selected subtree, and runtime shutdown closes the switche
 	expect(done).toHaveBeenCalledTimes(1);
 });
 
-test("a message sent during a blocking tool stays visible as queued, and Ctrl+C returns it to the draft", async () => {
-	const { tree, terminal, composer } = await setup({
+test("Ctrl+C interrupts a turn, returning queued input to the draft; pressed again, it stops the agent", async () => {
+	const { tree, terminal, composer, header } = await setup({
 		agents: false,
 		initialId: "1",
+		columns: 200,
 	});
 	const context = await spawnContext(
 		stream((context) =>
@@ -217,6 +219,7 @@ test("a message sent during a blocking tool stays visible as queued, and Ctrl+C 
 	await blockingTool(context);
 	const result = tree.start(ROOT, "monitor", context).result;
 	await until(() => hasRunningTool(tree.get("1")));
+	expect(terminal.text()).toContain("Ctrl+C interrupt");
 	terminal.input("QUEUED_MESSAGE");
 	terminal.input("\r");
 	await until(() => tree.get("1")?.queuedInput.length === 1);
@@ -224,9 +227,15 @@ test("a message sent during a blocking tool stays visible as queued, and Ctrl+C 
 	expect(terminal.text()).toContain("QUEUED_MESSAGE");
 	terminal.input("newer draft");
 	terminal.input("\x03");
-	expect((await result).status).toBe("aborted");
 	expect(composer()).toContain("QUEUED_MESSAGE\n\nnewer draft");
 	expect(terminal.text()).not.toContain("queued");
+	await until(() => tree.get("1")?.session?.isIdle === true);
+	expect(header()).toContain("Subagent 1 · 1/1 · interrupted");
+	expect(terminal.text()).toContain("Ctrl+C stop");
+	expect(await stillPending(result)).toBe(true);
+	terminal.input("\x03");
+	expect((await result).status).toBe("aborted");
+	expect(composer()).toContain("QUEUED_MESSAGE\n\nnewer draft");
 });
 
 test("context usage is unknown during startup, then shows the latest request in the header and the picker", async () => {

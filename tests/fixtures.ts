@@ -134,8 +134,7 @@ export function removeOutputOnCleanup(path: string): void {
 export function killGroup(pgid: number): void {
 	try {
 		process.kill(-pgid, "SIGKILL");
-	} catch {
-	}
+	} catch {}
 }
 
 export const theme = { fg: (_color: string, text: string) => text } as Theme;
@@ -498,8 +497,7 @@ export async function parentSession({
 				type: "session_shutdown",
 				reason: "quit",
 			});
-		} catch {
-		}
+		} catch {}
 		session.dispose();
 	});
 	await session.bindExtensions({ mode: "rpc", shutdownHandler: () => {} });

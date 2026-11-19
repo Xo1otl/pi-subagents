@@ -307,10 +307,7 @@ export function delegatedCommands({
 						await session.waitForIdle();
 						if (signal.aborted || !running()) return;
 					}
-					await session.sendCustomMessage<CommandMessage["details"]>(message, {
-						deliverAs: "steer",
-						triggerTurn: true,
-					});
+					await runtime.notify(id, message, "steer");
 				};
 			},
 		});

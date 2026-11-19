@@ -8,15 +8,21 @@ import {
 } from "@earendil-works/pi-tui";
 import type { Subagent, Subagents } from "../runtime/index.ts";
 import { readContextUsage, renderContextUsage } from "./context-usage.ts";
-import { fitHints, singleLine, statusLabel, type UITheme } from "./text.ts";
+import {
+	fitHints,
+	singleLine,
+	statusLabel,
+	stopHint,
+	type UITheme,
+} from "./text.ts";
 
-const HINTS = [
+const hints = (node: Subagent | undefined) => [
 	"Enter open",
 	"Esc close",
 	"↑↓ select",
 	"← parent",
 	"→ child",
-	"Ctrl+C stop",
+	stopHint(node),
 	"Tab next",
 ];
 
@@ -87,7 +93,8 @@ export function createPicker({
 				lines.push(row(node, node.id === id, width));
 			}
 			if (!nodes.length) lines.push(theme.fg("dim", "No subagents yet."));
-			lines.push(theme.fg("dim", fitHints(HINTS, width)));
+			const node = id ? runtime.get(id) : undefined;
+			lines.push(theme.fg("dim", fitHints(hints(node), width)));
 			return lines;
 		},
 		handleInput(data) {

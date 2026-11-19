@@ -128,6 +128,43 @@ test("a job exit reaching a busy session is answered after its reply", async () 
 	});
 });
 
+test("a job exit reaching an interrupted agent waits for its next input, and the interrupt leaves the job running", async () => {
+	const tree = testRuntime();
+	const context = await spawnContext(
+		stream((ctx) => {
+			const text = lastText(ctx);
+			if (text === "start") return toolCall("bash", { command: job.command });
+			if (lastCustomMessage(ctx, COMMAND_EXIT_TYPE))
+				return report("checked after resuming");
+			return response(
+				ctx.messages.at(-1)?.role === "toolResult"
+					? "waiting for the job"
+					: text,
+			);
+		}),
+	);
+	const job = backgroundJob(context.cwd, "interrupted");
+	const started = tree.start(ROOT, "start", context);
+	await until(() => idle(tree));
+	tree.interrupt("1");
+	const pgid = await job.pgid();
+	expect(await isProcessGroupActive(pgid)).toBe(true);
+	await job.release();
+	await waitForGroupToFinish(pgid);
+	await tree.settled("1");
+	expect(existsSync(job.finished)).toBe(true);
+	expect(exits(tree)).toHaveLength(0);
+	expect(tree.get("1")?.session?.getLastAssistantText()).toBe(
+		"waiting for the job",
+	);
+	await tree.send("1", "resume");
+	expect(await started.result).toMatchObject({
+		status: "done",
+		output: "checked after resuming",
+	});
+	expect(exits(tree)).toHaveLength(1);
+});
+
 test.each(["abort", "dispose"] as const)(
 	"%s kills nohup groups and cancellation permits reuse",
 	async (action) => {

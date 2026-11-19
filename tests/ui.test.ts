@@ -172,6 +172,8 @@ test("the root opens the switcher from /subagents and from Left-Left at its edit
 	const stopping = session.prompt("/subagents 1");
 	await until(ui.switcherOpen);
 	terminal.input("\x03");
+	await until(() => ui.indicator().includes("1 running · 1 interrupted"));
+	terminal.input("\x03");
 	await until(() => widgets.size === 0);
 	terminal.input("\x1b");
 	await stopping;

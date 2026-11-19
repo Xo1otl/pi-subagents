@@ -1,6 +1,7 @@
 import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import type { Subagent, Subagents } from "../runtime/index.ts";
+import { statusLabel } from "./text.ts";
 
 const WIDGET_KEY = "pi-subagents.running";
 const LISTED_IDS = 3;
@@ -8,11 +9,11 @@ const LISTED_IDS = 3;
 function summarize(nodes: readonly Subagent[]): string {
 	const active = nodes.filter((node) => node.status === "running");
 	if (!active.length) return "";
-	const stopping = active.filter((node) => node.cancelled).length;
-	const running = active.length - stopping;
-	const parts: string[] = [];
-	if (running) parts.push(`${running} running`);
-	if (stopping) parts.push(`${stopping} stopping`);
+	const counts = Map.groupBy(active, statusLabel);
+	const parts = ["running", "interrupted", "stopping"].flatMap((label) => {
+		const count = counts.get(label)?.length;
+		return count ? [`${count} ${label}`] : [];
+	});
 	const ids = active.slice(0, LISTED_IDS).map((node) => node.id);
 	if (active.length > LISTED_IDS) ids.push("…");
 	parts.push(ids.join(", "));

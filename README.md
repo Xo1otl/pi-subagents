@@ -20,6 +20,7 @@ pi install ./tools/pi-subagents   # or: pi -e ./tools/pi-subagents/index.ts
 - While serving its parent's task, a subagent's system prompt has a `<subagent_role>` section.
 - An idle subagent with nothing to wait for and no report gets a `subagent-reminder`; still unreported, its run fails.
 - Input to a running agent steers it. Continuing a finished one is your own conversation: no role, no reminder, no delivered report.
+- Interrupting an agent ends its turn, not its run: queued input returns to the draft, children and jobs keep running, their results wait, and your next input resumes it. Stopping ends the run and its descendants'.
 - Usage is billed to every ancestor session.
 - Child sessions are saved as `<parent>/<child>.jsonl`. Switching sessions, reloading or exiting cancels runs; they are not restored.
 - One-shot modes (`-p`, `--mode json`) are unsupported.
@@ -45,7 +46,7 @@ pi install ./tools/pi-subagents   # or: pi -e ./tools/pi-subagents/index.ts
 | PgUp / PgDn, Ctrl+Home / End | | Scroll, start / live |
 | Ctrl+O / Ctrl+T | | Toggle tools / thinking |
 | Tab / Shift+Tab | Next / previous agent | Next / previous agent |
-| Ctrl+C | Stop agent and descendants | Stop agent and descendants |
+| Ctrl+C | Interrupt agent; again: stop it and descendants | Interrupt agent; again: stop it and descendants |
 | Esc | Close | Close |
 
 ## Development

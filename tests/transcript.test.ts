@@ -22,6 +22,7 @@ function node(
 		context: { cwd: "/unused", model, projectTrusted: false },
 		status: "running",
 		cancelled: false,
+		interrupted: false,
 		delegated: true,
 		liveTools: new Map(),
 		queuedInput: [],

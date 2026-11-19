@@ -18,10 +18,20 @@ export function singleLine(text: string): string {
 	return plain(text).replace(/\s+/g, " ");
 }
 
-export function statusLabel(
-	node: Pick<Subagent, "status" | "cancelled">,
-): string {
-	return node.cancelled && node.status === "running" ? "stopping" : node.status;
+type Activity = Pick<Subagent, "status" | "cancelled" | "interrupted">;
+
+export function statusLabel(node: Activity): string {
+	if (node.status !== "running") return node.status;
+	if (node.cancelled) return "stopping";
+	return node.interrupted ? "interrupted" : "running";
+}
+
+export function interruptible(node: Activity | undefined): boolean {
+	return node !== undefined && statusLabel(node) === "running";
+}
+
+export function stopHint(node: Activity | undefined): string {
+	return `Ctrl+C ${interruptible(node) ? "interrupt" : "stop"}`;
 }
 
 export function fitHints(hints: readonly string[], width: number): string {

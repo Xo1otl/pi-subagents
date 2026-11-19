@@ -81,8 +81,12 @@ test("counts concurrent runs from startup through stopping and settlement, bound
 	expect(render(100, upper as Theme)).toContain("SUBAGENTS: 5 RUNNING");
 	runtime.abort("1");
 	expect(render()).toContain("4 running · 1 stopping · 1, 2, 3, …");
+	runtime.interrupt("2");
+	expect(render()).toContain("3 running · 1 interrupted · 1 stopping");
 	await runs[0];
-	expect(render()).toContain("Subagents: 4 running · 2, 3, 4, …");
+	expect(render()).toContain(
+		"Subagents: 3 running · 1 interrupted · 2, 3, 4, …",
+	);
 	runtime.abort();
 	await Promise.all(runs);
 	expect(widgets.size).toBe(0);

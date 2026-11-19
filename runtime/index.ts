@@ -62,6 +62,8 @@ export interface SubagentsOptions {
 
 export const ROOT = "root";
 
+export type Notice = Parameters<AgentSession["sendCustomMessage"]>[0];
+
 export interface SubagentToolExecution {
 	toolCallId: string;
 	toolName: string;
@@ -81,6 +83,7 @@ export interface Subagent {
 	readonly status: "running" | RunSummary["status"];
 	readonly error?: string;
 	readonly cancelled: boolean;
+	readonly interrupted: boolean;
 	readonly delegated: boolean;
 	readonly liveTools: ReadonlyMap<string, SubagentToolExecution>;
 	readonly queuedInput: readonly string[];
@@ -108,6 +111,12 @@ export interface Subagents {
 	leftovers(id: string): Leftovers;
 	settled(parentId: string): Promise<void>;
 	send(id: string, instructions: string): Promise<void>;
+	notify(
+		id: string,
+		notice: Notice,
+		deliverAs: "steer" | "followUp",
+	): Promise<void>;
+	interrupt(id: string): readonly string[];
 	abort(id?: string): ReadonlyMap<string, readonly string[]>;
 	dispose(): Promise<void>;
 }
@@ -125,8 +134,11 @@ interface SubagentNode extends Subagent {
 	status: Subagent["status"];
 	error?: string;
 	cancelled: boolean;
+	interruption?: PromiseWithResolvers<void>;
 	readonly liveTools: Map<string, SubagentToolExecution>;
 	readonly pendingInput: Set<{ readonly text: string }>;
+	readonly queuedNotices: Set<Notice>;
+	readonly heldNotices: Notice[];
 	run?: ActiveRun;
 	unsubscribe: () => void;
 }
@@ -287,6 +299,11 @@ export function createSubagents({
 			unsubscribe: () => {},
 			liveTools: new Map(),
 			pendingInput: new Set(),
+			queuedNotices: new Set(),
+			heldNotices: [],
+			get interrupted() {
+				return node.interruption !== undefined;
+			},
 			get delegated() {
 				return node.run !== undefined && !node.run.userLed;
 			},
@@ -350,13 +367,22 @@ export function createSubagents({
 		if (fromUser) node.pendingInput.add(input);
 		const accepted = (disposition?: string) => {
 			const withdrawn = fromUser && !node.pendingInput.delete(input);
-			if (withdrawn && disposition === "queued") node.session?.clearQueue();
+			if (withdrawn && disposition === "queued") clearQueue(node);
+			releaseHeld(node);
 			preflight.resolve();
 		};
+		const live = () =>
+			!node.cancelled &&
+			!closing &&
+			(!fromUser || node.pendingInput.has(input));
 		const prompt = previous.then(async () => {
 			try {
-				if (!node.session || node.cancelled || closing) return;
-				await node.session.prompt(instructions, {
+				if (fromUser && node.interruption && live())
+					await node.session?.waitForIdle();
+				const session = node.session;
+				if (!session || !live()) return;
+				if (fromUser) endInterruption(node);
+				await session.prompt(instructions, {
 					streamingBehavior: "steer",
 					preflightResult: accepted,
 				});
@@ -380,6 +406,47 @@ export function createSubagents({
 			await prompt;
 			changed();
 		} else await run(node, instructions, true);
+	}
+
+	function wake(
+		node: SubagentNode,
+		session: AgentSession,
+		notice: Notice,
+		deliverAs: "steer" | "followUp",
+	): Promise<void> {
+		if (session.isStreaming) node.queuedNotices.add(notice);
+		return session.sendCustomMessage(notice, { deliverAs, triggerTurn: true });
+	}
+
+	async function notify(
+		id: string,
+		notice: Notice,
+		deliverAs: "steer" | "followUp",
+	): Promise<void> {
+		const node = nodes.get(id);
+		const session = node?.session;
+		if (!node || !session) throw new Error(`Subagent ${id} has no session.`);
+		if (node.cancelled || closing) return;
+		if (node.interruption) {
+			node.heldNotices.push(notice);
+			return;
+		}
+		await wake(node, session, notice, deliverAs);
+	}
+
+	function releaseHeld(node: SubagentNode): void {
+		const session = node.session;
+		if (!session || node.interruption) return;
+		for (const notice of node.heldNotices.splice(0))
+			trackCompletion(node.id, wake(node, session, notice, "steer"));
+	}
+
+	function endInterruption(node: SubagentNode): void {
+		const interruption = node.interruption;
+		if (!interruption) return;
+		node.interruption = undefined;
+		interruption.resolve();
+		changed();
 	}
 
 	async function initialize(node: SubagentNode): Promise<void> {
@@ -463,6 +530,10 @@ export function createSubagents({
 				} catch (error) {
 					recordError(node, error);
 				}
+				if (node.interruption) {
+					await node.interruption.promise;
+					continue;
+				}
 				entries =
 					node.session?.sessionManager.getEntries().slice(firstEntry ?? 0) ??
 					[];
@@ -517,7 +588,15 @@ export function createSubagents({
 		node.unsubscribe();
 		node.session = session;
 		node.unsubscribe = session.subscribe((event) => {
-			if (node.cancelled && event.type === "agent_start") stopSession(session);
+			if ((node.cancelled || node.interruption) && event.type === "agent_start")
+				stopSession(session);
+			if (event.type === "message_end" && event.message.role === "custom")
+				for (const notice of node.queuedNotices)
+					if (
+						notice.content === event.message.content &&
+						notice.details === event.message.details
+					)
+						node.queuedNotices.delete(notice);
 			if (isToolExecution(event))
 				node.liveTools.set(
 					event.toolCallId,
@@ -554,19 +633,53 @@ export function createSubagents({
 		}
 	}
 
+	function clearQueue(node: SubagentNode): string[] {
+		const lost = [...node.queuedNotices];
+		node.queuedNotices.clear();
+		let input: string[] = [];
+		try {
+			const queued = node.session?.clearQueue();
+			if (queued) input = [...queued.steering, ...queued.followUp];
+		} catch (error) {
+			completionErrors.push(error);
+		}
+		if (!node.cancelled && !closing) {
+			node.heldNotices.push(...lost);
+			releaseHeld(node);
+		}
+		return input;
+	}
+
+	function withdraw(node: SubagentNode): string[] {
+		const pending = Array.from(node.pendingInput, ({ text }) => text);
+		node.pendingInput.clear();
+		return [...clearQueue(node), ...pending];
+	}
+
+	function interrupt(id: string): string[] {
+		const node = nodes.get(id);
+		if (
+			node?.status !== "running" ||
+			node.cancelled ||
+			node.interruption ||
+			closing
+		)
+			return [];
+		node.interruption = Promise.withResolvers();
+		const input = withdraw(node);
+		if (node.session) stopSession(node.session);
+		changed();
+		return input;
+	}
+
 	function abort(id = ROOT): Map<string, string[]> {
 		const discarded = new Map<string, string[]>();
 		for (const node of nodes.values()) {
 			if (!isWithin(nodes, node, id) || node.status !== "running") continue;
 			node.cancelled = true;
-			const input = Array.from(node.pendingInput, ({ text }) => text);
-			node.pendingInput.clear();
-			try {
-				const queued = node.session?.clearQueue();
-				if (queued) input.unshift(...queued.steering, ...queued.followUp);
-			} catch (error) {
-				completionErrors.push(error);
-			}
+			node.heldNotices.length = 0;
+			endInterruption(node);
+			const input = withdraw(node);
 			if (input.length) discarded.set(node.id, input);
 			if (node.session) stopSession(node.session);
 			changed();
@@ -610,6 +723,8 @@ export function createSubagents({
 		leftovers,
 		settled,
 		send,
+		notify,
+		interrupt,
 		abort,
 		dispose,
 	};

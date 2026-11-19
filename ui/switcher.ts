@@ -13,7 +13,7 @@ import type { Subagents } from "../runtime/index.ts";
 import { type Chat, createChat } from "./chat.ts";
 import { createPasteGuard } from "./navigation.ts";
 import { createPicker } from "./picker.ts";
-import type { UITheme } from "./text.ts";
+import { interruptible, type UITheme } from "./text.ts";
 
 export const SWITCHER_OVERLAY: OverlayOptions = {
 	width: "100%",
@@ -99,8 +99,11 @@ export function createSubagentSwitcher({
 	function stop(): void {
 		const id = selected();
 		if (!id) return;
-		for (const [agent, input] of runtime.abort(id))
-			chatFor(agent).restore(input);
+		const restored = interruptible(runtime.get(id))
+			? [[id, runtime.interrupt(id)] as const]
+			: runtime.abort(id);
+		for (const [agent, input] of restored)
+			if (input.length) chatFor(agent).restore(input);
 	}
 
 	function dispose(): void {

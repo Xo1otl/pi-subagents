@@ -241,12 +241,7 @@ export function createSubagentIntegration(
 				hold(source, ctx, message);
 				return;
 			}
-			const parent = source.runtime.get(owner.id)?.session;
-			if (!parent) throw new Error("Subagent parent session is unavailable.");
-			await parent.sendCustomMessage(message, {
-				deliverAs: "followUp",
-				triggerTurn: true,
-			});
+			await source.runtime.notify(owner.id, message, "followUp");
 		} catch (error) {
 			if (source.pendingCompletions.delete(message))
 				await discardSubagentCompletion(message);
@@ -260,7 +255,7 @@ export function createSubagentIntegration(
 		source.stopWatchingAbort();
 		const signal = ctx.signal;
 		const fence = () => {
-			source.abortEpoch++;
+			if (!source.runtime.get(owner.id)?.interrupted) source.abortEpoch++;
 		};
 		signal?.addEventListener("abort", fence, { once: true });
 		if (signal?.aborted) fence();
@@ -285,9 +280,9 @@ export function createSubagentIntegration(
 			source.stopWatchingAbort();
 			if (!owner) release(source, !event.aborted);
 			else if (event.aborted) {
-				source.abortEpoch++;
-				if (source.runtime.get(owner.id)?.cancelled)
-					await discardPending(source);
+				const node = source.runtime.get(owner.id);
+				if (!node?.interrupted) source.abortEpoch++;
+				if (node?.cancelled) await discardPending(source);
 			}
 		}
 		flushAccounting(ctx);
@@ -354,9 +349,7 @@ export function createSubagentIntegration(
 				isCurrent(source, ctx) &&
 				!tree.closed &&
 				(!owner ||
-					(source.abortEpoch === epoch &&
-						!signal?.aborted &&
-						!tree.get(owner.id)?.cancelled));
+					(source.abortEpoch === epoch && !tree.get(owner.id)?.cancelled));
 			const completion = started.result
 				.then((result) => deliver(source, ctx, result, canDeliver))
 				.catch((error: unknown) => {

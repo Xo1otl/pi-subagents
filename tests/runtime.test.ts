@@ -1,6 +1,7 @@
 import { describe, expect, mock, spyOn, test } from "bun:test";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { Type } from "typebox";
 import {
 	SUBAGENT_REMINDER_TYPE,
 	SUBAGENT_RESULT_TYPE,
@@ -11,8 +12,10 @@ import {
 	blockingTool,
 	checkpoint,
 	childExtension,
+	customMessages,
 	hasRunningTool,
 	hierarchyStream,
+	lastCompletion,
 	lastCustomMessage,
 	lastText,
 	model,
@@ -559,6 +562,163 @@ describe("interaction and cleanup", () => {
 		expect(leaf?.status).toBe("aborted");
 		await tree.send("1.1", "say hello");
 		expect(leaf?.status).toBe("done");
+	});
+
+	test("interrupting a task's turn keeps its run: it waits, unreminded, for input that resumes it, and still reports", async () => {
+		const tree = testRuntime();
+		const context = await spawnContext(echo);
+		await blockingTool(context);
+		const started = tree.start(ROOT, "monitor", context);
+		const node = tree.get("1");
+		await until(() => hasRunningTool(node));
+		expect(tree.interrupt("1")).toEqual([]);
+		expect(node).toMatchObject({
+			status: "running",
+			interrupted: true,
+			cancelled: false,
+		});
+		await node?.session?.waitForIdle();
+		expect(await stillPending(started.result)).toBe(true);
+		expect(reminders(tree, "1")).toBe(0);
+		await tree.send("1", "carry on");
+		expect(node?.interrupted).toBe(false);
+		expect(await started.result).toMatchObject({
+			status: "done",
+			output: "task result",
+		});
+		expect(replies(node?.session?.messages)).toEqual(["carry on"]);
+		expect(reminders(tree, "1")).toBe(1);
+	});
+
+	test("an interrupt hands back queued input once; input sent at once waits for the interrupted turn to end", async () => {
+		const tree = testRuntime();
+		const context = await spawnContext(echo);
+		await blockingTool(context);
+		const started = tree.start(ROOT, "monitor", context);
+		const node = tree.get("1");
+		await until(() => hasRunningTool(node));
+		await tree.send("1", "first");
+		expect(tree.interrupt("1")).toEqual(["first"]);
+		expect(tree.interrupt("1")).toEqual([]);
+		expect(node?.queuedInput).toEqual([]);
+		const resumed = tree.send("1", "second");
+		expect(node?.queuedInput).toEqual(["second"]);
+		await resumed;
+		expect(await started.result).toMatchObject({
+			status: "done",
+			output: "task result",
+		});
+		expect(replies(node?.session?.messages)).toEqual(["second"]);
+	});
+
+	test.each([
+		["queued before the interrupt", true, true],
+		["arriving after an interrupted turn", true, false],
+		["arriving while the parent idles", false, false],
+	] as const)(
+		"a child's result %s waits for the parent's next input instead of restarting it",
+		async (_case, busy, early) => {
+			const tree = testRuntime();
+			const child = checkpoint();
+			const context = await spawnContext(
+				stream(async (context, options) => {
+					const text = lastText(context);
+					const completion = lastCompletion(context);
+					const last = context.messages.at(-1);
+					if (completion) return report(`parent saw ${completion.output}`);
+					if (text === "parent task")
+						return toolCall("subagent", { instructions: "child task" });
+					if (text === "child task") {
+						await child.pass(options?.signal);
+						return report("child answer");
+					}
+					if (last?.role === "toolResult" && last.toolName === "subagent")
+						return busy
+							? toolCall("blocking", {})
+							: response("waiting for the child");
+					return response(text);
+				}),
+			);
+			await blockingTool(context);
+			const started = tree.start(ROOT, "parent task", context);
+			const parent = tree.get("1");
+			const results = () =>
+				customMessages(parent?.session?.messages, SUBAGENT_RESULT_TYPE);
+			await until(
+				() =>
+					child.reached &&
+					(busy ? hasRunningTool(parent) : parent?.session?.isIdle === true),
+			);
+			if (early) {
+				child.open();
+				await until(() => parent?.session?.agent.hasQueuedMessages() === true);
+			}
+			tree.interrupt("1");
+			child.open();
+			await until(() => tree.get("1.1")?.status === "done");
+			await tree.settled("1");
+			await parent?.session?.waitForIdle();
+			const transcript = parent?.session?.messages.length;
+			expect(await stillPending(started.result)).toBe(true);
+			expect(parent?.session?.messages.length).toBe(transcript);
+			expect(results()).toHaveLength(0);
+			await tree.send("1", "resume");
+			expect(await started.result).toMatchObject({
+				status: "done",
+				output: "parent saw child answer",
+			});
+			expect(results()).toHaveLength(1);
+		},
+	);
+
+	test("a result the parent already received is not delivered again by a later interrupt", async () => {
+		const tree = testRuntime();
+		const child = checkpoint();
+		let seen = 0;
+		const context = await spawnContext(
+			stream(async (context, options) => {
+				const text = lastText(context);
+				const last = context.messages.at(-1);
+				if (lastCompletion(context))
+					return ++seen === 1 ? toolCall("waiting", {}) : report("twice");
+				if (text === "parent task")
+					return toolCall("subagent", { instructions: "child task" });
+				if (text === "child task") {
+					await child.pass(options?.signal);
+					return report("child answer");
+				}
+				if (last?.role === "toolResult" && last.toolName === "subagent")
+					return toolCall("blocking", {});
+				if (text === "resume") return report("once");
+				return response("noted");
+			}),
+		);
+		const release = await blockingTool(context);
+		await childExtension(context, "waiting", (pi) => {
+			pi.registerTool({
+				name: "waiting",
+				label: "Waiting",
+				description: "Waits until aborted",
+				parameters: Type.Object({}),
+				execute: (_id, _args, signal) => waiting(signal),
+			});
+		});
+		const started = tree.start(ROOT, "parent task", context);
+		const parent = tree.get("1");
+		await until(() => child.reached && hasRunningTool(parent));
+		child.open();
+		await until(() => parent?.session?.agent.hasQueuedMessages() === true);
+		release.open();
+		await until(() => seen === 1 && hasRunningTool(parent));
+		tree.interrupt("1");
+		await tree.send("1", "resume");
+		expect(await started.result).toMatchObject({
+			status: "done",
+			output: "once",
+		});
+		expect(
+			customMessages(parent?.session?.messages, SUBAGENT_RESULT_TYPE),
+		).toHaveLength(1);
 	});
 
 	test("shutdown requested by lifecycle listeners waits for the whole run and is reentrant", async () => {
