@@ -53,6 +53,7 @@ export interface SubagentsOptions {
 	disposeSession: (session: AgentSession) => Promise<void>;
 	reportOf: (entry: SessionEntry) => string | undefined;
 	rootSessionManager?: SessionManager;
+	maxDepth?: number;
 }
 
 export const ROOT = "root";
@@ -81,6 +82,8 @@ export interface SubagentResult extends RunSummary {
 
 export interface Subagents {
 	readonly closed: boolean;
+	readonly maxDepth: number;
+	canSpawn(parentId: string): boolean;
 	get(id: string): Subagent | undefined;
 	tree(): Subagent[];
 	subscribe(listener: () => void): () => void;
@@ -189,7 +192,10 @@ export function createSubagents({
 	disposeSession,
 	reportOf,
 	rootSessionManager,
+	maxDepth = Number.POSITIVE_INFINITY,
 }: SubagentsOptions): Subagents {
+	if (!(maxDepth >= 1 && (Number.isInteger(maxDepth) || maxDepth === Infinity)))
+		throw new RangeError(`Invalid subagent max depth: ${maxDepth}`);
 	const rootLedger = rootSessionManager && usageLedger(rootSessionManager);
 	const nodes = new Map<string, SubagentNode>();
 	const pending = createPendingWork(fail);
@@ -227,12 +233,17 @@ export function createSubagents({
 		if (parentId !== ROOT && !parent)
 			throw new Error(`Unknown parent: ${parentId}`);
 		if (parent?.cancelled) throw new Error(`Parent ${parentId} was aborted.`);
+		const depth = (parent?.depth ?? 0) + 1;
+		if (depth > maxDepth)
+			throw new Error(
+				`Subagent depth limit reached: ${parentId} is at the maximum depth (${maxDepth}).`,
+			);
 		const index = childrenOf(parentId).length + 1;
 		const id = parentId === ROOT ? `${index}` : `${parentId}.${index}`;
 		const node: SubagentNode = {
 			id,
 			parentId,
-			depth: (parent?.depth ?? 0) + 1,
+			depth,
 			instructions,
 			context,
 			status: "running",
@@ -594,6 +605,8 @@ export function createSubagents({
 		get closed() {
 			return closing !== undefined;
 		},
+		maxDepth,
+		canSpawn: (parentId) => (nodes.get(parentId)?.depth ?? 0) < maxDepth,
 		get: (id) => nodes.get(id),
 		tree: () => subagentTree(nodes.values()),
 		subscribe(listener) {

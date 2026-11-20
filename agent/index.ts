@@ -38,6 +38,7 @@ import {
 	sessionOwner,
 	spawnContext,
 } from "./sessions.ts";
+import { MAX_DEPTH_SETTING, maxDepthSetting } from "./settings.ts";
 
 const EFFORTS = [
 	"off",
@@ -49,11 +50,16 @@ const EFFORTS = [
 	"max",
 ] as const satisfies readonly ThinkingLevel[];
 
-export function createSubagentRuntime(
-	rootSessionManager?: SessionManager,
-): Subagents {
+export function createSubagentRuntime({
+	rootSessionManager,
+	maxDepth,
+}: {
+	rootSessionManager?: SessionManager;
+	maxDepth?: number;
+} = {}): Subagents {
 	return createSubagents({
 		rootSessionManager,
+		maxDepth,
 		createSession: (request) => createChildSession(request, headlessExtension),
 		remindSession: remindChildSession,
 		disposeSession: disposeChildSession,
@@ -293,10 +299,27 @@ export function createSubagentIntegration(
 	pi.on("session_compact_failed", releaseAfterIdleWork);
 	pi.on("session_tree", releaseAfterIdleWork);
 
+	function configuredMaxDepth(ctx: ExtensionContext): number | undefined {
+		try {
+			return maxDepthSetting(pi.getSettings());
+		} catch (error) {
+			ctx.ui.notify(
+				`${errorMessage(error)} Ignoring ${MAX_DEPTH_SETTING}: subagent depth is unlimited.`,
+				"error",
+			);
+			return undefined;
+		}
+	}
+
 	pi.on("session_start", async (_event, ctx) => {
 		await teardown();
 		const manager = ctx.sessionManager as SessionManager;
-		const runtime = owner?.runtime ?? createSubagentRuntime(manager);
+		const runtime =
+			owner?.runtime ??
+			createSubagentRuntime({
+				rootSessionManager: manager,
+				maxDepth: configuredMaxDepth(ctx),
+			});
 		binding = {
 			runtime,
 			manager,
@@ -363,6 +386,12 @@ export function createSubagentIntegration(
 	});
 }
 
+export function spawnsSubagents(pi: ExtensionAPI): boolean {
+	const owner = sessionOwner(pi.events);
+	return !owner || owner.runtime.canSpawn(owner.id);
+}
+
 function headlessExtension(pi: ExtensionAPI): void {
-	pi.registerTool(createSubagentIntegration(pi));
+	const tool = createSubagentIntegration(pi);
+	if (spawnsSubagents(pi)) pi.registerTool(tool);
 }

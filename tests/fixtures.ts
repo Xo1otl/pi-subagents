@@ -439,6 +439,7 @@ interface ParentOptions {
 	extensions?: ExtensionFactory[];
 	onChildStart?: (ctx: ExtensionContext) => Promise<void>;
 	onChildLoad?: ExtensionFactory;
+	settings?: Record<string, unknown>;
 }
 
 export async function parentSession({
@@ -446,6 +447,7 @@ export async function parentSession({
 	extensions = [],
 	onChildStart,
 	onChildLoad,
+	settings,
 }: ParentOptions = {}) {
 	const context = await spawnContext(streamFn);
 	await childExtension(context, "provider", (pi) => {
@@ -454,7 +456,10 @@ export async function parentSession({
 		if (onChildStart)
 			pi.on("session_start", (_event, ctx) => onChildStart(ctx));
 	});
-	const settingsManager = SettingsManager.inMemory(QUIET_SETTINGS);
+	const settingsManager = SettingsManager.inMemory({
+		...QUIET_SETTINGS,
+		...settings,
+	});
 	const resourceLoader = new DefaultResourceLoader({
 		cwd: context.cwd,
 		agentDir: context.agentDir,

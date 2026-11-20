@@ -15,6 +15,14 @@ pi install ./tools/pi-subagents   # or: pi -e ./tools/pi-subagents/index.ts
 | `subagent(instructions, model?, effort?)` | Starts a headless session in the same workspace and returns `{ id, status: "running" }` at once. The result arrives later as a `subagent-result` message: batched while the parent is busy, never dropped by interrupts, long output saved to a file. |
 | `report_to_parent(result)` | Subagents only. The latest report becomes the result once the run has nothing left to wait for. Refused while child subagents run, and once while tracked jobs run; reporting again leaves those jobs running, untracked. |
 
+## Settings
+
+In `settings.json` (global or project):
+
+| Setting | Default | Behavior |
+|---|---|---|
+| `subagents.maxDepth` | unlimited | Deepest nesting level; the root's subagents are at 1. Subagents at this depth have no `subagent` tool. Must be a positive integer; an invalid value is reported and ignored. Read when a root session starts. |
+
 ## Behavior
 
 - While serving its parent's task, a subagent's system prompt has a `<subagent_role>` section.
