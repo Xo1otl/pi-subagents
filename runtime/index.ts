@@ -17,6 +17,7 @@ import {
 	summarizeOwnUsage,
 	summarizeRun,
 } from "./summary.ts";
+import { createIndexedTree, ROOT } from "./tree.ts";
 
 export type { SubagentToolExecution } from "./live-tools.ts";
 export type { Leftover } from "./pending-work.ts";
@@ -56,7 +57,7 @@ export interface SubagentsOptions {
 	maxDepth?: number;
 }
 
-export const ROOT = "root";
+export { ROOT } from "./tree.ts";
 
 export type Notice = Parameters<AgentSession["sendCustomMessage"]>[0];
 
@@ -143,36 +144,6 @@ function usageLedger(manager: SessionManager): UsageLedger {
 	return { manager, sessionId: manager.getSessionId() };
 }
 
-function subagentTree(nodes: Iterable<Subagent>): Subagent[] {
-	const children = Map.groupBy(nodes, (node) => node.parentId);
-	const visit = (id: string): Subagent[] =>
-		(children.get(id) ?? []).flatMap((node) => [node, ...visit(node.id)]);
-	return visit(ROOT);
-}
-
-function* ancestors<Node extends Subagent>(
-	nodes: ReadonlyMap<string, Node>,
-	node: Subagent,
-): Generator<Node> {
-	for (
-		let parent = nodes.get(node.parentId);
-		parent;
-		parent = nodes.get(parent.parentId)
-	)
-		yield parent;
-}
-
-function isWithin(
-	nodes: ReadonlyMap<string, Subagent>,
-	node: Subagent,
-	id: string,
-): boolean {
-	return (
-		id === ROOT ||
-		[node, ...ancestors(nodes, node)].some((member) => member.id === id)
-	);
-}
-
 function bill(
 	ledgers: readonly UsageLedger[],
 	node: Subagent,
@@ -204,7 +175,7 @@ export function createSubagents({
 }: SubagentsOptions): Subagents {
 	let maxDepth = validateMaxDepth(configuredDepth);
 	const rootLedger = rootSessionManager && usageLedger(rootSessionManager);
-	const nodes = new Map<string, SubagentNode>();
+	const nodes = createIndexedTree<SubagentNode>();
 	const pending = createPendingWork(fail);
 	const cleanupErrors: unknown[] = [];
 	const listeners = new Set<() => void>();
@@ -217,10 +188,6 @@ export function createSubagents({
 
 	function assertOpen(): void {
 		if (closing) throw new Error("Subagents have been shut down.");
-	}
-
-	function childrenOf(id: string): SubagentNode[] {
-		return [...nodes.values()].filter((node) => node.parentId === id);
 	}
 
 	function fail(id: string, error: unknown): void {
@@ -246,8 +213,7 @@ export function createSubagents({
 			throw new Error(
 				`Subagent depth limit reached: ${parentId} is at the maximum depth (${maxDepth}).`,
 			);
-		const index = childrenOf(parentId).length + 1;
-		const id = parentId === ROOT ? `${index}` : `${parentId}.${index}`;
+		const id = nodes.nextId(parentId);
 		const node: SubagentNode = {
 			id,
 			parentId,
@@ -274,7 +240,7 @@ export function createSubagents({
 				];
 			},
 		};
-		nodes.set(id, node);
+		nodes.add(node);
 		const result = run(node, instructions, "parent");
 		void result.catch(() => {});
 		return { id, result };
@@ -435,7 +401,7 @@ export function createSubagents({
 		const settlement = Promise.withResolvers<void>();
 		node.run = active;
 		const ledgers: UsageLedger[] = rootLedger ? [rootLedger] : [];
-		for (const ancestor of ancestors(nodes, node)) {
+		for (const ancestor of nodes.ancestors(node)) {
 			if (ancestor.session)
 				ledgers.push(usageLedger(ancestor.session.sessionManager));
 			if (ancestor.run) trackCompletion(ancestor.id, settlement.promise);
@@ -487,7 +453,8 @@ export function createSubagents({
 
 	function leftovers(id: string): Leftovers {
 		return {
-			children: childrenOf(id)
+			children: nodes
+				.childrenOf(id)
 				.filter((child) => child.delegated && !child.cancelled)
 				.map((child) => child.id),
 			work: pending.running(id),
@@ -579,8 +546,8 @@ export function createSubagents({
 
 	function abort(id = ROOT): Map<string, string[]> {
 		const discarded = new Map<string, string[]>();
-		for (const node of nodes.values()) {
-			if (!isWithin(nodes, node, id) || node.status !== "running") continue;
+		for (const node of nodes.subtree(id)) {
+			if (node.status !== "running") continue;
 			node.cancelled = true;
 			node.heldNotices.length = 0;
 			endInterruption(node);
@@ -597,7 +564,7 @@ export function createSubagents({
 		closing = Promise.resolve().then(async () => {
 			await pending.settleAll();
 			await Promise.all(
-				Array.from(nodes.values(), (node) => detach(node, node.session)),
+				Array.from(nodes.subtree(ROOT), (node) => detach(node, node.session)),
 			);
 			listeners.clear();
 			depthListeners.clear();
@@ -629,7 +596,7 @@ export function createSubagents({
 		},
 		canSpawn: (parentId) => (nodes.get(parentId)?.depth ?? 0) < maxDepth,
 		get: (id) => nodes.get(id),
-		tree: () => subagentTree(nodes.values()),
+		tree: nodes.preorder,
 		subscribe(listener) {
 			listeners.add(listener);
 			return () => listeners.delete(listener);

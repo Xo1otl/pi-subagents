@@ -39,6 +39,12 @@ const echo = stream((context) => {
 		: response(text);
 });
 
+async function blockedMonitor() {
+	const context = await spawnContext(echo);
+	const blocking = await blockingTool(context);
+	return { context, blocking };
+}
+
 function reminders(tree: Subagents, id: string): number {
 	return (
 		tree
@@ -395,8 +401,7 @@ describe("interaction and cleanup", () => {
 
 	test("input sent during a long-running tool stays queued and visible, then steers; its answer is no report, so the task is reminded", async () => {
 		const tree = testRuntime();
-		const context = await spawnContext(echo);
-		const release = await blockingTool(context);
+		const { context, blocking } = await blockedMonitor();
 		const result = tree.start(ROOT, "monitor", context).result;
 		const node = tree.get("1");
 		const statuses: (string | undefined)[] = [];
@@ -404,12 +409,13 @@ describe("interaction and cleanup", () => {
 			if (node?.status !== statuses.at(-1)) statuses.push(node?.status);
 		});
 		expect(node?.queuedInput).toEqual([]);
-		await until(() => hasRunningTool(node));
+		await blocking.reached;
+		expect(hasRunningTool(node)).toBe(true);
 		const sent = tree.send("1", "are you there?");
 		expect(node?.queuedInput).toEqual(["are you there?"]);
 		await sent;
 		expect(node?.queuedInput).toEqual(["are you there?"]);
-		release.open();
+		blocking.open();
 		expect(await result).toMatchObject({
 			status: "done",
 			output: "task result",
@@ -424,14 +430,7 @@ describe("interaction and cleanup", () => {
 
 	test("stopping returns sent input that never reached the agent, not its task", async () => {
 		const tree = testRuntime();
-		const context = await spawnContext(
-			stream((context) =>
-				lastText(context) === "monitor"
-					? toolCall("blocking", {})
-					: response(lastText(context)),
-			),
-		);
-		await blockingTool(context);
+		const { context, blocking } = await blockedMonitor();
 		const early = tree.start(ROOT, "monitor", context);
 		const pending = tree.send("1", "before startup");
 		expect(tree.get("1")?.queuedInput).toEqual(["before startup"]);
@@ -444,7 +443,8 @@ describe("interaction and cleanup", () => {
 
 		const steered = tree.start(ROOT, "monitor", context);
 		const node = tree.get("2");
-		await until(() => hasRunningTool(node));
+		await blocking.reached;
+		expect(hasRunningTool(node)).toBe(true);
 		await tree.send("2", "first");
 		await tree.send("2", "second");
 		expect(tree.abort("2")).toEqual(new Map([["2", ["first", "second"]]]));
@@ -454,14 +454,7 @@ describe("interaction and cleanup", () => {
 
 	test("input stopped inside slow input hooks is handed back without reaching the agent", async () => {
 		const tree = testRuntime();
-		const context = await spawnContext(
-			stream((context) =>
-				lastText(context) === "monitor"
-					? toolCall("blocking", {})
-					: response(lastText(context)),
-			),
-		);
-		await blockingTool(context);
+		const { context, blocking } = await blockedMonitor();
 		const hook = checkpoint();
 		await childExtension(context, "input", (pi) => {
 			pi.on("input", async (event) => {
@@ -470,7 +463,8 @@ describe("interaction and cleanup", () => {
 		});
 		const result = tree.start(ROOT, "monitor", context).result;
 		const node = tree.get("1");
-		await until(() => hasRunningTool(node));
+		await blocking.reached;
+		expect(hasRunningTool(node)).toBe(true);
 		const sent = tree.send("1", "in flight");
 		await hook.reached;
 		expect(tree.abort("1")).toEqual(new Map([["1", ["in flight"]]]));
@@ -569,8 +563,7 @@ describe("interaction and cleanup", () => {
 
 	test("interrupting a task's turn keeps its run: it waits, unreminded, for input that resumes it, and still reports", async () => {
 		const tree = testRuntime();
-		const context = await spawnContext(echo);
-		const blocking = await blockingTool(context);
+		const { context, blocking } = await blockedMonitor();
 		const started = tree.start(ROOT, "monitor", context);
 		const node = tree.get("1");
 		await blocking.reached;
@@ -596,11 +589,11 @@ describe("interaction and cleanup", () => {
 
 	test("an interrupt hands back queued input once; input sent at once waits for the interrupted turn to end", async () => {
 		const tree = testRuntime();
-		const context = await spawnContext(echo);
-		await blockingTool(context);
+		const { context, blocking } = await blockedMonitor();
 		const started = tree.start(ROOT, "monitor", context);
 		const node = tree.get("1");
-		await until(() => hasRunningTool(node));
+		await blocking.reached;
+		expect(hasRunningTool(node)).toBe(true);
 		await tree.send("1", "first");
 		expect(tree.interrupt("1")).toEqual(["first"]);
 		expect(tree.interrupt("1")).toEqual([]);

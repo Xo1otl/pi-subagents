@@ -151,8 +151,10 @@ export function hasRunningTool(node: Subagent | undefined): boolean {
 	);
 }
 
-export function testRuntime(): Subagents {
-	const runtime = createSubagentRuntime();
+export function testRuntime(
+	options?: Parameters<typeof createSubagentRuntime>[0],
+): Subagents {
+	const runtime = createSubagentRuntime(options);
 	onCleanup(() => runtime.dispose());
 	return runtime;
 }

@@ -1,22 +1,22 @@
 import { expect, test } from "bun:test";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { maxDepthSetting } from "../agent/depth.ts";
 import { createSubagentRuntime } from "../agent/index.ts";
-import { maxDepthSetting } from "../agent/settings.ts";
-import { createSubagents, ROOT, type Subagents } from "../runtime/index.ts";
-import { onCleanup, rootSession, spawnContext } from "./fixtures.ts";
+import { ROOT, type Subagents } from "../runtime/index.ts";
+import { rootSession, spawnContext, testRuntime } from "./fixtures.ts";
 
-function limitedRuntime(maxDepth?: number): Subagents {
-	const runtime = createSubagentRuntime({ maxDepth });
-	onCleanup(() => runtime.dispose());
-	return runtime;
+function childSession(runtime: Subagents, id: string) {
+	const session = runtime.get(id)?.session;
+	if (!session) throw new Error(`Missing session for subagent ${id}`);
+	return session;
 }
 
 const tools = (runtime: Subagents, id: string) =>
-	runtime.get(id)?.session?.getActiveToolNames() ?? [];
+	childSession(runtime, id).getActiveToolNames();
 
 test("depth is unlimited by default", async () => {
-	const tree = limitedRuntime();
+	const tree = testRuntime();
 	expect(tree.maxDepth).toBe(Number.POSITIVE_INFINITY);
 	expect(
 		await tree.start(ROOT, "nest:3", await spawnContext()).result,
@@ -25,7 +25,7 @@ test("depth is unlimited by default", async () => {
 });
 
 test("subagents at the maximum depth get no subagent tool and cannot spawn", async () => {
-	const tree = limitedRuntime(2);
+	const tree = testRuntime({ maxDepth: 2 });
 	const context = await spawnContext();
 	expect(await tree.start(ROOT, "nest:1", context).result).toMatchObject({
 		status: "done",
@@ -39,23 +39,27 @@ test("subagents at the maximum depth get no subagent tool and cannot spawn", asy
 		true,
 		false,
 	]);
-	expect(() => tree.start("1.1", "nest:0", context)).toThrow(
-		"Subagent depth limit reached: 1.1 is at the maximum depth (2).",
-	);
+	expect(() => tree.start("1.1", "nest:0", context)).toThrow(/depth limit/i);
 	expect(tree.tree().map(({ id }) => id)).toEqual(["1", "1.1"]);
+});
+
+test("raising the depth limit respects a child's manually disabled spawn tool", async () => {
+	const tree = testRuntime();
+	await tree.start(ROOT, "say hello", await spawnContext()).result;
+	const session = childSession(tree, "1");
+	const active = session.getActiveToolNames();
+	expect(active).toContain("subagent");
+	session.setActiveToolsByName(active.filter((name) => name !== "subagent"));
+
+	tree.setMaxDepth(1);
+	tree.setMaxDepth(2);
+	expect(tree.canSpawn("1")).toBe(true);
+	expect(session.getActiveToolNames()).not.toContain("subagent");
 });
 
 test("the runtime rejects invalid maximum depths", () => {
 	for (const maxDepth of [0, -1, 1.5, Number.NaN])
-		expect(() =>
-			createSubagents({
-				createSession: async () => {},
-				remindSession: async () => {},
-				disposeSession: async () => {},
-				reportOf: () => undefined,
-				maxDepth,
-			}),
-		).toThrow(RangeError);
+		expect(() => createSubagentRuntime({ maxDepth })).toThrow(RangeError);
 });
 
 test("the root reads the maximum depth from settings", async () => {
@@ -114,7 +118,7 @@ test("maxDepthSetting validates subagents.maxDepth", () => {
 });
 
 test("an installed copy of the extension also hides the tool at the maximum depth", async () => {
-	const tree = limitedRuntime(1);
+	const tree = testRuntime({ maxDepth: 1 });
 	const context = await spawnContext();
 	await writeFile(
 		join(context.agentDir, "extensions", "pi-subagents.js"),

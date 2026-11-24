@@ -26,7 +26,7 @@ const hints = (node: Subagent | undefined) => [
 	"Tab next",
 ];
 
-export interface PickerProps {
+interface PickerProps {
 	runtime: Subagents;
 	theme: UITheme;
 	keybindings: Pick<KeybindingsManager, "matches">;
@@ -35,7 +35,7 @@ export interface PickerProps {
 	onOpen: (id: string) => void;
 }
 
-export interface Picker {
+interface Picker {
 	render(width: number, height: number): string[];
 	handleInput(data: string): void;
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined;
@@ -49,7 +49,8 @@ export function createPicker({
 	onSelect,
 	onOpen,
 }: PickerProps): Picker {
-	let rowIds = new Map<number, string>();
+	let firstRow = 0;
+	let visible: Subagent[] = [];
 
 	function row(node: Subagent, active: boolean, width: number): string {
 		const label = `${active ? ">" : " "} ${"  ".repeat(node.depth - 1)}${node.id} [${statusLabel(node)}] ${singleLine(node.instructions)}`;
@@ -87,11 +88,9 @@ export function createPicker({
 				theme.fg("accent", "Subagents") +
 					theme.fg("dim", ` · ${nodes.length} · context`),
 			];
-			rowIds = new Map();
-			for (const node of nodes.slice(start, start + listHeight)) {
-				rowIds.set(lines.length, node.id);
-				lines.push(row(node, node.id === id, width));
-			}
+			firstRow = lines.length;
+			visible = nodes.slice(start, start + listHeight);
+			for (const node of visible) lines.push(row(node, node.id === id, width));
 			if (!nodes.length) lines.push(theme.fg("dim", "No subagents yet."));
 			const node = id ? runtime.get(id) : undefined;
 			lines.push(theme.fg("dim", fitHints(hints(node), width)));
@@ -120,7 +119,7 @@ export function createPicker({
 		},
 		handleMouse(event) {
 			if (event.type !== "click" || event.button !== "left") return undefined;
-			const id = rowIds.get(event.y);
+			const id = visible[event.y - firstRow]?.id;
 			if (!id) return undefined;
 			onOpen(id);
 			return { handled: true };

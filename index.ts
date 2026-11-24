@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createSubagentIntegration, registerSpawnTool } from "./agent/index.ts";
+import { registerSpawnTool } from "./agent/depth.ts";
+import { createSubagentIntegration } from "./agent/index.ts";
 import { createSubagentUI } from "./ui/index.ts";
 
 export default function subagentsExtension(pi: ExtensionAPI): void {

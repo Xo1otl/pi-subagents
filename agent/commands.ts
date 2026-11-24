@@ -40,10 +40,6 @@ export interface CommandHost {
 	listener(ctx: ExtensionContext): CommandListener | undefined;
 }
 
-export interface CommandTracking {
-	stop(): void;
-}
-
 interface TrackedSession {
 	readonly ctx: ExtensionContext;
 	readonly shell: BashOperations;
@@ -101,7 +97,7 @@ export function trackCommands(
 		isActive: isProcessGroupActive,
 		waitForExit: waitForGroupToFinish,
 	},
-): CommandTracking {
+): () => void {
 	const groups = new Map<number, ExtensionContext>();
 	let scope = new AbortController();
 	let session: TrackedSession | undefined;
@@ -277,7 +273,7 @@ export function trackCommands(
 		session = undefined;
 	});
 
-	return { stop };
+	return stop;
 }
 
 export function delegatedCommands({
@@ -286,7 +282,7 @@ export function delegatedCommands({
 }: SessionOwner): ExtensionFactory {
 	return (pi) => {
 		let unsubscribe = () => {};
-		const commands = trackCommands(pi, {
+		const stopCommands = trackCommands(pi, {
 			ownsJobs: true,
 			track: (work, _ctx, leftover) =>
 				runtime.trackCompletion(id, work, leftover),
@@ -318,7 +314,7 @@ export function delegatedCommands({
 		pi.on("session_start", () => {
 			unsubscribe();
 			unsubscribe = runtime.subscribe(() => {
-				if (runtime.get(id)?.cancelled) commands.stop();
+				if (runtime.get(id)?.cancelled) stopCommands();
 			});
 		});
 		pi.on("session_shutdown", () => unsubscribe());

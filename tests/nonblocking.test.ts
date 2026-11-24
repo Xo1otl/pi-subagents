@@ -49,6 +49,13 @@ import {
 const completions = (session: AgentSession) =>
 	customMessages(session.messages, SUBAGENT_RESULT_TYPE);
 
+// The tree tracks delivery; the parent's follow-up turn can still be running.
+async function expectSingleCompletion(tree: Subagents, session: AgentSession) {
+	await tree.settled(ROOT);
+	await session.waitForIdle();
+	expect(completions(session)).toHaveLength(1);
+}
+
 function completionDetails(session: AgentSession): SubagentCompletionDetails {
 	const message = completions(session).at(-1);
 	if (!message) throw new Error("Missing completion");
@@ -81,13 +88,14 @@ test("the tool starts the child with the requested effort and rejects unknown mo
 	);
 	expect(tree.tree()).toHaveLength(0);
 	await execute({ model: "test-provider/test-model", effort: "low" });
-	await until(() => completions(session).length === 1);
+	await expectSingleCompletion(tree, session);
 	expect(tree.get("1")?.session?.model).toMatchObject({ id: model.id });
 	expect(tree.get("1")?.session?.thinkingLevel).toBe("low");
 });
 
 test("nohup completion notifies the parent once, with the child's report", async () => {
 	let job: ReturnType<typeof backgroundJob> | undefined;
+	const jobStarted = Promise.withResolvers<void>();
 	const { session, tree } = await rootSession({
 		streamFn: stream((context) => {
 			const text = lastText(context);
@@ -101,26 +109,28 @@ test("nohup completion notifies the parent once, with the child's report", async
 				return response("completion accepted");
 			if (lastCustomMessage(context, COMMAND_EXIT_TYPE))
 				return report("child report after exit");
+			const last = context.messages.at(-1);
+			if (last?.role === "toolResult" && last.toolName === "bash")
+				jobStarted.resolve();
 			if (text === "final update") return response("last child answer");
 			return response("available while job runs");
 		}),
 	});
 	job = backgroundJob(session.sessionManager.getCwd(), "notify");
 	await session.prompt("delegate");
-	await until(() => tree.get("1")?.session?.isIdle === true);
+	await jobStarted.promise;
+	await tree.get("1")?.session?.waitForIdle();
 	expect(tree.get("1")?.status).toBe("running");
 	expect(completions(session)).toHaveLength(0);
 	await tree.send("1", "final update");
 	expect(completions(session)).toHaveLength(0);
 	await job.release();
-	await until(() => completions(session).length === 1 && session.isIdle);
+	await expectSingleCompletion(tree, session);
 	expect(existsSync(job.finished)).toBe(true);
 	const [completion] = completions(session);
 	if (!completion) throw new Error("Missing completion");
 	expect(completionOutput(completion)).toBe("child report after exit");
 	expect(session.getLastAssistantText()).toBe("completion accepted");
-	await tree.settled(ROOT);
-	expect(completions(session)).toHaveLength(1);
 });
 
 test("root returns a receipt and accepts another prompt while child session initialization is blocked", async () => {
@@ -146,7 +156,7 @@ test("root returns a receipt and accepts another prompt while child session init
 	expect(session.getLastAssistantText()).toBe("another prompt accepted");
 	await initialization.reached;
 	initialization.open();
-	await until(() => completions(session).length === 1 && session.isIdle);
+	await expectSingleCompletion(tree, session);
 	expect(completionDetails(session)).toMatchObject({
 		id: "1",
 		status: "done",
@@ -205,7 +215,7 @@ test.each(["initializing", "running"] as const)(
 			model: alternate.id,
 		});
 		child.open();
-		await until(() => completions(session).length === 1 && session.isIdle);
+		await expectSingleCompletion(tree, session);
 		expect(tree.get("1")?.session?.model).toEqual(model);
 		expect(completionDetails(session)).toMatchObject({
 			id: "1",
@@ -278,7 +288,7 @@ test("provider errors are delivered after the receipt with usage and a terminal 
 	});
 	const { session, tree } = await rootSession({ streamFn: dispatch });
 	await session.prompt("delegate");
-	await until(() => completions(session).length === 1 && session.isIdle);
+	await expectSingleCompletion(tree, session);
 	expect(completionDetails(session)).toMatchObject({
 		status: "error",
 		error: "provider unavailable",
@@ -325,7 +335,7 @@ test("an already-aborted tool call rejects, but aborting its signal after receip
 	expect(tree.get("1")?.cancelled).toBe(false);
 	expect(aborted).toBe(false);
 	tree.abort("1");
-	await until(() => completions(session).length === 1 && session.isIdle);
+	await expectSingleCompletion(tree, session);
 	expect(aborted).toBe(true);
 	expect(completionDetails(session)).toMatchObject({
 		status: "aborted",
@@ -358,7 +368,7 @@ test("interrupting the originating parent leaves the child running and still del
 	await session.prompt("corrected prompt");
 	expect(session.getLastAssistantText()).toBe("another prompt accepted");
 	child.open();
-	await until(() => completions(session).length === 1 && session.isIdle);
+	await expectSingleCompletion(tree, session);
 	expect(completionDetails(session)).toMatchObject({ id: "1", status: "done" });
 	expect(session.getLastAssistantText()).toBe("completion accepted");
 	expect(charges(session)).toHaveLength(1);
@@ -473,7 +483,7 @@ test("accounting preserves other extensions' boundary drafts both with and witho
 				entries: [...event.entries, { type: "custom", customType, data: true }],
 			};
 		};
-	const { session } = await rootSession({
+	const { session, tree } = await rootSession({
 		streamFn: defaultDispatch,
 		onChildStart: () => child.promise,
 		extensions: [
@@ -498,7 +508,7 @@ test("accounting preserves other extensions' boundary drafts both with and witho
 	expect(metadata(SUBAGENT_USAGE_TYPE)).toHaveLength(0);
 	const before = { ...drafted };
 	child.resolve();
-	await until(() => completions(session).length === 1 && session.isIdle);
+	await expectSingleCompletion(tree, session);
 	expect(drafted["prior-settle"]).toBeGreaterThan(before["prior-settle"]);
 	expectPersisted();
 	expect(metadata(SUBAGENT_USAGE_TYPE)).toHaveLength(1);
@@ -587,7 +597,7 @@ test("headless extension command failures become run errors rather than successf
 		},
 	});
 	await execute("command", { instructions: "/fail" });
-	await until(() => completions(session).length === 1 && session.isIdle);
+	await expectSingleCompletion(tree, session);
 	expect(completionDetails(session)).toMatchObject({
 		status: "error",
 		error: "command failed",
@@ -662,7 +672,7 @@ test("reload cancels and fences old results while the reloaded integration can s
 	expect(tree.closed).toBe(true);
 	expect(completions(session)).toHaveLength(0);
 	await session.prompt("delegate");
-	await until(() => completions(session).length === 1 && session.isIdle);
+	await expectSingleCompletion(runtime(), session);
 	expect(completionDetails(session)).toMatchObject({ id: "1", status: "done" });
 	expect(runtime()).not.toBe(tree);
 });
@@ -683,9 +693,9 @@ test("completion output is bounded with full output saved, and rich usage is bil
 		if (lastText(context) === "child task") return report(huge, { usage });
 		return defaultDispatch.respond(context, options);
 	});
-	const { session } = await rootSession({ streamFn: dispatch });
+	const { session, tree } = await rootSession({ streamFn: dispatch });
 	await session.prompt("delegate");
-	await until(() => completions(session).length === 1 && session.isIdle);
+	await expectSingleCompletion(tree, session);
 	const completion = completions(session)[0];
 	const details = completionDetails(session);
 	if (!details.fullOutputPath) throw new Error("Missing full output file");
@@ -753,7 +763,7 @@ test("the view binds only to root sessions and is released before runtime teardo
 	if (!tree) throw new Error("Missing root runtime");
 	expect(calls.at(-1)).toBe("root bind");
 	await session.prompt("delegate");
-	await until(() => completions(session).length === 1 && session.isIdle);
+	await expectSingleCompletion(tree, session);
 	expect(calls).toContain("child dispose");
 	expect(calls).not.toContain("child bind");
 	calls.length = 0;

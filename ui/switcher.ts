@@ -20,7 +20,7 @@ export const SWITCHER_OVERLAY: OverlayOptions = {
 	anchor: "bottom-left",
 };
 
-export interface SubagentSwitcherProps {
+interface SubagentSwitcherProps {
 	runtime: Subagents;
 	tui: TUI;
 	theme: UITheme;
@@ -29,7 +29,7 @@ export interface SubagentSwitcherProps {
 	initialId?: string;
 }
 
-export interface SubagentSwitcher extends Component, Focusable {
+interface SubagentSwitcher extends Component, Focusable {
 	handleInput(data: string): void;
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined;
 	dispose(): void;
@@ -92,7 +92,8 @@ export function createSubagentSwitcher({
 
 	function cycle(delta: number): string | undefined {
 		const nodes = runtime.tree();
-		const index = nodes.findIndex((node) => node.id === selected());
+		if (!nodes.length) return undefined;
+		const index = chosen ? nodes.findIndex((node) => node.id === chosen) : 0;
 		return nodes[(index + delta + nodes.length) % nodes.length]?.id;
 	}
 

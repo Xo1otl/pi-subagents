@@ -20,7 +20,7 @@ import {
 } from "./text.ts";
 import { createTranscriptRenderer, type TranscriptRow } from "./transcript.ts";
 
-export interface ChatProps {
+interface ChatProps {
 	id: string;
 	runtime: Subagents;
 	tui: TUI;
