@@ -83,6 +83,8 @@ export interface SubagentResult extends RunSummary {
 export interface Subagents {
 	readonly closed: boolean;
 	readonly maxDepth: number;
+	setMaxDepth(override?: number): void;
+	onMaxDepthChange(listener: () => void): () => void;
 	canSpawn(parentId: string): boolean;
 	get(id: string): Subagent | undefined;
 	tree(): Subagent[];
@@ -186,21 +188,27 @@ function recordError(node: SubagentNode, error: unknown): void {
 	node.error ??= errorMessage(error);
 }
 
+function validateMaxDepth(depth: number): number {
+	if (!(depth >= 1 && (Number.isInteger(depth) || depth === Infinity)))
+		throw new RangeError(`Invalid subagent max depth: ${depth}`);
+	return depth;
+}
+
 export function createSubagents({
 	createSession,
 	remindSession,
 	disposeSession,
 	reportOf,
 	rootSessionManager,
-	maxDepth = Number.POSITIVE_INFINITY,
+	maxDepth: configuredDepth = Number.POSITIVE_INFINITY,
 }: SubagentsOptions): Subagents {
-	if (!(maxDepth >= 1 && (Number.isInteger(maxDepth) || maxDepth === Infinity)))
-		throw new RangeError(`Invalid subagent max depth: ${maxDepth}`);
+	let maxDepth = validateMaxDepth(configuredDepth);
 	const rootLedger = rootSessionManager && usageLedger(rootSessionManager);
 	const nodes = new Map<string, SubagentNode>();
 	const pending = createPendingWork(fail);
 	const cleanupErrors: unknown[] = [];
 	const listeners = new Set<() => void>();
+	const depthListeners = new Set<() => void>();
 	let closing: Promise<void> | undefined;
 
 	function changed(): void {
@@ -592,6 +600,7 @@ export function createSubagents({
 				Array.from(nodes.values(), (node) => detach(node, node.session)),
 			);
 			listeners.clear();
+			depthListeners.clear();
 			nodes.clear();
 			if (cleanupErrors.length)
 				throw new AggregateError(cleanupErrors, "Subagent cleanup failed.");
@@ -605,7 +614,19 @@ export function createSubagents({
 		get closed() {
 			return closing !== undefined;
 		},
-		maxDepth,
+		get maxDepth() {
+			return maxDepth;
+		},
+		setMaxDepth(override = configuredDepth) {
+			assertOpen();
+			if (override === maxDepth) return;
+			maxDepth = validateMaxDepth(override);
+			for (const listener of depthListeners) listener();
+		},
+		onMaxDepthChange(listener) {
+			depthListeners.add(listener);
+			return () => depthListeners.delete(listener);
+		},
 		canSpawn: (parentId) => (nodes.get(parentId)?.depth ?? 0) < maxDepth,
 		get: (id) => nodes.get(id),
 		tree: () => subagentTree(nodes.values()),

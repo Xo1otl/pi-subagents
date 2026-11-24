@@ -69,6 +69,32 @@ test("the root reads the maximum depth from settings", async () => {
 	expect(tools(tree, "1")).not.toContain("subagent");
 });
 
+test("root depth overrides affect existing children and clear on session replacement", async () => {
+	const { tree, session, runtime } = await rootSession({
+		settings: { subagents: { maxDepth: 1 } },
+	});
+	const context = await spawnContext();
+	await tree.start(ROOT, "say hello", context).result;
+	const command = (value: string) =>
+		session.prompt(`/subagents-depth ${value}`);
+	await command("2");
+	expect(tools(tree, "1")).toContain("subagent");
+	await tree.start("1", "say hello", context).result;
+	expect(tools(tree, "1.1")).not.toContain("subagent");
+	await command("2.5");
+	expect(tree.maxDepth).toBe(2);
+	await command("reset");
+	expect(tree.maxDepth).toBe(1);
+	expect(tools(tree, "1")).not.toContain("subagent");
+	expect(() => tree.start("1.1", "say hello", context)).toThrow("depth limit");
+	await command("unlimited");
+	expect(tree.maxDepth).toBe(Infinity);
+	expect(tools(tree, "1")).toContain("subagent");
+	expect(tools(tree, "1.1")).toContain("subagent");
+	await session.extensionRunner.emit({ type: "session_start", reason: "new" });
+	expect(runtime().maxDepth).toBe(1);
+});
+
 test("an invalid setting leaves depth unlimited", async () => {
 	const { tree } = await rootSession({
 		settings: { subagents: { maxDepth: "2" } },

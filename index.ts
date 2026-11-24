@@ -1,9 +1,9 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createSubagentIntegration, spawnsSubagents } from "./agent/index.ts";
+import { createSubagentIntegration, registerSpawnTool } from "./agent/index.ts";
 import { createSubagentUI } from "./ui/index.ts";
 
 export default function subagentsExtension(pi: ExtensionAPI): void {
 	const ui = createSubagentUI(pi);
 	const tool = createSubagentIntegration(pi, ui);
-	if (spawnsSubagents(pi)) pi.registerTool({ ...tool, ...ui.toolRenderers });
+	registerSpawnTool(pi, { ...tool, ...ui.toolRenderers });
 }

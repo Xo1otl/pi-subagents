@@ -23,6 +23,8 @@ In `settings.json` (global or project):
 |---|---|---|
 | `subagents.maxDepth` | unlimited | Deepest nesting level; the root's subagents are at 1. Subagents at this depth have no `subagent` tool. Must be a positive integer; an invalid value is reported and ignored. Read when a root session starts. |
 
+Use `/subagents-depth` in the root session to see the current limit. Pass a positive integer to change it, `unlimited` to remove it, or `reset` to restore the startup setting. The limit applies to future spawns throughout the tree; lowering it does not stop existing agents. Overrides are not saved and clear on session switch or reload.
+
 ## Behavior
 
 - While serving its parent's task, a subagent's system prompt has a `<subagent_role>` section.

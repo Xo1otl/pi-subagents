@@ -95,7 +95,37 @@ export function createSubagentIntegration(
 	const parentId = owner?.id ?? ROOT;
 	let binding: SessionBinding | undefined;
 	if (owner) registerReporting(pi, owner);
-	else trackCommands(pi, rootCommands());
+	else {
+		trackCommands(pi, rootCommands());
+		pi.registerCommand("subagents-depth", {
+			description:
+				"Show or override session nesting depth: /subagents-depth [N|unlimited|reset]",
+			handler: async (args, ctx) => {
+				const tree = current(ctx)?.runtime;
+				if (!tree) throw new Error("Subagents are not initialized.");
+				const value = args.trim();
+				if (value === "reset") tree.setMaxDepth();
+				else if (value === "unlimited") tree.setMaxDepth(Infinity);
+				else if (value) {
+					if (
+						!/^[1-9]\d*$/.test(value) ||
+						!Number.isSafeInteger(Number(value))
+					) {
+						ctx.ui.notify(
+							"Expected a positive integer, unlimited, or reset.",
+							"error",
+						);
+						return;
+					}
+					tree.setMaxDepth(Number(value));
+				}
+				ctx.ui.notify(
+					`Subagent max depth: ${tree.maxDepth === Infinity ? "unlimited" : tree.maxDepth}.`,
+					"info",
+				);
+			},
+		});
+	}
 
 	function rootCommands(): CommandHost {
 		return {
@@ -386,12 +416,43 @@ export function createSubagentIntegration(
 	});
 }
 
-export function spawnsSubagents(pi: ExtensionAPI): boolean {
+export function registerSpawnTool(
+	pi: ExtensionAPI,
+	tool: ReturnType<typeof createSubagentIntegration>,
+): void {
 	const owner = sessionOwner(pi.events);
-	return !owner || owner.runtime.canSpawn(owner.id);
+	let allowed = !owner || owner.runtime.canSpawn(owner.id);
+	let registered = allowed;
+	if (registered) pi.registerTool(tool);
+	if (!owner) return;
+
+	let unsubscribe: (() => void) | undefined;
+	let restore = false;
+	const sync = () => {
+		const next = owner.runtime.canSpawn(owner.id);
+		if (next === allowed) return;
+		allowed = next;
+		const active = pi.getActiveTools();
+		if (!next) {
+			restore = active.includes(tool.name);
+			if (restore)
+				pi.setActiveTools(active.filter((name) => name !== tool.name));
+		} else if (!registered) {
+			registered = true;
+			pi.registerTool(tool);
+		} else if (restore && !active.includes(tool.name)) {
+			pi.setActiveTools([...active, tool.name]);
+		}
+	};
+	pi.on("session_start", () => {
+		unsubscribe?.();
+		unsubscribe = owner.runtime.onMaxDepthChange(sync);
+		sync();
+	});
+	pi.on("session_shutdown", () => unsubscribe?.());
 }
 
 function headlessExtension(pi: ExtensionAPI): void {
 	const tool = createSubagentIntegration(pi);
-	if (spawnsSubagents(pi)) pi.registerTool(tool);
+	registerSpawnTool(pi, tool);
 }
